@@ -10,8 +10,8 @@
 import 'package:flutter/material.dart';
 
 import '../bootstrap/bootstrap.dart';
-import '../rust/api.dart' as tagnet;
-import '../tagnet_service.dart';
+import '../rust/api.dart' as onisync;
+import '../onisync_service.dart';
 import '../widgets/file_preview.dart';
 import '../widgets/property_tile.dart';
 import '../widgets/tag_chip.dart';
@@ -21,13 +21,13 @@ class FileDetailScreen extends StatefulWidget {
   FileDetailScreen({
     super.key,
     required this.session,
-    required tagnet.FileEntry file,
+    required onisync.FileEntry file,
   }) : fileId = file.fileId;
 
-  final TagnetSession session;
+  final OniSyncSession session;
 
   /// The string id of the file to display. Callers still pass a captured
-  /// [tagnet.FileEntry] via the constructor for continuity with the existing
+  /// [onisync.FileEntry] via the constructor for continuity with the existing
   /// list rows; the screen only holds onto its id and refetches the full
   /// entry itself.
   final String fileId;
@@ -37,12 +37,12 @@ class FileDetailScreen extends StatefulWidget {
 }
 
 class _FileDetailScreenState extends State<FileDetailScreen> {
-  tagnet.FileEntry? _file;
+  onisync.FileEntry? _file;
 
   /// Tags currently applied to this file, keyed by string id (for name/color
   /// lookup when rendering the chips). Bounded by the number of applied tags,
   /// so we fetch these one-by-one rather than pulling every tag in the store.
-  Map<String, tagnet.TagEntry> _appliedTags = {};
+  Map<String, onisync.TagEntry> _appliedTags = {};
 
   /// The string ids of tags currently applied to this file (direct only).
   List<String> _appliedTagIds = [];
@@ -57,7 +57,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
   bool _deleted = false;
   bool _watching = false;
 
-  tagnet.TagnetApp get _app => widget.session.app;
+  onisync.OniSyncApp get _app => widget.session.app;
 
   @override
   void initState() {
@@ -97,7 +97,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
       // the user can meaningfully add/remove on this file.
       final applied = await _app.tagIdsForFileString(
         fileId: widget.fileId,
-        subtagRule: tagnet.SubtagRule.exclude,
+        subtagRule: onisync.SubtagRule.exclude,
       );
       final entries = await Future.wait(
         applied.map((id) => _app.getTagEntry(tagId: id)),
@@ -175,11 +175,11 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     // whole tag store. Revisit — the right shape is likely a small
     // search-in-picker that calls `runQuery` per keystroke, matching the home
     // screen's model. Same TODO applies to TagDetailScreen._pickTag.
-    final tagnet.QueryEntries all;
+    final onisync.QueryEntries all;
     try {
       all = await _app.runQuery(
         query: '',
-        subtagRule: tagnet.SubtagRule.include,
+        subtagRule: onisync.SubtagRule.include,
       );
     } catch (error) {
       _snack('Failed to load tags: $error');
@@ -193,7 +193,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
       _snack('No more tags to add.');
       return;
     }
-    final chosen = await showModalBottomSheet<tagnet.TagEntry>(
+    final chosen = await showModalBottomSheet<onisync.TagEntry>(
       context: context,
       builder: (_) => SafeArea(
         child: ListView(
@@ -378,7 +378,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
   /// whose content we haven't fetched yet. In that case `_localPath` is null
   /// and we render a neutral "not synced" tile instead of the preview widget.
   /// Preview height is bounded so it never crowds out the tags/properties.
-  Widget _buildPreview(BuildContext context, tagnet.FileEntry file) {
+  Widget _buildPreview(BuildContext context, onisync.FileEntry file) {
     final theme = Theme.of(context);
     final path = _localPath;
     final header = Padding(

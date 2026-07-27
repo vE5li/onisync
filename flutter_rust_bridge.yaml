@@ -3,20 +3,20 @@
 # Lives at the repo root so every path below is repo-root-relative (frb resolves
 # them against this file's directory). Run from the repo root, inside
 # `nix develop`, AFTER the Flutter app tree exists at ./app (see
-# tagnet-bridge/android/README.md):
+# onisync-bridge/android/README.md):
 #
 #   flutter_rust_bridge_codegen generate --config-file flutter_rust_bridge.yaml
 #
-# It reads the annotated Rust surface in tagnet-bridge/src/api.rs and writes the
+# It reads the annotated Rust surface in onisync-bridge/src/api.rs and writes the
 # Dart bindings into the Flutter app's lib/.
 
 # The crate whose `#[frb]`-annotated items become Dart bindings.
 rust_input: crate::api
-rust_root: tagnet-bridge/
+rust_root: onisync-bridge/
 # Where the generated Dart lands inside the Flutter app.
 dart_output: app/lib/rust
 # Generated Rust glue (the frb_generated.rs the crate `include!`s).
-rust_output: tagnet-bridge/src/frb_generated.rs
+rust_output: onisync-bridge/src/frb_generated.rs
 # Build the bridge with the codegen annotations + generated module turned on.
 rust_features:
   - generated

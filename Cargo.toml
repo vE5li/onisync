@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["tagnetd", "tagnet-core", "tagnet", "tagnet-bridge"]
+members = ["onisyncd", "onisync-core", "onisync", "onisync-bridge"]
 
 [workspace.dependencies]
-tagnet-core = { path = "tagnet-core" }
+onisync-core = { path = "onisync-core" }

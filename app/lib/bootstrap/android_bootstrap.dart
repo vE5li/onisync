@@ -2,10 +2,10 @@
 // the app (portability plan section 8).
 //
 // Unlike Linux (which attaches to a daemon), this process OWNS the engine, DB,
-// and identity. It also wires the Android share sheet so "Share to tagnet"
+// and identity. It also wires the Android share sheet so "Share to onisync"
 // uploads files, and surfaces this device's public key for pairing.
 //
-// Selected at build time via --dart-define=TAGNET_BACKEND=android (see main).
+// Selected at build time via --dart-define=ONISYNC_BACKEND=android (see main).
 
 import 'dart:async';
 
@@ -13,56 +13,56 @@ import 'package:flutter/services.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 
 import '../rust/frb_generated.dart';
-import '../rust/api.dart' as tagnet;
+import '../rust/api.dart' as onisync;
 import 'bootstrap.dart';
 
 /// MethodChannel exposed by [MainActivity] returning the JSON config + paths
-/// the Kotlin side built. See TagnetConfig.kt for the single source of truth.
+/// the Kotlin side built. See OniSyncConfig.kt for the single source of truth.
 ///
 /// The Kotlin foreground service normally starts the runtime before this
 /// bootstrap runs; the values fetched here are the *same* values it passed to
-/// nativeStart, so TagnetApp.start attaches to the already-running instance
+/// nativeStart, so OniSyncApp.start attaches to the already-running instance
 /// (crate::service::start is idempotent). If the service is somehow slow, the
 /// Dart side starts it with identical inputs — no divergence possible.
-const _configChannel = MethodChannel('tagnet_app/config');
+const _configChannel = MethodChannel('onisync_app/config');
 
-class AndroidBootstrap extends TagnetBootstrap {
+class AndroidBootstrap extends OniSyncBootstrap {
   StreamSubscription<List<SharedMediaFile>>? _shareSub;
 
   @override
-  Future<TagnetSession> connect() async {
-    // Loads libtagnet_bridge.so and wires up the generated bindings.
+  Future<OniSyncSession> connect() async {
+    // Loads libonisync_bridge.so and wires up the generated bindings.
     await RustLib.init();
 
     // Fetch the runtime startup inputs from Kotlin. Editing the peer config
-    // means editing TagnetConfig.kt — there is no JSON literal on the Dart
+    // means editing OniSyncConfig.kt — there is no JSON literal on the Dart
     // side any more.
     final inputs = await _configChannel.invokeMapMethod<String, String>(
       'getStartupInputs',
     );
     if (inputs == null) {
-      throw StateError('tagnet_app/config channel returned no inputs');
+      throw StateError('onisync_app/config channel returned no inputs');
     }
     final configJson = inputs['configJson']!;
     final dataDir = inputs['dataDir']!;
     final identityFile = inputs['identityFile']!;
 
-    final app = tagnet.TagnetApp.start(
+    final app = onisync.OniSyncApp.start(
       configurationJson: configJson,
       dataDir: dataDir,
       identityFile: identityFile,
     );
 
-    return TagnetSession(app: app, publicKey: app.publicKey());
+    return OniSyncSession(app: app, publicKey: app.publicKey());
   }
 
-  /// Wire up the Android share sheet ("Share to tagnet"). Two cases:
+  /// Wire up the Android share sheet ("Share to onisync"). Two cases:
   ///   1. app already running  -> getMediaStream() pushes new shares,
   ///   2. app launched by share -> getInitialMedia() returns the first batch.
   /// Both funnel into [_uploadSharedFiles].
   @override
   void attachInputs(
-    TagnetSession session, {
+    OniSyncSession session, {
     required void Function(String message) showMessage,
     required VoidCallback onChanged,
   }) {
@@ -80,11 +80,11 @@ class AndroidBootstrap extends TagnetBootstrap {
   }
 
   /// Hand each shared file's *path* to the sync engine via
-  /// [tagnet.TagnetApp.uploadFile]. The engine streams the bytes from disk
+  /// [onisync.OniSyncApp.uploadFile]. The engine streams the bytes from disk
   /// (hash then serve-on-demand); they are never buffered whole, matching the
   /// CLI's upload path.
   Future<void> _uploadSharedFiles(
-    tagnet.TagnetApp app,
+    onisync.OniSyncApp app,
     List<SharedMediaFile> files,
     void Function(String) showMessage,
     VoidCallback onChanged,
@@ -105,7 +105,7 @@ class AndroidBootstrap extends TagnetBootstrap {
     }
 
     if (uploaded > 0) {
-      showMessage('Uploaded $uploaded file${uploaded == 1 ? '' : 's'} to tagnet');
+      showMessage('Uploaded $uploaded file${uploaded == 1 ? '' : 's'} to onisync');
       onChanged();
     }
   }
@@ -119,4 +119,4 @@ class AndroidBootstrap extends TagnetBootstrap {
 }
 
 /// Factory referenced by the backend selector in main.dart.
-TagnetBootstrap createBootstrap() => AndroidBootstrap();
+OniSyncBootstrap createBootstrap() => AndroidBootstrap();

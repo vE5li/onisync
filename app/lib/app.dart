@@ -1,6 +1,6 @@
 // Shared application shell for both the Android and Linux apps.
 //
-// This is entirely platform-agnostic: it takes a [TagnetBootstrap] (chosen in
+// This is entirely platform-agnostic: it takes a [OniSyncBootstrap] (chosen in
 // main.dart via --dart-define) and drives the lifecycle that is identical on
 // every platform — connect, then hand the session to the home screen. Live
 // updates and query dispatch are owned by the screens themselves (each opens
@@ -12,14 +12,14 @@ import 'package:flutter/material.dart';
 import 'bootstrap/bootstrap.dart';
 import 'screens/home_screen.dart';
 
-class TagnetApp extends StatefulWidget {
-  const TagnetApp({super.key, required this.bootstrap});
+class OniSyncApp extends StatefulWidget {
+  const OniSyncApp({super.key, required this.bootstrap});
 
   /// The platform backend (in-process engine on Android, daemon IPC on Linux).
-  final TagnetBootstrap bootstrap;
+  final OniSyncBootstrap bootstrap;
 
   @override
-  State<TagnetApp> createState() => _TagnetAppState();
+  State<OniSyncApp> createState() => _OniSyncAppState();
 }
 
 // Shows feedback (SnackBars) from callbacks that can fire outside a build
@@ -27,8 +27,8 @@ class TagnetApp extends StatefulWidget {
 final GlobalKey<ScaffoldMessengerState> _messengerKey =
     GlobalKey<ScaffoldMessengerState>();
 
-class _TagnetAppState extends State<TagnetApp> {
-  TagnetSession? _session;
+class _OniSyncAppState extends State<OniSyncApp> {
+  OniSyncSession? _session;
 
   @override
   void initState() {
@@ -54,7 +54,7 @@ class _TagnetAppState extends State<TagnetApp> {
     } catch (error) {
       // TODO: surface connection failures in the UI once the redesigned
       // status/error surface lands. For now they only appear in logs.
-      debugPrint('tagnet bootstrap failed: $error');
+      debugPrint('onisync bootstrap failed: $error');
     }
   }
 
@@ -75,7 +75,7 @@ class _TagnetAppState extends State<TagnetApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'tagnet',
+      title: 'onisync',
       scaffoldMessengerKey: _messengerKey,
       home: HomeScreen(session: _session),
     );

@@ -14,8 +14,8 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../bootstrap/bootstrap.dart';
-import '../rust/api.dart' as tagnet;
-import '../tagnet_service.dart';
+import '../rust/api.dart' as onisync;
+import '../onisync_service.dart';
 import '../widgets/property_tile.dart';
 import '../widgets/tag_chip.dart';
 
@@ -26,7 +26,7 @@ class TagDetailScreen extends StatefulWidget {
     required this.tagId,
   });
 
-  final TagnetSession session;
+  final OniSyncSession session;
   final String tagId;
 
   @override
@@ -34,7 +34,7 @@ class TagDetailScreen extends StatefulWidget {
 }
 
 class _TagDetailScreenState extends State<TagDetailScreen> {
-  tagnet.TagEntry? _tag;
+  onisync.TagEntry? _tag;
 
   /// Direct parent tags (tags applied to this tag). String ids for the wire,
   /// resolved to entries in [_relatedTags] for rendering.
@@ -45,14 +45,14 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
 
   /// Name/color lookup for every tag id that appears in either section
   /// above. Bounded by parents + subtags — never a whole-store listing.
-  Map<String, tagnet.TagEntry> _relatedTags = {};
+  Map<String, onisync.TagEntry> _relatedTags = {};
 
   bool _loading = true;
   String? _error;
   bool _deleted = false;
   bool _watching = false;
 
-  tagnet.TagnetApp get _app => widget.session.app;
+  onisync.OniSyncApp get _app => widget.session.app;
 
   @override
   void initState() {
@@ -89,11 +89,11 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
       final tag = await _app.getTagEntry(tagId: widget.tagId);
       final parents = await _app.tagIdsForTagString(
         tagId: widget.tagId,
-        subtagRule: tagnet.SubtagRule.exclude,
+        subtagRule: onisync.SubtagRule.exclude,
       );
       final subtags = await _app.subtagIdsForTagString(
         tagId: widget.tagId,
-        subtagRule: tagnet.SubtagRule.exclude,
+        subtagRule: onisync.SubtagRule.exclude,
       );
       // Resolve every related tag by id. Bounded by parents.length +
       // subtags.length; avoids the whole-store listing that `runQuery('')`
@@ -183,15 +183,15 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
   /// Revisit — the right shape is likely a small search-in-picker that calls
   /// `runQuery` per keystroke, matching the home screen's model. Same
   /// treatment as FileDetailScreen._addTag.
-  Future<tagnet.TagEntry?> _pickTag({
+  Future<onisync.TagEntry?> _pickTag({
     required String title,
     required Set<String> excludeIds,
   }) async {
-    final tagnet.QueryEntries all;
+    final onisync.QueryEntries all;
     try {
       all = await _app.runQuery(
         query: '',
-        subtagRule: tagnet.SubtagRule.include,
+        subtagRule: onisync.SubtagRule.include,
       );
     } catch (error) {
       _snack('Failed to load tags: $error');
@@ -205,7 +205,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
       _snack('No candidate tags.');
       return null;
     }
-    return showModalBottomSheet<tagnet.TagEntry>(
+    return showModalBottomSheet<onisync.TagEntry>(
       context: context,
       builder: (_) => SafeArea(
         child: ListView(
@@ -429,7 +429,7 @@ class _TagsSection extends StatelessWidget {
 
   final String title;
   final List<String> tagIds;
-  final Map<String, tagnet.TagEntry> resolved;
+  final Map<String, onisync.TagEntry> resolved;
   final VoidCallback onAdd;
   final ValueChanged<String> onRemove;
   final ValueChanged<String> onTapTag;

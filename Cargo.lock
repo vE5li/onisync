@@ -1132,6 +1132,68 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 
 [[package]]
+name = "onisync"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "comfy-table",
+ "onisync-core",
+ "onisyncd",
+ "owo-colors",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "onisync-bridge"
+version = "0.1.0"
+dependencies = [
+ "android_logger",
+ "env_logger",
+ "flutter_rust_bridge",
+ "jni",
+ "log",
+ "onisync-core",
+ "onisyncd",
+ "tokio",
+]
+
+[[package]]
+name = "onisync-core"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "onisyncd"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "blake3",
+ "clap",
+ "ed25519-dalek",
+ "env_logger",
+ "futures-util",
+ "log",
+ "notify",
+ "onisync-core",
+ "rand 0.8.6",
+ "rmp-serde",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
 name = "oslog"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1580,68 +1642,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "tagnet"
-version = "0.1.0"
-dependencies = [
- "clap",
- "comfy-table",
- "owo-colors",
- "serde",
- "serde_json",
- "tagnet-core",
- "tagnetd",
- "tokio",
-]
-
-[[package]]
-name = "tagnet-bridge"
-version = "0.1.0"
-dependencies = [
- "android_logger",
- "env_logger",
- "flutter_rust_bridge",
- "jni",
- "log",
- "tagnet-core",
- "tagnetd",
- "tokio",
-]
-
-[[package]]
-name = "tagnet-core"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "serde",
- "uuid",
-]
-
-[[package]]
-name = "tagnetd"
-version = "0.1.0"
-dependencies = [
- "base64",
- "blake3",
- "clap",
- "ed25519-dalek",
- "env_logger",
- "futures-util",
- "log",
- "notify",
- "rand 0.8.6",
- "rmp-serde",
- "rusqlite",
- "serde",
- "serde_json",
- "tagnet-core",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "uuid",
- "walkdir",
 ]
 
 [[package]]

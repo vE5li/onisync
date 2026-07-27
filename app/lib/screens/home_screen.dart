@@ -19,7 +19,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../bootstrap/bootstrap.dart';
-import '../rust/api.dart' as tagnet;
+import '../rust/api.dart' as onisync;
 import '../widgets/tag_chip.dart';
 import 'file_detail_screen.dart';
 import 'tag_detail_screen.dart';
@@ -27,7 +27,7 @@ import 'tag_detail_screen.dart';
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key, required this.session});
 
-  final TagnetSession? session;
+  final OniSyncSession? session;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -52,7 +52,7 @@ class _HomeScreenState extends State<HomeScreen> {
   int _queryEpoch = 0;
 
   /// Latest result to render. Null until the user runs a query.
-  tagnet.QueryEntries? _results;
+  onisync.QueryEntries? _results;
   String? _error;
   bool _loading = false;
 
@@ -142,7 +142,7 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       final result = await session.app.runQuery(
         query: _query.text,
-        subtagRule: tagnet.SubtagRule.include,
+        subtagRule: onisync.SubtagRule.include,
       );
       if (!mounted || epoch != _queryEpoch) return;
       setState(() {
@@ -160,7 +160,7 @@ class _HomeScreenState extends State<HomeScreen> {
           message.contains('NotFound') || message.contains('Ambiguous');
       setState(() {
         if (looksLikeUnresolved) {
-          _results = const tagnet.QueryEntries(files: [], tags: []);
+          _results = const onisync.QueryEntries(files: [], tags: []);
           _error = null;
         } else {
           _error = message;
@@ -189,7 +189,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (session == null) return;
     try {
       // Pass an empty color; the engine substitutes its default palette entry
-      // (see tagnetd::api::create_tag). The user can recolor via the tag
+      // (see onisyncd::api::create_tag). The user can recolor via the tag
       // detail screen.
       await session.app.createTag(name: name, color: '');
       // The change stream will re-run the current query and the new tag will
@@ -207,7 +207,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final publicKey = widget.session?.publicKey;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('tagnet'),
+        title: const Text('onisync'),
         actions: [
           if (publicKey != null) _CopyPublicKeyButton(publicKey: publicKey),
         ],
@@ -345,8 +345,8 @@ class _SectionHeader extends StatelessWidget {
 class _TagRow extends StatelessWidget {
   const _TagRow({required this.tag, required this.session});
 
-  final tagnet.TagEntry tag;
-  final TagnetSession session;
+  final onisync.TagEntry tag;
+  final OniSyncSession session;
 
   @override
   Widget build(BuildContext context) {
@@ -399,8 +399,8 @@ class _CreateTagRow extends StatelessWidget {
 class _FileRow extends StatelessWidget {
   const _FileRow({required this.file, required this.session});
 
-  final tagnet.FileEntry file;
-  final TagnetSession session;
+  final onisync.FileEntry file;
+  final OniSyncSession session;
 
   @override
   Widget build(BuildContext context) {

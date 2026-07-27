@@ -4,24 +4,24 @@ self: {
   config,
   ...
 }: {
-  options.services.tagnet = with lib; {
-    # enable = lib.mkEnableOption "tagnet service";
+  options.services.onisync = with lib; {
+    # enable = lib.mkEnableOption "onisync service";
 
     user = mkOption {
       type = types.str;
-      description = "User account under which tagnet runs.";
+      description = "User account under which onisync runs.";
     };
 
     group = mkOption {
       type = types.str;
-      description = "Group under which tagnet runs.";
+      description = "Group under which onisync runs.";
     };
 
     package = mkOption {
       type = types.package;
-      default = self.packages.${pkgs.system}.tagnetd;
-      defaultText = literalExpression "tagnet.packages.\${system}.tagnetd";
-      description = "The tagnet daemon package to use.";
+      default = self.packages.${pkgs.system}.onisyncd;
+      defaultText = literalExpression "onisync.packages.\${system}.onisyncd";
+      description = "The onisync daemon package to use.";
     };
 
     configuration-file = mkOption {
@@ -31,7 +31,7 @@ self: {
 
     state-directory = mkOption {
       type = types.str;
-      default = "tagnet";
+      default = "onisync";
       description = ''
         Name of the systemd StateDirectory, created under /var/lib and
         owned by the service user. Used as the default data directory.
@@ -40,7 +40,7 @@ self: {
 
     data-directory = mkOption {
       type = types.path;
-      default = "/var/lib/${config.services.tagnet.state-directory}";
+      default = "/var/lib/${config.services.onisync.state-directory}";
       defaultText = literalExpression ''"/var/lib/''${state-directory}"'';
       description = "Path to the data directory";
     };
@@ -51,8 +51,8 @@ self: {
     };
   };
 
-  config = with config.services.tagnet; {
-    systemd.services.tagnet = {
+  config = with config.services.onisync; {
+    systemd.services.onisync = {
       enable = true;
 
       wantedBy = ["multi-user.target"];
@@ -67,18 +67,18 @@ self: {
         StateDirectory = state-directory;
 
         # Local control socket (portability plan section 7). systemd creates
-        # /run/tagnet owned by the service user and tears it down on stop; its
+        # /run/onisync owned by the service user and tears it down on stop; its
         # 0700 mode is the entire security model for local control (nothing is
         # exposed on the network). The daemon binds, and clients connect to,
-        # the fixed /run/tagnet/tagnet.sock — no XDG_RUNTIME_DIR guessing.
-        RuntimeDirectory = "tagnet";
+        # the fixed /run/onisync/onisync.sock — no XDG_RUNTIME_DIR guessing.
+        RuntimeDirectory = "onisync";
         RuntimeDirectoryMode = "0700";
       };
 
       environment = {
         RUST_LOG = "debug";
-        TAGNET_DATA_DIR = "${data-directory}";
-        TAGNET_PRIVATE_KEY_FILE = "${private-key-file}";
+        ONISYNC_DATA_DIR = "${data-directory}";
+        ONISYNC_PRIVATE_KEY_FILE = "${private-key-file}";
       };
     };
 

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Adaptive launcher icon for tagnet (API 26+). Solid brand-blue background with
+  Adaptive launcher icon for onisync (API 26+). Solid brand-blue background with
   the white tag glyph foreground; the launcher masks it to the device's icon
   shape (circle / squircle / etc.). minSdk is 26, so every device uses this.
 -->

@@ -1,21 +1,21 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- tagnet: peer sync (outbound / optional listener). -->
+    <!-- onisync: peer sync (outbound / optional listener). -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- tagnet: keep the tokio runtime + inotify alive under Doze. -->
+    <!-- onisync: keep the tokio runtime + inotify alive under Doze. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <!-- Required on API 34+ (Android 14) for a data-sync foreground service. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <!-- Needed to post the ongoing notification on API 33+. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- tagnet: the sync directory lives in shared storage (Documents/tagnet)
+    <!-- onisync: the sync directory lives in shared storage (Documents/onisync)
          so synced files are browsable in the Files app / Gallery. Broad "All
          files access"; the user must grant it via the system settings screen
          (see MainActivity). Requested via MANAGE_APP_ALL_FILES_ACCESS_PERMISSION. -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <application
-        android:label="tagnet"
+        android:label="onisync"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <!-- launchMode="singleTask" is recommended by receive_sharing_intent:
@@ -42,11 +42,11 @@
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
-            <!-- tagnet: appear in the Android share sheet as an upload target.
+            <!-- onisync: appear in the Android share sheet as an upload target.
                  A single shared item (ACTION_SEND) or several at once
                  (ACTION_SEND_MULTIPLE); "*/*" accepts any file type. The
                  receive_sharing_intent plugin reads the EXTRA_STREAM URI(s)
-                 and hands them to Dart, which uploads via TagnetApp.uploadFile. -->
+                 and hands them to Dart, which uploads via OniSyncApp.uploadFile. -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND"/>
                 <category android:name="android.intent.category.DEFAULT"/>
@@ -58,10 +58,10 @@
                 <data android:mimeType="*/*"/>
             </intent-filter>
         </activity>
-        <!-- tagnet: foreground service hosting the native runtime. Not
+        <!-- onisync: foreground service hosting the native runtime. Not
              exported; the type must match FOREGROUND_SERVICE_DATA_SYNC. -->
         <service
-            android:name=".TagnetService"
+            android:name=".OniSyncService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
         <!-- Don't delete the meta-data below.

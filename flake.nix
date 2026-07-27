@@ -30,8 +30,8 @@
   }:
     {
       overlays.default = final: prev: {
-        tagnetd = final.callPackage ./nix/tagnetd.nix {};
-        tagnet = final.callPackage ./nix/tagnet.nix {};
+        onisyncd = final.callPackage ./nix/onisyncd.nix {};
+        onisync = final.callPackage ./nix/onisync.nix {};
       };
 
       nixosModules.default = import ./nix/module.nix self;
@@ -106,7 +106,7 @@
         # two-process topology). Unlike Android, `flutter build linux` drives a
         # CMake + Ninja + clang toolchain and links against GTK3; none of these
         # are pulled in by the Android tooling, so they must be listed
-        # explicitly. `cargo build -p tagnet-bridge` (invoked from the Linux
+        # explicitly. `cargo build -p onisync-bridge` (invoked from the Linux
         # runner's CMake hook) reuses the Rust toolchain already on PATH.
         linuxDesktopTools = with pkgs; [
           cmake
@@ -146,11 +146,11 @@
           pkgs.lib.concatStringsSep "\n"
           (pkgs.lib.mapAttrsToList (name: value: "export ${name}=${pkgs.lib.escapeShellArg value}") androidEnv);
 
-        # Turn a bash body into a `nix run`-able app named `tagnet-<name>`, with
+        # Turn a bash body into a `nix run`-able app named `onisync-<name>`, with
         # the toolchains on PATH and the shared env exported.
         mkApp = name: body: let
           script = pkgs.writeShellApplication {
-            name = "tagnet-${name}";
+            name = "onisync-${name}";
             # Both tool sets are on PATH: the Android steps ignore the desktop
             # tools and vice versa, but the Linux desktop apps (`run-linux`)
             # need CMake/Ninja/clang/GTK from `linuxDesktopTools`.
@@ -159,12 +159,12 @@
               ${androidEnvExports}
               # Run from the repo root regardless of where `nix run` was invoked.
               # All command bodies use paths relative to the repo root (e.g.
-              # `cp tagnet-bridge/... app/...`), so we must actually chdir there;
+              # `cp onisync-bridge/... app/...`), so we must actually chdir there;
               # `cd "$PWD"` would leave us wherever the user invoked `nix run`
               # (e.g. inside app/), breaking those relative paths. Resolve the
               # root explicitly: honour an override, else ask git for the
               # toplevel, else fall back to the current directory.
-              root="''${TAGNET_ROOT:-}"
+              root="''${ONISYNC_ROOT:-}"
               if [ -z "$root" ]; then
                 root="$(${pkgs.git}/bin/git rev-parse --show-toplevel 2>/dev/null || true)"
               fi
@@ -174,18 +174,18 @@
           };
         in {
           type = "app";
-          program = "${script}/bin/tagnet-${name}";
+          program = "${script}/bin/onisync-${name}";
         };
 
         # Build the `apps` output from an attrset of `{ <name> = <bash body>; }`,
-        # deriving each app's derivation name (`tagnet-<name>`) from its attr key
+        # deriving each app's derivation name (`onisync-<name>`) from its attr key
         # so the two never drift.
         mkApps = pkgs.lib.mapAttrs mkApp;
 
         # The Flutter app tree (app/) — including the Dart sources under app/lib/
         # (minus the generated app/lib/rust/) and the hand-merged Android glue —
         # is tracked in git and is the source of truth. It is never regenerated;
-        # the one-time scaffolding is documented in tagnet-bridge/android/README.md.
+        # the one-time scaffolding is documented in onisync-bridge/android/README.md.
 
         # Generate the Dart <-> Rust bindings.
         codegenBody = ''
@@ -201,14 +201,14 @@
           for abi in $abis; do targets+=("-t" "$abi"); done
           cargo ndk "''${targets[@]}" \
             -o app/android/app/src/main/jniLibs \
-            build --release -p tagnet-bridge --features generated
+            build --release -p onisync-bridge --features generated
         '';
 
         # Standalone build step: cross-compile for a fixed ABI set. Defaults to
-        # arm64-v8a (physical devices); override with TAGNET_ANDROID_ABIS
+        # arm64-v8a (physical devices); override with ONISYNC_ANDROID_ABIS
         # (space-separated) e.g. to produce a multi-ABI release build.
         buildNativeAndroidBody = ''
-          abis="''${TAGNET_ANDROID_ABIS:-arm64-v8a}"
+          abis="''${ONISYNC_ANDROID_ABIS:-arm64-v8a}"
           ${buildNativeForAbisBody}
         '';
 
@@ -222,12 +222,12 @@
         # x86_64 .so while only arm64-v8a was (re)built, and frb then misreads
         # the mismatched wire format ("Bad state: ...").
         #
-        # With more than one android device connected, set TAGNET_DEVICE to an
+        # With more than one android device connected, set ONISYNC_DEVICE to an
         # id/name (see `flutter devices`) to pick one.
         pickAndroidDevice = ''
           selector='.[0] // empty'
-          if [ -n "''${TAGNET_DEVICE:-}" ]; then
-            selector='map(select(.id == "'"$TAGNET_DEVICE"'" or .name == "'"$TAGNET_DEVICE"'"))[0] // empty'
+          if [ -n "''${ONISYNC_DEVICE:-}" ]; then
+            selector='map(select(.id == "'"$ONISYNC_DEVICE"'" or .name == "'"$ONISYNC_DEVICE"'"))[0] // empty'
           fi
           read -r device platform < <(
             flutter devices --machine \
@@ -249,13 +249,13 @@
           esac
         '';
 
-        # Copy the per-device runtime config selected by $TAGNET_CONFIG into
+        # Copy the per-device runtime config selected by $ONISYNC_CONFIG into
         # the Android asset the Kotlin runtime reads at start-up. This is what
         # puts one of the files under app/config/ inside the APK.
         selectAndroidConfigBody = ''
           mkdir -p app/android/app/src/main/assets
-          cp "app/config/''${TAGNET_CONFIG}.json" \
-             "app/android/app/src/main/assets/tagnet_config.json"
+          cp "app/config/''${ONISYNC_CONFIG}.json" \
+             "app/android/app/src/main/assets/onisync_config.json"
         '';
 
         # Fast path: pick the device and launch, no native rebuild. Assumes the
@@ -265,7 +265,7 @@
           ${selectAndroidConfigBody}
           # Select the in-process-engine backend at build time.
           ( cd app && flutter run --release -d "$device" \
-              --dart-define=TAGNET_BACKEND=android )
+              --dart-define=ONISYNC_BACKEND=android )
         '';
 
         # Full path: pick the device, build the native .so for exactly THAT
@@ -278,7 +278,7 @@
           abis="$device_abi"
           ${buildNativeForAbisBody}
           ( cd app && flutter run --release -d "$device" \
-              --dart-define=TAGNET_BACKEND=android )
+              --dart-define=ONISYNC_BACKEND=android )
         '';
 
         # Like run-android, but wipes the app's local data first by uninstalling the
@@ -289,15 +289,15 @@
         # an empty database on next launch. The package id matches
         # app/android/app/build.gradle.kts (applicationId).
         runAndroidCleanBody = ''
-          echo "Uninstalling com.example.tagnet_app to wipe local data..."
+          echo "Uninstalling com.example.onisync_app to wipe local data..."
           # adb ships with the composed Android SDK's platform-tools; reference
           # it by absolute path rather than assuming it is on PATH. Don't fail if
           # the package isn't installed yet.
-          "${androidSdkRoot}/platform-tools/adb" uninstall com.example.tagnet_app || true
+          "${androidSdkRoot}/platform-tools/adb" uninstall com.example.onisync_app || true
           # Rebuild the native .so for the device's ABI before running: a fresh
           # install (or a cleaned tree) has no bundled library, and `flutter run`
           # alone does not build it, so the app would crash with
-          # "libtagnet_bridge.so not found". Building the device's own ABI also
+          # "libonisync_bridge.so not found". Building the device's own ABI also
           # avoids the stale-.so / frb wire mismatch on x86_64 emulators.
           ${runAndroidLaunchBody}
         '';
@@ -307,7 +307,7 @@
         # Build/run the Flutter Linux desktop app. Unlike Android, the native
         # library is built and bundled by the runner's CMake hook
         # (app/linux/CMakeLists.txt) during `flutter run`, so there is no
-        # separate native-build step here. The daemon (tagnetd) is a separate,
+        # separate native-build step here. The daemon (onisyncd) is a separate,
         # long-lived process the user runs via systemd or cargo; the flake does
         # not build or manage it, and the app attaches to its control socket at
         # launch.
@@ -315,15 +315,15 @@
           # Select the daemon-attach backend at build time (the Dart sources are
           # shared with Android; only this define differs).
           ( cd app && flutter run -d linux \
-              --dart-define=TAGNET_BACKEND=linux )
+              --dart-define=ONISYNC_BACKEND=linux )
         '';
       in {
         formatter = pkgs.alejandra;
 
         packages = rec {
-          tagnetd = pkgs.tagnetd;
-          tagnet = pkgs.tagnet;
-          default = tagnet;
+          onisyncd = pkgs.onisyncd;
+          onisync = pkgs.onisync;
+          default = onisync;
         };
 
         apps = mkApps {
@@ -335,9 +335,9 @@
           # the connected device's ABI, then launch. The safe default; safe to
           # re-run.
           #
-          # Requires TAGNET_CONFIG=<name> (see app/config/) so the APK bundles
+          # Requires ONISYNC_CONFIG=<name> (see app/config/) so the APK bundles
           # a per-device runtime config. With more than one android device
-          # connected also set TAGNET_DEVICE=<id|name> to pick which one to
+          # connected also set ONISYNC_DEVICE=<id|name> to pick which one to
           # flash; see the run-android-phone / run-android-sylvie-phone
           # convenience apps below for the two-phone workflow.
           run-android = ''
@@ -352,7 +352,7 @@
           # identity + empty DB). Use after a schema change or to reset a device.
           run-android-clean = runAndroidCleanBody;
           # Individual build step, exposed for manual use / overriding ABIs
-          # (defaults to arm64-v8a; set TAGNET_ANDROID_ABIS for a release build).
+          # (defaults to arm64-v8a; set ONISYNC_ANDROID_ABIS for a release build).
           build-native-android = buildNativeAndroidBody;
 
           # --- Linux desktop apps (two-process topology) ---------------------
