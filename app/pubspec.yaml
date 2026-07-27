@@ -36,6 +36,13 @@ dependencies:
   cupertino_icons: ^1.0.8
   path_provider: ^2.1.6
   flutter_rust_bridge: 2.12.0
+  # Annotations for the freezed sealed unions the flutter_rust_bridge codegen
+  # emits for Rust enums-with-data (e.g. ApiEvent, OperationStatusDto). The
+  # generated `api.dart` imports this and declares `part 'api.freezed.dart'`,
+  # which `build_runner` fills in from the `freezed` dev-dependency below.
+  freezed_annotation: ^2.4.4
+  # Read/write JSON annotations that freezed's generated code references.
+  json_annotation: ^4.9.0
   # Receives files/text shared to the app via the Android share sheet
   # (ACTION_SEND / ACTION_SEND_MULTIPLE). Handles the intent plumbing,
   # content-resolver reads, and cold/warm-start cases.
@@ -55,6 +62,11 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
+
+  # Code generation for the freezed sealed unions in the generated Rust
+  # bindings. `dart run build_runner build` produces `api.freezed.dart`.
+  build_runner: ^2.4.13
+  freezed: ^2.5.7
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec

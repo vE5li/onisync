@@ -1,12 +1,11 @@
-//! UI-facing API (portability plan section 5).
+//! UI-facing API.
 //!
 //! This is the single, transport-agnostic API surface the UI talks to. It is
 //! deliberately a **v1**: every operation maps 1:1 onto capabilities that
 //! already exist in [`FileDatabase`](crate::database::FileDatabase) and the
-//! change pipeline. See the portability plan section 5.6 for explicit
-//! non-goals.
+//! change pipeline.
 //!
-//! ## Architecture (plan 5.1)
+//! ## Architecture
 //!
 //! The API is split into a read half and a write half because the core
 //! enforces a single-writer model:
@@ -25,9 +24,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use onisync_core::state::{Change, ChangeOrigin};
 use onisync_core::{FileId, FileInfo, LogicalPath, TagId};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{broadcast, oneshot};
 
@@ -37,7 +36,7 @@ use crate::directory_manager::SyncDirectoryCommand;
 use crate::fetch::PendingFetches;
 use crate::transfer::ChunkSource;
 
-/// Errors surfaced to the UI (plan 5.5).
+/// Errors surfaced to the UI.
 ///
 /// A single serializable error type so the transport can carry one shape over
 /// the wire. It wraps the crate's hand-rolled [`DatabaseError`] (which has no
@@ -125,7 +124,7 @@ pub struct QueryResult {
     pub tags: Vec<Tag>,
 }
 
-/// A live update delivered on the API event stream (plan 5.5).
+/// A live update delivered on the API event stream.
 ///
 /// Delivery is **best-effort**, mirroring the in-process ingest bus. There is
 /// no per-event replay or buffering. On (re)connection over IPC the transport
@@ -149,7 +148,7 @@ pub enum ApiEvent {
 /// Cheap to clone. Holds the pieces needed to serve reads (the DB path),
 /// serve writes (the ingest-bus sender), and produce the event stream (a
 /// broadcast subscription source). Constructed by [`run`](crate::run) and
-/// wrapped by each transport backend (plan section 6).
+/// wrapped by each transport backend.
 #[derive(Clone)]
 pub struct Api {
     main_db_path: PathBuf,
@@ -167,6 +166,10 @@ pub struct Api {
     /// completed fetch materializes here and the path is handed to the caller
     /// with move semantics. See [`crate::paths::Paths::fetch_temp_dir`].
     fetch_temp_dir: PathBuf,
+    /// Live sync-operation registry. Reads (`list_operations`) snapshot it;
+    /// `subscribe_operations` taps its event broadcast. Fed by the peer
+    /// sessions, not by this API.
+    operations: crate::operations::Operations,
 }
 
 impl Api {
@@ -191,6 +194,7 @@ impl Api {
         events: broadcast::Sender<Change>,
         pending_fetches: PendingFetches,
         fetch_temp_dir: PathBuf,
+        operations: crate::operations::Operations,
     ) -> Self {
         Self {
             main_db_path,
@@ -199,6 +203,7 @@ impl Api {
             events,
             pending_fetches,
             fetch_temp_dir,
+            operations,
         }
     }
 
@@ -226,8 +231,6 @@ impl Api {
             ))
             .map_err(|_| ApiError::Internal("runtime is shutting down".to_owned()))
     }
-
-    // --- Read API (plan 5.3) -------------------------------------------------
 
     /// Resolve a full-or-short file id `prefix` (as displayed by `list_files`'s
     /// short ids, or a pasted full id) to a single [`FileId`]. Backed by
@@ -268,11 +271,9 @@ impl Api {
 
     /// Run a free-form query and return both the matching files and tags.
     ///
-    /// The query is a whitespace-separated list of terms, combined
-    /// conjunctively (a result must satisfy every term):
-    ///
-    /// The query is a whitespace-separated list of *chunks*, each optionally
-    /// prefixed by `!` (negation) and/or a kind prefix:
+    /// The query is a whitespace-separated list of *chunks*, combined
+    /// conjunctively (a result must satisfy every chunk). Each chunk is
+    /// optionally prefixed by `!` (negation) and/or a kind prefix:
     ///
     /// - `/t foo` — require the tag(s) resolved from `foo`. A file matches if
     ///   it carries any such tag; a tag matches if it is a subtag of any.
@@ -424,8 +425,6 @@ impl Api {
             .into_iter()
             .collect())
     }
-
-    // --- Write API (plan 5.4) ------------------------------------------------
 
     /// Create a tag. Mints a fresh `TagId` and enqueues `Change::TagAdded`;
     /// the id is returned immediately (persistence is asynchronous — observe
@@ -699,8 +698,6 @@ impl Api {
         })
     }
 
-    // --- Event stream (plan 5.5) ---------------------------------------------
-
     /// Subscribe to the live change stream.
     ///
     /// Yields every [`Change`] applied by `handle_changes` after this call.
@@ -710,14 +707,36 @@ impl Api {
     pub fn subscribe(&self) -> broadcast::Receiver<Change> {
         self.events.subscribe()
     }
+
+    /// Snapshot every currently-active sync operation.
+    ///
+    /// The read counterpart of
+    /// [`subscribe_operations`](Self::subscribe_operations): the UI calls
+    /// this for its initial paint (and after an IPC `Resynced`),
+    /// then applies live [`OperationEvent`](crate::operations::OperationEvent)s
+    /// on top. Order is unspecified; the caller sorts by `started_at`.
+    pub fn list_operations(&self) -> Vec<crate::operations::Operation> {
+        self.operations.snapshot()
+    }
+
+    /// Subscribe to the live sync-operation stream.
+    ///
+    /// Yields every [`OperationEvent`](crate::operations::OperationEvent)
+    /// (started / progress / terminal) produced by the peer sessions after this
+    /// call. Best-effort, exactly like [`subscribe`](Self::subscribe): a slow
+    /// subscriber that lags past the channel capacity observes a
+    /// `RecvError::Lagged`, which the transport maps onto a re-snapshot prompt.
+    pub fn subscribe_operations(&self) -> broadcast::Receiver<crate::operations::OperationEvent> {
+        self.operations.subscribe()
+    }
 }
 
 /// Search-query lexer (stage 1 of two — see [`Api::parse_query`]).
 ///
 /// This module is deliberately **pure**: it turns a raw query string into a
 /// vector of [`Chunk`]s without ever touching the database. Resolving a chunk's
-/// text into concrete [`TagId`](onisync_core::TagId)s or applying it against the
-/// stored files happens in the resolver stage.
+/// text into concrete [`TagId`](onisync_core::TagId)s or applying it against
+/// the stored files happens in the resolver stage.
 ///
 /// # Grammar
 ///
@@ -1023,8 +1042,6 @@ pub(crate) mod chunk {
             );
         }
 
-        // --- Error-recovery contract --------------------------------------
-        //
         // The lexer is infallible: it drops the current chunk-in-progress on
         // any grammar error and resumes at the next whitespace boundary. The
         // tests below pin down exactly what "resume" means for each error

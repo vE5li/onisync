@@ -93,8 +93,6 @@ impl Debouncer {
         let mut split_new_events = Vec::new();
         let timestamp = Instant::now();
 
-        // println!("RAW: {:?}", event);
-
         // NOTE: This code assumes that events will not be bundled. E.g. two create
         // events being combined into a single event with multiple paths.
         match event.kind {

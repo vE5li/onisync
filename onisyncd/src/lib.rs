@@ -1,10 +1,9 @@
 //! Core onisync runtime as a library.
 //!
-//! This crate used to be a pure binary whose entire runtime lived in
-//! `main.rs`. It has been split so that the runtime is callable as a library
-//! function ([`run`]): the desktop binary (`main.rs`) is a thin CLI wrapper,
-//! and other frontends (e.g. an Android native library) can link this crate
-//! and call [`run`] directly without a `main()`.
+//! The runtime is callable as a library function ([`run`]): the desktop binary
+//! (`main.rs`) is a thin CLI wrapper, and other frontends (e.g. an Android
+//! native library) can link this crate and call [`run`] directly without a
+//! `main()`.
 //!
 //! All business logic (peer sync, the DB pipeline, change handling) lives
 //! here behind [`run`]. Frontends supply:
@@ -52,6 +51,7 @@ pub mod directory_manager;
 pub mod fetch;
 pub mod file_bytes;
 pub mod identity;
+pub mod operations;
 pub mod paths;
 pub mod transfer;
 pub mod transport;
@@ -130,6 +130,9 @@ struct PeerContext {
     pending_fetches: PendingFetches,
     change_sender: UnboundedSender<DaemonMessage>,
     command_sender: UnboundedSender<SyncDirectoryCommand>,
+    /// Live sync-operation registry, so peer sessions can surface what they are
+    /// doing (serving/receiving files, reconciling, fetching) to the UI.
+    operations: crate::operations::Operations,
 }
 
 /// Cooperative shutdown handle for [`run`].
@@ -333,6 +336,10 @@ pub async fn run(
     // the transport). Sized generously; the UI is expected to keep up.
     let (event_sender, _event_receiver) = tokio::sync::broadcast::channel(1024);
 
+    // Live sync-operation registry, shared by the UI-facing API (to snapshot /
+    // subscribe) and every peer session (to report work in progress).
+    let operations = crate::operations::Operations::new();
+
     let fetch_temp_dir = paths.fetch_temp_dir();
     if let Err(error) = paths.clean_fetch_temp_dir().await {
         log::warn!(
@@ -351,6 +358,7 @@ pub async fn run(
         event_sender.clone(),
         pending_fetches.clone(),
         fetch_temp_dir,
+        operations.clone(),
     );
 
     // The sync-directory manager is inherently single-threaded: it holds
@@ -401,6 +409,7 @@ pub async fn run(
         change_sender.clone(),
         command_sender.clone(),
         event_sender,
+        operations.clone(),
         shutdown.token().child_token(),
     ));
 
@@ -411,6 +420,7 @@ pub async fn run(
         pending_fetches: pending_fetches.clone(),
         change_sender: change_sender.clone(),
         command_sender: command_sender.clone(),
+        operations: operations.clone(),
     };
 
     let mut peer_handles = Vec::new();
@@ -557,6 +567,7 @@ async fn handle_connection(
         &main_db_path,
         outgoing,
         incoming,
+        operations::Direction::Inbound,
         context,
         &shutdown,
     )
@@ -594,6 +605,15 @@ async fn connect_to_peer(
         }
 
         log::debug!("Attempting outbound connection to {} ({url})", peer.name);
+        // Surface the connection attempt as a live operation. It resolves when
+        // we hand off to `run_peer_session` (completed) or the attempt fails
+        // (the handle is dropped -> aborted).
+        let connecting = context
+            .operations
+            .begin(operations::OperationKind::connecting_to_peer(
+                peer.name.clone(),
+                url.clone(),
+            ));
         let connect = tokio::select! {
             _ = shutdown.cancelled() => return,
             connect = tokio_tungstenite::connect_async(&url) => connect,
@@ -669,12 +689,17 @@ async fn connect_to_peer(
                     continue;
                 }
 
+                // Connected: the attempt operation is done. The session's own
+                // `PeerConnected` operation now represents the live link.
+                connecting.complete();
+
                 run_peer_session(
                     &peer.public_key,
                     &peer.name,
                     &main_db_path,
                     outgoing,
                     incoming,
+                    operations::Direction::Outbound,
                     context.clone(),
                     &shutdown,
                 )
@@ -758,12 +783,14 @@ async fn read_handshake(
 /// Opens its own read-only handle on the main DB. The DB is shared with
 /// `handle_changes` and with other connection tasks; SQLite serialises these
 /// accesses at the file level. Writes still only happen from `handle_changes`.
+#[allow(clippy::too_many_arguments)]
 async fn run_peer_session<S>(
     peer_public_key: &str,
     peer_name: &str,
     main_db_path: &std::path::Path,
     mut outgoing: SplitSink<WebSocketStream<S>, Message>,
     mut incoming: SplitStream<WebSocketStream<S>>,
+    direction: operations::Direction,
     context: PeerContext,
     shutdown: &CancellationToken,
 ) where
@@ -774,7 +801,17 @@ async fn run_peer_session<S>(
         pending_fetches,
         change_sender,
         command_sender,
+        operations,
     } = context;
+
+    // The steady-state "connected to this peer" operation. Held for the life of
+    // the session; dropped (its terminal `Aborted`/`Completed`) when the
+    // session ends. We `complete` it on a clean close below.
+    let _peer_connected = operations.begin(operations::OperationKind::peer_connected(
+        peer_name,
+        peer_public_key,
+        direction,
+    ));
 
     // FileDatabase wraps a rusqlite Connection which is Send but not Sync.
     // We must never hold `&FileDatabase` across an `.await` in this task,
@@ -830,6 +867,8 @@ async fn run_peer_session<S>(
         let our_sender = our_sender.clone();
         let receiver_done_tx = receiver_done_tx.clone();
         let transfer_temp_dir = transfer_temp_dir.clone();
+        let operations = operations.clone();
+        let peer_name = peer_name.to_owned();
 
         move |file_id: FileId,
               content_hash: String,
@@ -838,6 +877,20 @@ async fn run_peer_session<S>(
             let transfer_id = TransferId::new();
             let temp_path = transfer_temp_dir.join(transfer_id.to_string());
             let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+
+            // Surface this pull as a live "receiving file" operation with byte
+            // progress. The handle lives on the bridge task below and reaches a
+            // terminal state from the transfer outcome.
+            let receiving = operations.begin(operations::OperationKind::receiving_file(
+                file_id, &peer_name,
+            ));
+            let progress = {
+                let operations = operations.clone();
+                let id = receiving.id();
+                Box::new(move |done: u64, total: Option<u64>| {
+                    operations.report_progress(id, done, total);
+                }) as transfer::ProgressSink
+            };
 
             let inbound = spawn_receiver(
                 transfer_id,
@@ -848,13 +901,20 @@ async fn run_peer_session<S>(
                 our_sender.clone(),
                 Frame::Sync,
                 outcome_tx,
+                Some(progress),
             );
 
             let done_tx = receiver_done_tx.clone();
             tokio::spawn(async move {
                 if let Ok(outcome) = outcome_rx.await {
+                    match &outcome {
+                        ReceiveOutcome::Complete(_) => receiving.complete(),
+                        ReceiveOutcome::Failed(error) => receiving.fail(error.to_string()),
+                    }
                     let _ = done_tx.send((transfer_id, purpose, outcome));
                 }
+                // If `outcome_rx` closed without a value, `receiving` drops
+                // here and the operation is marked aborted.
             });
 
             (transfer_id, inbound)
@@ -1196,8 +1256,12 @@ async fn run_peer_session<S>(
                         let announced_file_ids: Vec<FileId> =
                             entries.iter().map(|entry| entry.file_id).collect();
 
+                        let reconciling = operations.begin(
+                            operations::OperationKind::reconciling_manifest(peer_name),
+                        );
                         let (wanted, deletions) =
                             reconcile_peer_manifest(peer_name, entries, &database);
+                        reconciling.complete();
 
                         // Apply peer deletions that won last-writer-wins by
                         // enqueuing them through the sole DB writer.
@@ -1432,6 +1496,8 @@ async fn run_peer_session<S>(
                             );
                             continue;
                         };
+                        let reconciling_tags = operations
+                            .begin(operations::OperationKind::reconciling_tags(peer_name));
                         reconcile_peer_tag_manifest(
                             peer_name,
                             peer_public_key,
@@ -1441,6 +1507,7 @@ async fn run_peer_session<S>(
                             &outbound,
                             &change_sender,
                         );
+                        reconciling_tags.complete();
                     }
                     Frame::Sync(SyncMessage::TagRequest { tag_id }) => {
                         // Answer with the full tag definition as a
@@ -1517,12 +1584,58 @@ async fn run_peer_session<S>(
                             }
                             _ => None,
                         };
+                        // Build a progress sink + register a "serving file"
+                        // operation for whichever source ends up serving the
+                        // bytes. `serve_progress` begins the operation, wires a
+                        // byte-progress sink, and spawns a task that awaits the
+                        // sender's `SenderOutcome` to set the terminal state —
+                        // mirroring the receiver's `start_pull` bridge. It
+                        // returns the `(progress_sink, done_sender)` pair
+                        // `spawn_sender` needs. The operation's lifetime is thus
+                        // owned by that task, not the demux table, so it always
+                        // reaches a terminal state (the demux entry only tracks
+                        // frame routing).
+                        let serve_progress = |source: operations::ServeSource| {
+                            let handle = operations.begin(operations::OperationKind::sending_file(
+                                file_id, peer_name, source,
+                            ));
+                            let id = handle.id();
+                            let operations_for_sink = operations.clone();
+                            let sink = Box::new(move |done: u64, total: Option<u64>| {
+                                operations_for_sink.report_progress(id, done, total);
+                            }) as transfer::ProgressSink;
+
+                            let (done_tx, done_rx) =
+                                tokio::sync::oneshot::channel::<transfer::SenderOutcome>();
+                            tokio::spawn(async move {
+                                match done_rx.await {
+                                    Ok(transfer::SenderOutcome::Complete) => handle.complete(),
+                                    Ok(transfer::SenderOutcome::Aborted(reason)) => {
+                                        handle.fail(reason)
+                                    }
+                                    // Sender task dropped without reporting: the
+                                    // handle drops here and the operation is
+                                    // marked aborted.
+                                    Err(_) => {}
+                                }
+                            });
+                            (sink, done_tx)
+                        };
                         let inbound = if let Some(content) = sync_content {
                             log::debug!(
                                 "TransferStart {transfer_id}: serving {} from a sync directory",
                                 file_id.to_string()
                             );
-                            Some(spawn_sender(transfer_id, content, our_sender.clone(), Frame::Sync))
+                            let (sink, done_tx) =
+                                serve_progress(operations::ServeSource::SyncDirectory);
+                            Some(spawn_sender(
+                                transfer_id,
+                                content,
+                                our_sender.clone(),
+                                Frame::Sync,
+                                Some(sink),
+                                done_tx,
+                            ))
                         } else if let Some(provider) =
                             pending_fetches.provider_for(file_id, &content_hash).await
                         {
@@ -1530,7 +1643,15 @@ async fn run_peer_session<S>(
                                 "TransferStart {transfer_id}: serving {} from a local provider",
                                 file_id.to_string()
                             );
-                            Some(spawn_sender(transfer_id, provider, our_sender.clone(), Frame::Sync))
+                            let (sink, done_tx) = serve_progress(operations::ServeSource::Provider);
+                            Some(spawn_sender(
+                                transfer_id,
+                                provider,
+                                our_sender.clone(),
+                                Frame::Sync,
+                                Some(sink),
+                                done_tx,
+                            ))
                         } else {
                             pending_fetches
                                 .take_fetch_cached(file_id, &content_hash)
@@ -1540,7 +1661,16 @@ async fn run_peer_session<S>(
                                         "TransferStart {transfer_id}: serving {} from the fetch cache",
                                         file_id.to_string()
                                     );
-                                    spawn_sender(transfer_id, content, our_sender.clone(), Frame::Sync)
+                                    let (sink, done_tx) =
+                                        serve_progress(operations::ServeSource::FetchCache);
+                                    spawn_sender(
+                                        transfer_id,
+                                        content,
+                                        our_sender.clone(),
+                                        Frame::Sync,
+                                        Some(sink),
+                                        done_tx,
+                                    )
                                 })
                         };
                         match inbound {
@@ -1578,7 +1708,10 @@ async fn run_peer_session<S>(
                                         matches!(message, TransferMessage::Abort { .. });
                                     if endpoint.send(message).is_err() || is_abort {
                                         // Endpoint gone, or the transfer aborted:
-                                        // drop the demux entry.
+                                        // drop the demux entry. The serve
+                                        // operation's terminal state is handled
+                                        // by the sender task via its
+                                        // `SenderOutcome`, not here.
                                         transfers.remove(&transfer_id);
                                     }
                                 }
@@ -2431,6 +2564,7 @@ fn reconcile_tag_placement(
 async fn fetch_and_place_deferred(
     pending_fetches: &PendingFetches,
     change_sender: &UnboundedSender<DaemonMessage>,
+    operations: &crate::operations::Operations,
     placement: DeferredPlacement,
 ) {
     let DeferredPlacement {
@@ -2478,6 +2612,8 @@ async fn fetch_and_place_deferred(
         file_id.to_string(),
         expected_hash,
     );
+    // Surface the placement fetch as a live operation for the UI.
+    let placing = operations.begin(operations::OperationKind::placing_file(file_id));
     let (fetch_respond, fetch_result) = tokio::sync::oneshot::channel();
     pending_fetches
         .start_local_fetch(file_id, expected_hash.clone(), fetch_respond)
@@ -2489,6 +2625,7 @@ async fn fetch_and_place_deferred(
                 "reconcile_tag_placement: fetch of {} succeeded; materializing",
                 file_id.to_string()
             );
+            placing.complete();
             content
         }
         Ok(Err(error)) => {
@@ -2498,6 +2635,7 @@ async fn fetch_and_place_deferred(
                 "reconcile_tag_placement: fetch of {} failed ({error:?}); placement deferred until a peer can serve it",
                 file_id.to_string()
             );
+            placing.fail(format!("{error:?}"));
             return;
         }
         Err(_) => {
@@ -2505,6 +2643,7 @@ async fn fetch_and_place_deferred(
                 "reconcile_tag_placement: fetch engine dropped responder for {}",
                 file_id.to_string()
             );
+            placing.fail("fetch engine dropped responder");
             return;
         }
     };
@@ -2518,7 +2657,7 @@ async fn fetch_and_place_deferred(
         content,
         content_hash: expected_hash,
         // Bytes sourced by our own on-demand fetch, not a specific announcing
-        // peer. `Materialize` no longer records a version or forwards, so the
+        // peer. `Materialize` does not record a version or forward, so the
         // origin is only a sentinel here.
         origin: ChangeOrigin::Local {
             directory_path: std::path::PathBuf::new(),
@@ -2550,6 +2689,7 @@ async fn handle_changes(
     change_sender: UnboundedSender<DaemonMessage>,
     command_sender: UnboundedSender<SyncDirectoryCommand>,
     event_sender: tokio::sync::broadcast::Sender<Change>,
+    operations: crate::operations::Operations,
     shutdown: CancellationToken,
 ) {
     /// Origin tag stored in `file_versions.origin` for locally-observed
@@ -3102,8 +3242,27 @@ async fn handle_changes(
                     return;
                 }
 
+                // Surface this on-demand fetch as a live operation. Interpose a
+                // oneshot so we can observe the outcome (to set the terminal
+                // state) before forwarding it to the original waiter.
+                let fetching = operations.begin(operations::OperationKind::fetching(file_id));
+                let (proxy_tx, proxy_rx) =
+                    tokio::sync::oneshot::channel::<Result<FileBytes, bus::FetchError>>();
+                tokio::spawn(async move {
+                    // If the fetch engine drops the responder, `proxy_rx` errors:
+                    // `fetching` then drops here (marked aborted) and the waiter
+                    // is left to time out, matching the pre-existing behaviour.
+                    if let Ok(result) = proxy_rx.await {
+                        match &result {
+                            Ok(_) => fetching.complete(),
+                            Err(error) => fetching.fail(error.to_string()),
+                        }
+                        let _ = respond_to.send(result);
+                    }
+                });
+
                 pending_fetches
-                    .start_local_fetch(file_id, expected_hash, respond_to)
+                    .start_local_fetch(file_id, expected_hash, proxy_tx)
                     .await;
 
                 continue;
@@ -3128,8 +3287,15 @@ async fn handle_changes(
                 {
                     let pending_fetches = pending_fetches.clone();
                     let change_sender = change_sender.clone();
+                    let operations = operations.clone();
                     tokio::spawn(async move {
-                        fetch_and_place_deferred(&pending_fetches, &change_sender, deferred).await;
+                        fetch_and_place_deferred(
+                            &pending_fetches,
+                            &change_sender,
+                            &operations,
+                            deferred,
+                        )
+                        .await;
                     });
                 }
                 continue;
@@ -3848,7 +4014,13 @@ async fn handle_changes(
                 if let Some(deferred) =
                     reconcile_tag_placement(&command_sender, &database, *file_id)
                 {
-                    fetch_and_place_deferred(&pending_fetches, &change_sender, deferred).await;
+                    fetch_and_place_deferred(
+                        &pending_fetches,
+                        &change_sender,
+                        &operations,
+                        deferred,
+                    )
+                    .await;
                 }
 
                 forward_to_peers(
@@ -3889,7 +4061,13 @@ async fn handle_changes(
                 if let Some(deferred) =
                     reconcile_tag_placement(&command_sender, &database, *file_id)
                 {
-                    fetch_and_place_deferred(&pending_fetches, &change_sender, deferred).await;
+                    fetch_and_place_deferred(
+                        &pending_fetches,
+                        &change_sender,
+                        &operations,
+                        deferred,
+                    )
+                    .await;
                 }
 
                 forward_to_peers(
@@ -3964,7 +4142,7 @@ async fn handle_changes(
             }
         }
 
-        // Publish the applied change to UI-facing API subscribers (plan 5.5).
+        // Publish the applied change to UI-facing API subscribers.
         // Best-effort: if there are no subscribers, or the channel is full and
         // a subscriber lags, the send/receive machinery handles it (the
         // subscriber observes `Lagged`, mapped to `Resynced` by the transport).

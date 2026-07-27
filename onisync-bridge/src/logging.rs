@@ -1,4 +1,4 @@
-//! Log routing for embedded frontends (portability plan section 8).
+//! Log routing for embedded frontends.
 //!
 //! The desktop binary uses `env_logger`, which writes to stderr — there is no
 //! stderr on Android. This module installs `android_logger` so the core's

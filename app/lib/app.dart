@@ -4,8 +4,7 @@
 // main.dart via --dart-define) and drives the lifecycle that is identical on
 // every platform — connect, then hand the session to the home screen. Live
 // updates and query dispatch are owned by the screens themselves (each opens
-// its own change-stream subscription), so no state below the session lives
-// here anymore. The actual pixels live in screens/.
+// its own change-stream subscription); the actual pixels live in screens/.
 
 import 'package:flutter/material.dart';
 
@@ -44,8 +43,8 @@ class _OniSyncAppState extends State<OniSyncApp> {
       });
 
       // Wire any platform-only inputs (Android share sheet); no-op on Linux.
-      // `onChanged` used to trigger an app-level re-fetch; screens now watch
-      // the change stream directly, so the callback is intentionally a no-op.
+      // `onChanged` is intentionally a no-op: screens watch the change stream
+      // directly, so no app-level re-fetch is needed.
       widget.bootstrap.attachInputs(
         session,
         showMessage: _showMessage,

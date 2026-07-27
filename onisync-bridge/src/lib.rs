@@ -1,9 +1,8 @@
-//! Native bridge library for embedded frontends (portability plan section 8).
+//! Native bridge library for embedded frontends.
 //!
 //! This crate is the `cdylib` the Android app (and, later, a single-process
 //! desktop build) loads. It links the [`onisync`] core as an `rlib` and
-//! re-exposes the section-5/6 UI-facing API to Dart via
-//! `flutter_rust_bridge`.
+//! re-exposes the UI-facing API to Dart via `flutter_rust_bridge`.
 //!
 //! It adds no business logic. Its whole job is lifecycle + transport glue:
 //!
@@ -36,7 +35,6 @@ pub mod logging;
 pub mod runtime;
 pub mod service;
 
-// JNI entry points for the Android foreground service (Android only).
 #[cfg(target_os = "android")]
 pub mod jni;
 

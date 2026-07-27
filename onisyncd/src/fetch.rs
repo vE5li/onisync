@@ -1,10 +1,11 @@
 //! On-demand recursive file fetch across the live peer tree.
 //!
 //! Used by `onisync edit <uuid>` when a file's bytes are not present
-//! locally. A [`Sync::FetchRequest`](onisync_core::state::Sync::FetchRequest) is
-//! flooded across the tree of *live* peer connections, which is assumed acyclic
-//! (there is no seen-set / TTL — a node simply never forwards a request back to
-//! the peer it arrived from). Modelled as a "call stack across machines":
+//! locally. A [`Sync::FetchRequest`](onisync_core::state::Sync::FetchRequest)
+//! is flooded across the tree of *live* peer connections, which is assumed
+//! acyclic (there is no seen-set / TTL — a node simply never forwards a request
+//! back to the peer it arrived from). Modelled as a "call stack across
+//! machines":
 //!
 //! - Each node, on receiving a `FetchRequest` it cannot satisfy locally,
 //!   forwards it to all its neighbours **except the one it came from** and

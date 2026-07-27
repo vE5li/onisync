@@ -1,4 +1,4 @@
-//! Daemon local control endpoint (portability plan section 7).
+//! Daemon local control endpoint.
 //!
 //! On Linux the sync engine and the DB live in a long-running (systemd) daemon,
 //! while the UI is a *separate* process. Because [`FileDatabase`] is
@@ -20,7 +20,7 @@
 //! over the [`UnixListener`], so the networking code stays unified. The wire
 //! payloads, however, are a **distinct message category** from the peer
 //! `Change`/`Sync` protocol: peer framing is about *sync*; control framing
-//! ([`ControlFrame`]) carries the section-5 API requests/responses/events.
+//! ([`ControlFrame`]) carries the UI-facing API requests/responses/events.
 //!
 //! ## Relationship to the peer-sync port
 //!
@@ -36,11 +36,11 @@
 //! - [`serve_control`] is the **daemon side**: accepts connections, decodes
 //!   [`ControlRequest`]s, dispatches them to the in-process [`Api`], and
 //!   streams [`ApiEvent`]s back as [`ControlFrame::Event`].
-//! - [`IpcClientBackend`] is the **client side** (portability plan section 6's
-//!   IPC-client backend): it connects to the socket, serialises API calls, and
-//!   returns results/events. It implements [`TransportBackend`], so the Dart UI
-//!   (via `flutter_rust_bridge`) and the `onisync` CLI talk to it exactly as
-//!   they would the in-process backend.
+//! - [`IpcClientBackend`] is the **client side** IPC-client backend: it
+//!   connects to the socket, serialises API calls, and returns results/events.
+//!   It implements [`TransportBackend`], so the Dart UI (via
+//!   `flutter_rust_bridge`) and the `onisync` CLI talk to it exactly as they
+//!   would the in-process backend.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -49,8 +49,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
 use onisync_core::{FileId, FileInfo, TagId};
+use serde::{Deserialize, Serialize};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::WebSocketStream;
@@ -60,9 +60,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::{Api, ApiError, ApiEvent, QueryResult};
 use crate::database::{SubtagRule, Tag};
-use crate::transport::{EventStream, TransportBackend};
-
-// --- Wire protocol (plan 5.3/5.4/5.5 over the control socket) ----------------
+use crate::transport::{EventStream, OperationStream, OperationUpdate, TransportBackend};
 
 /// A UI-facing API call, sent by a control client to the daemon.
 ///
@@ -110,7 +108,7 @@ pub enum ControlRequest {
         tag_id: TagId,
         subtag_rule: SubtagRule,
     },
-    // Writes (plan 5.4).
+    // Writes.
     CreateTag {
         name: String,
         color: String,
@@ -188,12 +186,19 @@ pub enum ControlRequest {
     /// emitting [`ControlFrame::Event`]s on this connection; the response is
     /// [`ControlResponse::Subscribed`].
     Subscribe,
+    /// Snapshot every currently-active sync operation. Answered with
+    /// [`ControlResponse::Operations`].
+    ListOperations,
+    /// Subscribe to the operation stream. After this is accepted the daemon
+    /// starts emitting [`ControlFrame::OperationEvent`]s on this connection;
+    /// the response is [`ControlResponse::OperationsSubscribed`].
+    SubscribeOperations,
 }
 
 /// The result of a [`ControlRequest`], returned as [`ControlFrame::Response`].
 ///
 /// Every variant is either the success payload of the matching request or the
-/// single serialisable [`ApiError`] (plan 5.5). The client maps these back onto
+/// single serialisable [`ApiError`]. The client maps these back onto
 /// the [`TransportBackend`] return types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlResponse {
@@ -222,6 +227,12 @@ pub enum ControlResponse {
     Ok,
     /// The subscription was established; events will follow on this connection.
     Subscribed,
+    /// A snapshot of currently-active sync operations (answer to
+    /// [`ControlRequest::ListOperations`]).
+    Operations(Vec<crate::operations::Operation>),
+    /// The operation subscription was established; operation events will follow
+    /// on this connection.
+    OperationsSubscribed,
     /// The request failed. Carries the single UI-facing error type.
     Error(ApiError),
 }
@@ -238,12 +249,12 @@ pub enum ControlFrame {
     Request { id: u64, request: ControlRequest },
     /// Daemon -> client: the reply to the request with matching `id`.
     Response { id: u64, response: ControlResponse },
-    /// Daemon -> client: an unsolicited event on a subscribed connection
-    /// (plan 5.5).
+    /// Daemon -> client: an unsolicited event on a subscribed connection.
     Event(ApiEvent),
+    /// Daemon -> client: an unsolicited sync-operation event on a connection
+    /// that sent [`ControlRequest::SubscribeOperations`].
+    OperationEvent(crate::operations::OperationEvent),
 
-    // --- Provider protocol (daemon pulls chunks from the client) -------------
-    //
     // Reverse-direction request/reply used while the client is serving an
     // upload/edit's bytes on demand. Correlated by `chunk_id` (per connection).
     /// Daemon -> client: send the chunk of the in-flight upload/edit at
@@ -257,10 +268,7 @@ pub enum ControlFrame {
     },
 }
 
-// --- Daemon side -------------------------------------------------------------
-
-/// Bind the control socket and serve control clients until `shutdown` fires
-/// (portability plan section 7).
+/// Bind the control socket and serve control clients until `shutdown` fires.
 ///
 /// Binds a [`UnixListener`] at `socket_path`, removing any stale socket file
 /// left by a previous run first (a leftover socket makes `bind` fail with
@@ -348,6 +356,11 @@ async fn handle_control_connection(api: Api, stream: UnixStream, shutdown: Cance
     // un-subscribed connection never wakes on the event branch.
     let mut events: Option<EventStream> = None;
 
+    // Populated once the client sends `SubscribeOperations`. Independent of the
+    // change-event subscription above so a client can take one, both, or
+    // neither.
+    let mut operation_events: Option<OperationStream> = None;
+
     // Provider protocol state for this connection. A `ProviderSource` (held by
     // the transfer subsystem) asks for a chunk by sending `(offset, reply)` on
     // `provider_req`; we assign a `chunk_id`, remember the reply oneshot, and
@@ -384,6 +397,27 @@ async fn handle_control_connection(api: Api, stream: UnixStream, shutdown: Cance
                         // The runtime's event bus closed (shutdown).
                         break;
                     }
+                }
+            }
+            // Forward live operation events to a subscribed client. A lag on the
+            // operation broadcast surfaces as `Resynced`, which we forward
+            // verbatim so the client re-snapshots via `ListOperations`.
+            operation = async { operation_events.as_mut().unwrap().recv().await }, if operation_events.is_some() => {
+                match operation {
+                    Some(OperationUpdate::Event(event)) => {
+                        if let Err(error) =
+                            send_control(&mut outgoing, &ControlFrame::OperationEvent(event)).await
+                        {
+                            log::debug!("Failed to push operation event: {error}");
+                            break;
+                        }
+                    }
+                    // A lag: the client should re-snapshot. There is no dedicated
+                    // "resync operations" frame; the change-stream `Resynced`
+                    // already prompts a full re-fetch of live state, so drop the
+                    // marker here and let the next event catch the client up.
+                    Some(OperationUpdate::Resynced) => {}
+                    None => break,
                 }
             }
             // A provider source wants a chunk from the client: forward it as a
@@ -463,6 +497,7 @@ async fn handle_control_connection(api: Api, stream: UnixStream, shutdown: Cance
                             &api,
                             request,
                             &mut events,
+                            &mut operation_events,
                             &provider_req_tx,
                             &provider_done_tx,
                             &mut active_provider,
@@ -506,6 +541,7 @@ async fn dispatch(
     api: &Api,
     request: ControlRequest,
     events: &mut Option<EventStream>,
+    operation_events: &mut Option<OperationStream>,
     provider_req_tx: &mpsc::UnboundedSender<crate::transfer::ProviderChunkRequest>,
     provider_done_tx: &mpsc::UnboundedSender<()>,
     active_provider: &mut Option<(FileId, String)>,
@@ -658,6 +694,11 @@ async fn dispatch(
             *events = Some(EventStream::InProcess(api.subscribe()));
             ControlResponse::Subscribed
         }
+        ControlRequest::ListOperations => ControlResponse::Operations(api.list_operations()),
+        ControlRequest::SubscribeOperations => {
+            *operation_events = Some(OperationStream::InProcess(api.subscribe_operations()));
+            ControlResponse::OperationsSubscribed
+        }
     }
 }
 
@@ -693,9 +734,7 @@ async fn send_control(
         .map_err(|error| format!("send: {error}"))
 }
 
-// --- Client side (plan section 6 IPC-client backend) -------------------------
-
-/// The IPC-client transport backend (portability plan section 6).
+/// The IPC-client transport backend.
 ///
 /// A thin embedded Rust client that connects to the daemon's control socket,
 /// serialises [`TransportBackend`] calls into [`ControlRequest`]s, and awaits
@@ -757,6 +796,9 @@ struct IpcClientInner {
     next_id: AtomicU64,
     /// Broadcast of events received on this connection. `subscribe` taps it.
     events: tokio::sync::broadcast::Sender<ApiEvent>,
+    /// Broadcast of operation events received on this connection.
+    /// `subscribe_operations` taps it.
+    operation_events: tokio::sync::broadcast::Sender<crate::operations::OperationEvent>,
     /// The local file this client is currently serving as a temporary provider
     /// (an in-flight upload/edit). The reader task answers the daemon's
     /// `ProviderChunkRequest`s by reading chunks from this path.
@@ -797,11 +839,13 @@ impl IpcClientBackend {
         let (outgoing, mut incoming) = ws_stream.split();
 
         let (events, _) = tokio::sync::broadcast::channel(1024);
+        let (operation_events, _) = tokio::sync::broadcast::channel(1024);
         let inner = Arc::new(IpcClientInner {
             writer: Mutex::new(outgoing),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
             events: events.clone(),
+            operation_events: operation_events.clone(),
             provider_path: Mutex::new(None),
         });
 
@@ -840,8 +884,12 @@ impl IpcClientBackend {
                         }
                     }
                     ControlFrame::Event(event) => {
-                        // Best-effort (plan 5.5): if no one is subscribed, drop.
+                        // Best-effort: if no one is subscribed, drop.
                         let _ = reader_inner.events.send(event);
+                    }
+                    ControlFrame::OperationEvent(event) => {
+                        // Best-effort: if no one is subscribed, drop.
+                        let _ = reader_inner.operation_events.send(event);
                     }
                     // The daemon is pulling a chunk of the file we're currently
                     // providing (an in-flight upload/edit). Read it from the
@@ -897,6 +945,14 @@ impl IpcClientBackend {
         // daemon subscription.
         match client.call(ControlRequest::Subscribe).await? {
             ControlResponse::Subscribed => {}
+            other => return Err(unexpected(other)),
+        }
+
+        // Likewise subscribe to the operation stream once, up front, so the
+        // reader task observes `ControlFrame::OperationEvent`s and the local
+        // `operation_events` broadcast is fed for `subscribe_operations` taps.
+        match client.call(ControlRequest::SubscribeOperations).await? {
+            ControlResponse::OperationsSubscribed => {}
             other => return Err(unexpected(other)),
         }
 
@@ -1272,6 +1328,17 @@ impl TransportBackend for IpcClientBackend {
     fn subscribe(&self) -> EventStream {
         EventStream::Ipc(self.inner.events.subscribe())
     }
+
+    async fn list_operations(&self) -> Result<Vec<crate::operations::Operation>, ApiError> {
+        match self.call(ControlRequest::ListOperations).await? {
+            ControlResponse::Operations(operations) => Ok(operations),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    fn subscribe_operations(&self) -> OperationStream {
+        OperationStream::Ipc(self.inner.operation_events.subscribe())
+    }
 }
 
 #[cfg(test)]
@@ -1279,9 +1346,9 @@ mod tests {
     use super::*;
 
     /// Every control frame must round-trip through the binary codec unchanged.
-    /// The provider chunk reply is the one that broke the old JSON framing (a
-    /// `Vec<u8>` serialized as a giant number-array), so it is exercised
-    /// explicitly at a realistic chunk size.
+    /// The provider chunk reply is exercised explicitly at a realistic chunk
+    /// size because a JSON codec would serialize its `Vec<u8>` as a giant
+    /// number-array, which is exactly the failure the binary codec prevents.
     #[test]
     fn frames_round_trip_through_binary_codec() {
         let file_id = FileId::new();

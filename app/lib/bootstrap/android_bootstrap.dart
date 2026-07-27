@@ -1,5 +1,5 @@
 // Android backend: start an in-process sync engine and accept files shared to
-// the app (portability plan section 8).
+// the app.
 //
 // Unlike Linux (which attaches to a daemon), this process OWNS the engine, DB,
 // and identity. It also wires the Android share sheet so "Share to onisync"
@@ -34,9 +34,9 @@ class AndroidBootstrap extends OniSyncBootstrap {
     // Loads libonisync_bridge.so and wires up the generated bindings.
     await RustLib.init();
 
-    // Fetch the runtime startup inputs from Kotlin. Editing the peer config
-    // means editing OniSyncConfig.kt — there is no JSON literal on the Dart
-    // side any more.
+    // Fetch the runtime startup inputs from Kotlin. The peer config lives
+    // in OniSyncConfig.kt (single source of truth); the Dart side never
+    // holds a JSON literal.
     final inputs = await _configChannel.invokeMapMethod<String, String>(
       'getStartupInputs',
     );

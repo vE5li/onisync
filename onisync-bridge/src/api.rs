@@ -1,10 +1,10 @@
-//! Dart-facing API surface (portability plan sections 5, 6, 8).
+//! Dart-facing API surface.
 //!
 //! This is the thin layer `flutter_rust_bridge` generates Dart bindings for. It
 //! deliberately adds **no** business logic: it owns a [`RuntimeHandle`] and
-//! forwards every call to the section-6 [`Backend`], which forwards to the
-//! section-5 [`Api`](onisyncd::api::Api). The Dart UI holds one [`OniSyncApp`]
-//! and never learns which transport backs it.
+//! forwards every call to the [`Backend`], which forwards to the
+//! [`Api`](onisyncd::api::Api). The Dart UI holds one [`OniSyncApp`] and never
+//! learns which transport backs it.
 //!
 //! The `#[flutter_rust_bridge::frb]` annotations are applied only when the
 //! `flutter_rust_bridge` feature is enabled (via `cfg_attr`), so the crate
@@ -19,8 +19,13 @@
 pub use onisync_core::{FileId, FileInfo, TagId};
 pub use onisyncd::api::{ApiError, ApiEvent};
 pub use onisyncd::database::{SubtagRule, Tag};
+pub use onisyncd::operations::{
+    Direction, Operation, OperationEvent, OperationKind, OperationStatus, ServeSource,
+};
 use onisyncd::paths::Paths;
-use onisyncd::transport::{Backend, EventStream, TransportBackend};
+use onisyncd::transport::{
+    Backend, EventStream, OperationStream, OperationUpdate, TransportBackend,
+};
 use tokio::sync::Mutex;
 
 use crate::runtime::StartError;
@@ -107,6 +112,169 @@ pub struct QueryEntries {
     pub tags: Vec<TagEntry>,
 }
 
+/// A live sync operation flattened into primitive fields for the Dart UI.
+///
+/// The daemon's [`Operation`] (and its nested [`OperationKind`]/
+/// [`OperationStatus`]) live in a foreign crate, so — as with [`FileEntry`] —
+/// `flutter_rust_bridge` cannot see inside them to generate readable Dart
+/// classes. This DTO re-expresses the same information as flat, displayable
+/// fields.
+///
+/// `kind` is a stable machine string (e.g. `"sending_file"`,
+/// `"receiving_file"`, `"connecting_to_peer"`) the UI switches on to choose an
+/// icon/label. The optional fields carry whatever that kind provides; a field
+/// is empty/None for kinds that do not use it.
+pub struct OperationEntry {
+    /// Stable id for the life of the operation; the UI keys rows on it so a
+    /// row updates in place from start through progress to its terminal state.
+    pub id: u64,
+    /// Machine-readable kind discriminant (see the type docs).
+    pub kind: String,
+    /// The peer this operation involves, if any (its configured name).
+    pub peer_name: Option<String>,
+    /// The file this operation concerns, as its id string, if any.
+    pub file_id: Option<String>,
+    /// For `sending_file`: where the bytes are read from
+    /// (`"sync_directory"` / `"provider"` / `"fetch_cache"`).
+    pub serve_source: Option<String>,
+    /// The current lifecycle status.
+    pub status: OperationStatusDto,
+    /// Bytes/entries done so far, when the operation reports progress.
+    pub progress_done: Option<u64>,
+    /// Total bytes/entries, when known.
+    pub progress_total: Option<u64>,
+    /// Wall-clock milliseconds when the operation started.
+    pub started_at: i64,
+    /// Wall-clock milliseconds of the last update.
+    pub updated_at: i64,
+}
+
+/// The lifecycle status of an [`OperationEntry`], as a real Dart enum.
+pub enum OperationStatusDto {
+    /// Running (progress, if any, is on the [`OperationEntry`] fields).
+    Active,
+    /// Finished successfully.
+    Completed,
+    /// Finished with an error. Carries the reason.
+    Failed { reason: String },
+    /// Ended without a terminal outcome (cancelled / link dropped).
+    Aborted,
+}
+
+impl From<Operation> for OperationEntry {
+    fn from(operation: Operation) -> Self {
+        let (kind, peer_name, file_id, serve_source) = flatten_kind(&operation.kind);
+        let (status, progress_done, progress_total) = flatten_status(&operation.status);
+        Self {
+            id: operation.id.as_u64(),
+            kind,
+            peer_name,
+            file_id,
+            serve_source,
+            status,
+            progress_done,
+            progress_total,
+            started_at: operation.started_at,
+            updated_at: operation.updated_at,
+        }
+    }
+}
+
+/// Flatten an [`OperationKind`] into `(kind, peer_name, file_id,
+/// serve_source)`.
+fn flatten_kind(kind: &OperationKind) -> (String, Option<String>, Option<String>, Option<String>) {
+    match kind {
+        OperationKind::ConnectingToPeer { peer_name, .. } => (
+            "connecting_to_peer".to_owned(),
+            Some(peer_name.clone()),
+            None,
+            None,
+        ),
+        OperationKind::PeerConnected {
+            peer_name,
+            direction,
+            ..
+        } => (
+            match direction {
+                Direction::Outbound => "peer_connected_outbound",
+                Direction::Inbound => "peer_connected_inbound",
+            }
+            .to_owned(),
+            Some(peer_name.clone()),
+            None,
+            None,
+        ),
+        OperationKind::SendingFile {
+            file_id,
+            peer_name,
+            source,
+        } => (
+            "sending_file".to_owned(),
+            Some(peer_name.clone()),
+            Some(file_id.clone()),
+            Some(
+                match source {
+                    ServeSource::SyncDirectory => "sync_directory",
+                    ServeSource::Provider => "provider",
+                    ServeSource::FetchCache => "fetch_cache",
+                }
+                .to_owned(),
+            ),
+        ),
+        OperationKind::ReceivingFile { file_id, peer_name } => (
+            "receiving_file".to_owned(),
+            Some(peer_name.clone()),
+            Some(file_id.clone()),
+            None,
+        ),
+        OperationKind::Fetching { file_id } => {
+            ("fetching".to_owned(), None, Some(file_id.clone()), None)
+        }
+        OperationKind::RelayingFetch { file_id, from_peer } => (
+            "relaying_fetch".to_owned(),
+            Some(from_peer.clone()),
+            Some(file_id.clone()),
+            None,
+        ),
+        OperationKind::ReconcilingManifest { peer_name } => (
+            "reconciling_manifest".to_owned(),
+            Some(peer_name.clone()),
+            None,
+            None,
+        ),
+        OperationKind::ReconcilingTags { peer_name } => (
+            "reconciling_tags".to_owned(),
+            Some(peer_name.clone()),
+            None,
+            None,
+        ),
+        OperationKind::PlacingFile { file_id } => {
+            ("placing_file".to_owned(), None, Some(file_id.clone()), None)
+        }
+    }
+}
+
+/// Flatten an [`OperationStatus`] into `(status, progress_done,
+/// progress_total)`.
+fn flatten_status(status: &OperationStatus) -> (OperationStatusDto, Option<u64>, Option<u64>) {
+    match status {
+        OperationStatus::Active { progress } => (
+            OperationStatusDto::Active,
+            progress.map(|p| p.done),
+            progress.and_then(|p| p.total),
+        ),
+        OperationStatus::Completed => (OperationStatusDto::Completed, None, None),
+        OperationStatus::Failed { reason } => (
+            OperationStatusDto::Failed {
+                reason: reason.clone(),
+            },
+            None,
+            None,
+        ),
+        OperationStatus::Aborted => (OperationStatusDto::Aborted, None, None),
+    }
+}
+
 /// The handle the Dart UI holds while it is open.
 ///
 /// It does **not** own the runtime. The runtime is a process-global owned by
@@ -143,7 +311,7 @@ impl OniSyncApp {
     }
 
     /// Attach to an already-running onisync daemon over IPC (Linux desktop
-    /// topology, plan sections 6-7).
+    /// topology).
     ///
     /// Unlike [`start`](OniSyncApp::start), this process does **not** own the
     /// sync engine or the database — the systemd daemon does. This opens a
@@ -179,11 +347,9 @@ impl OniSyncApp {
         crate::service::public_key().unwrap_or_default()
     }
 
-    // --- Read API (plan 5.3) -------------------------------------------------
-
-    /// Resolve a full-or-short file id `prefix` `short_id_length`) to a single
-    /// [`FileId`]. Errors with `NotFound` if nothing matches or `Ambiguous` if
-    /// several do.
+    /// Resolve a full-or-short file id prefix (see
+    /// [`FileInfo::short_id_length`]) to a single [`FileId`]. Errors with
+    /// `NotFound` if nothing matches or `Ambiguous` if several do.
     pub async fn resolve_file_id(&self, prefix: String) -> Result<FileId, ApiError> {
         self.try_backend()?.resolve_file_id(prefix).await
     }
@@ -210,8 +376,6 @@ impl OniSyncApp {
             .await
     }
 
-    // --- Query helpers for the Dart UI ---------------------------------------
-    //
     // The raw `tags_for_file` returns *opaque* id handles the Dart UI cannot
     // render. These variants take id *strings* (full-or-short prefixes resolved
     // by `resolve_file_id`) and return either id strings or flattened
@@ -344,8 +508,6 @@ impl OniSyncApp {
         Ok(TagEntry::from(backend.get_tag(tag_id).await?))
     }
 
-    // --- Write API (plan 5.4) ------------------------------------------------
-
     /// Create a tag; returns the freshly-minted id.
     pub async fn create_tag(&self, name: String, color: String) -> Result<TagId, ApiError> {
         self.try_backend()?.create_tag(name, color).await
@@ -412,8 +574,6 @@ impl OniSyncApp {
         self.try_backend()?.untag_file(tag_id, file_id).await
     }
 
-    // --- Event stream (plan 5.5) ---------------------------------------------
-
     /// Subscribe to the live change stream.
     ///
     /// Returns an [`EventSubscription`] the UI polls with
@@ -427,9 +587,41 @@ impl OniSyncApp {
                 .map(|backend| Mutex::new(backend.subscribe())),
         }
     }
+
+    /// Snapshot every currently-active sync operation as flattened
+    /// [`OperationEntry`] rows the Dart UI renders directly.
+    ///
+    /// The UI calls this for its initial paint of the "activity" view, then
+    /// applies live updates from
+    /// [`subscribe_operations`](Self::subscribe_operations) (and re-calls
+    /// this on an [`OperationUpdateDto::Resynced`]).
+    pub async fn list_operations(&self) -> Result<Vec<OperationEntry>, ApiError> {
+        Ok(self
+            .try_backend()?
+            .list_operations()
+            .await?
+            .into_iter()
+            .map(OperationEntry::from)
+            .collect())
+    }
+
+    /// Subscribe to the live sync-operation stream.
+    ///
+    /// Returns an [`OperationSubscription`] the UI polls with
+    /// [`OperationSubscription::next`]. Each item is an
+    /// [`OperationUpdateDto`]; a `None` means the stream is unavailable
+    /// (runtime not running) or closed.
+    pub fn subscribe_operations(&self) -> OperationSubscription {
+        OperationSubscription {
+            stream: self
+                .try_backend()
+                .ok()
+                .map(|backend| Mutex::new(backend.subscribe_operations())),
+        }
+    }
 }
 
-/// A live subscription to the change stream (plan 5.5).
+/// A live subscription to the change stream.
 ///
 /// `flutter_rust_bridge` maps [`EventSubscription::next`] onto a Dart
 /// `Future<ApiEvent?>` the UI awaits in a loop; on `null` the stream is done.
@@ -453,5 +645,53 @@ impl EventSubscription {
         let stream = self.stream.as_ref()?;
         let mut guard = stream.lock().await;
         guard.recv().await
+    }
+}
+
+/// A live update on the operation stream, for the Dart UI.
+///
+/// The FFI-facing counterpart of
+/// [`OperationUpdate`](onisyncd::transport::OperationUpdate).
+pub enum OperationUpdateDto {
+    /// The stream lagged or reconnected; the UI should re-call
+    /// [`OniSyncApp::list_operations`] to re-sync its view.
+    Resynced,
+    /// A new operation began.
+    Started { operation: OperationEntry },
+    /// An existing operation changed (progress or terminal outcome).
+    Updated { operation: OperationEntry },
+}
+
+/// A live subscription to the sync-operation stream.
+///
+/// The operation counterpart of [`EventSubscription`]:
+/// `flutter_rust_bridge` maps [`OperationSubscription::next`] onto a Dart
+/// `Future<OperationUpdateDto?>` the UI awaits in a loop; on `null` the stream
+/// is done.
+#[cfg_attr(feature = "flutter_rust_bridge", flutter_rust_bridge::frb(opaque))]
+pub struct OperationSubscription {
+    /// `None` if the runtime was not running when the subscription was made.
+    stream: Option<Mutex<OperationStream>>,
+}
+
+impl OperationSubscription {
+    /// Await the next operation update, or `None` once the stream is
+    /// permanently closed (or was never available).
+    pub async fn next(&self) -> Option<OperationUpdateDto> {
+        let stream = self.stream.as_ref()?;
+        let mut guard = stream.lock().await;
+        match guard.recv().await? {
+            OperationUpdate::Resynced => Some(OperationUpdateDto::Resynced),
+            OperationUpdate::Event(OperationEvent::Started(operation)) => {
+                Some(OperationUpdateDto::Started {
+                    operation: OperationEntry::from(operation),
+                })
+            }
+            OperationUpdate::Event(OperationEvent::Updated(operation)) => {
+                Some(OperationUpdateDto::Updated {
+                    operation: OperationEntry::from(operation),
+                })
+            }
+        }
     }
 }

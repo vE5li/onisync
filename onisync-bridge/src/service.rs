@@ -1,4 +1,4 @@
-//! Process-global runtime ownership (portability plan section 8).
+//! Process-global runtime ownership.
 //!
 //! On Android the sync engine must keep running after the UI is closed. The
 //! Flutter activity (and its Dart isolate) is destroyed when the app is swiped
@@ -23,8 +23,7 @@ use crate::runtime::{RuntimeHandle, StartError};
 
 /// What this process is attached to.
 ///
-/// Two very different topologies share one process-global slot (plan
-/// sections 6-8):
+/// Two very different topologies share one process-global slot:
 ///
 /// - [`Runtime::InProcess`] (Android, single-process desktop) **owns** the sync
 ///   engine: a [`RuntimeHandle`] holding the runtime thread, the DB, and the
@@ -90,8 +89,7 @@ pub fn start(configuration_json: &str, paths: Paths) -> Result<String, StartErro
     Ok(public_key)
 }
 
-/// Attach to an already-running daemon over IPC (plan sections 6-7, Linux
-/// desktop topology).
+/// Attach to an already-running daemon over IPC (Linux desktop topology).
 ///
 /// Unlike [`start`], this process does **not** own the sync engine or the DB:
 /// the systemd daemon does. This opens a control-socket connection

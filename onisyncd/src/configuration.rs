@@ -4,9 +4,9 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
 use onisync_core::state::Frame;
 use onisync_core::{FileId, LogicalPath, PhysicalPath, TagId};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::bus::PeerCommand;
@@ -32,8 +32,7 @@ pub enum SyncType {
         /// this directory's on-disk copy survives.
         ///
         /// Universal-only (files here are stored under their `file_id`, so a
-        /// kept copy is unambiguous). Defaults to `false` so existing behaviour
-        /// — and configs that wrote `{"Universal": {}}` — are unchanged.
+        /// kept copy is unambiguous).
         #[serde(default)]
         keep_deleted_files: bool,
     },
@@ -106,17 +105,13 @@ pub struct TagDeclaration {
 pub struct Configuration {
     /// Synchronized directories on the device itself.
     pub sync_directories: Vec<SyncDirectory>,
-    /// Directories for special features, such as uploading one-time sending.
-    // pub special_directories: Vec<SyncDirectory>,
-
     /// Port to listen on. None for not listening.
     pub listen_port: Option<u16>,
     pub peers: Vec<Peer>,
     /// Tags that must exist on startup, so a [`SyncType::TagBased`] directory
     /// can reference them by id without the operator first creating them
-    /// through the UI. See [`TagDeclaration`] for the
-    /// last-writer-wins-floor semantics. Defaults to empty so pre-existing
-    /// config files keep parsing.
+    /// through the UI. See [`TagDeclaration`] for the last-writer-wins-floor
+    /// semantics.
     #[serde(default)]
     pub tags: Vec<TagDeclaration>,
 }
@@ -215,7 +210,6 @@ impl Configuration {
                     };
                 }
                 SyncType::TagBased { tags } => all_synced_tags.extend_from_slice(tags),
-                // SyncType::Upload || SyncType::Copy => {},
             }
         }
 
@@ -231,10 +225,10 @@ impl std::str::FromStr for Configuration {
     /// Parse a [`Configuration`] from a JSON string, returning a [`Result`]
     /// instead of panicking.
     ///
-    /// This is the non-file, non-panicking entry point required by the
-    /// portability plan (section 8): frontends without a shell/filesystem
-    /// contract (Android) generate the configuration JSON in memory and parse
-    /// it here. [`Configuration::new`] remains the file-reading desktop path.
+    /// This is the non-file, non-panicking entry point: frontends without a
+    /// shell/filesystem contract (Android) generate the configuration JSON in
+    /// memory and parse it here. [`Configuration::new`] remains the
+    /// file-reading desktop path.
     fn from_str(json: &str) -> Result<Self, ConfigurationError> {
         // TODO: We need to make sure that sync directories are not nested.
         // TODO: Make sure that public keys are unique.
@@ -242,12 +236,7 @@ impl std::str::FromStr for Configuration {
     }
 }
 
-pub struct ConnectionStatistics {
-    // pub last_connected: Option<()>,
-    // pub data_sent: usize,
-    // pub data_received: usize,
-    // pub last_synced_file: Option<String>,
-}
+pub struct ConnectionStatistics {}
 
 pub struct RuntimePeer {
     pub sync_type: Option<SyncType>,
@@ -276,7 +265,6 @@ impl Default for RuntimePeer {
 impl RuntimePeer {
     pub fn new() -> Self {
         Self {
-            // No sync type set yet.
             sync_type: None,
             statistics: ConnectionStatistics {},
             outbound: None,

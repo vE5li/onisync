@@ -1,4 +1,4 @@
-//! JNI entry points for the Android foreground service (plan section 8).
+//! JNI entry points for the Android foreground service.
 //!
 //! These let `OniSyncService` (Kotlin) drive the process-global runtime
 //! ([`crate::service`]) directly, so sync keeps running after the Flutter UI

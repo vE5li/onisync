@@ -31,10 +31,9 @@ enum Commands {
 
 /// Resolve on-disk paths from the environment.
 ///
-/// The library no longer reads the environment itself; the desktop binary is
-/// responsible for turning `ONISYNC_DATA_DIR` / `ONISYNC_PRIVATE_KEY_FILE` into a
-/// [`Paths`]. Panicking here (rather than deep in the library) keeps the
-/// failure mode obvious for a shell-launched daemon.
+/// The desktop binary turns `ONISYNC_DATA_DIR` / `ONISYNC_PRIVATE_KEY_FILE`
+/// into a [`Paths`]. Panicking here (rather than deep in the library) keeps
+/// the failure mode obvious for a shell-launched daemon.
 fn paths_from_env() -> Paths {
     let data_dir =
         std::env::var("ONISYNC_DATA_DIR").expect("ONISYNC_DATA_DIR environment variable not set");
@@ -96,10 +95,10 @@ async fn main() -> Result<(), std::io::Error> {
             }
 
             // Start the runtime, keeping the UI-facing `Api` so we can also
-            // serve the local control socket (portability plan section 7):
-            // the desktop daemon owns the DB, and a separate UI process attaches
-            // over this socket. It shares the runtime's shutdown signal so a
-            // Ctrl-C / systemd stop tears both down together.
+            // serve the local control socket: the desktop daemon owns the DB,
+            // and a separate UI process attaches over this socket. It shares
+            // the runtime's shutdown signal so a Ctrl-C / systemd stop tears
+            // both down together.
             let (api, driver) = match onisyncd::run(configuration, paths, shutdown.clone()).await {
                 Ok(pair) => pair,
                 Err(error) => {

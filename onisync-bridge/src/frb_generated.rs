@@ -26,11 +26,12 @@
 
 // Section: imports
 
+use flutter_rust_bridge::for_generated::byteorder::{NativeEndian, ReadBytesExt, WriteBytesExt};
+use flutter_rust_bridge::for_generated::{Lifetimeable, Lockable, transform_result_dco};
+use flutter_rust_bridge::{Handler, IntoIntoDart};
+
 use crate::api::*;
 use crate::runtime::*;
-use flutter_rust_bridge::for_generated::byteorder::{NativeEndian, ReadBytesExt, WriteBytesExt};
-use flutter_rust_bridge::for_generated::{transform_result_dco, Lifetimeable, Lockable};
-use flutter_rust_bridge::{Handler, IntoIntoDart};
 
 // Section: boilerplate
 
@@ -40,7 +41,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -441654860;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 1508999513;
 
 // Section: executor
 
@@ -426,6 +427,62 @@ fn wire__crate__api__OniSyncApp_get_tag_entry_impl(
                         let output_ok =
                             crate::api::OniSyncApp::get_tag_entry(&*api_that_guard, api_tag_id)
                                 .await?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
+fn wire__crate__api__OniSyncApp_list_operations_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "OniSyncApp_list_operations",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_that = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OniSyncApp>,
+            >>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| async move {
+                transform_result_sse::<_, ApiError>(
+                    (move || async move {
+                        let mut api_that_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                    &api_that, 0, false,
+                                )],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_that_guard =
+                                        Some(api_that.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_that_guard = api_that_guard.unwrap();
+                        let output_ok =
+                            crate::api::OniSyncApp::list_operations(&*api_that_guard).await?;
                         Ok(output_ok)
                     })()
                     .await,
@@ -985,6 +1042,57 @@ fn wire__crate__api__OniSyncApp_subscribe_impl(
                     let api_that_guard = api_that_guard.unwrap();
                     let output_ok =
                         Result::<_, ()>::Ok(crate::api::OniSyncApp::subscribe(&*api_that_guard))?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__OniSyncApp_subscribe_operations_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "OniSyncApp_subscribe_operations",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_that = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OniSyncApp>,
+            >>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, ()>((move || {
+                    let mut api_that_guard = None;
+                    let decode_indices_ =
+                        flutter_rust_bridge::for_generated::lockable_compute_decode_order(vec![
+                            flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                &api_that, 0, false,
+                            ),
+                        ]);
+                    for i in decode_indices_ {
+                        match i {
+                            0 => api_that_guard = Some(api_that.lockable_decode_sync_ref()),
+                            _ => unreachable!(),
+                        }
+                    }
+                    let api_that_guard = api_that_guard.unwrap();
+                    let output_ok = Result::<_, ()>::Ok(
+                        crate::api::OniSyncApp::subscribe_operations(&*api_that_guard),
+                    )?;
                     Ok(output_ok)
                 })())
             }
@@ -1551,6 +1659,63 @@ fn wire__crate__api__OniSyncApp_upload_file_impl(
         },
     )
 }
+fn wire__crate__api__OperationSubscription_next_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_async::<flutter_rust_bridge::for_generated::SseCodec, _, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "OperationSubscription_next",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_that = <RustOpaqueMoi<
+                flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OperationSubscription>,
+            >>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| async move {
+                transform_result_sse::<_, ()>(
+                    (move || async move {
+                        let mut api_that_guard = None;
+                        let decode_indices_ =
+                            flutter_rust_bridge::for_generated::lockable_compute_decode_order(
+                                vec![flutter_rust_bridge::for_generated::LockableOrderInfo::new(
+                                    &api_that, 0, false,
+                                )],
+                            );
+                        for i in decode_indices_ {
+                            match i {
+                                0 => {
+                                    api_that_guard =
+                                        Some(api_that.lockable_decode_async_ref().await)
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        let api_that_guard = api_that_guard.unwrap();
+                        let output_ok = Result::<_, ()>::Ok(
+                            crate::api::OperationSubscription::next(&*api_that_guard).await,
+                        )?;
+                        Ok(output_ok)
+                    })()
+                    .await,
+                )
+            }
+        },
+    )
+}
 
 // Section: related_funcs
 
@@ -1568,6 +1733,9 @@ flutter_rust_bridge::frb_generated_moi_arc_impl_value!(
 );
 flutter_rust_bridge::frb_generated_moi_arc_impl_value!(
     flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OniSyncApp>
+);
+flutter_rust_bridge::frb_generated_moi_arc_impl_value!(
+    flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OperationSubscription>
 );
 flutter_rust_bridge::frb_generated_moi_arc_impl_value!(
     flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StartError>
@@ -1623,6 +1791,16 @@ impl SseDecode for OniSyncApp {
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         let mut inner = <RustOpaqueMoi<
             flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OniSyncApp>,
+        >>::sse_decode(deserializer);
+        return flutter_rust_bridge::for_generated::rust_auto_opaque_decode_owned(inner);
+    }
+}
+
+impl SseDecode for OperationSubscription {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <RustOpaqueMoi<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OperationSubscription>,
         >>::sse_decode(deserializer);
         return flutter_rust_bridge::for_generated::rust_auto_opaque_decode_owned(inner);
     }
@@ -1688,6 +1866,18 @@ impl SseDecode for RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpa
 
 impl SseDecode
     for RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OniSyncApp>>
+{
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <usize>::sse_decode(deserializer);
+        return decode_rust_opaque_moi(inner);
+    }
+}
+
+impl SseDecode
+    for RustOpaqueMoi<
+        flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OperationSubscription>,
+    >
 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1792,6 +1982,18 @@ impl SseDecode for Vec<crate::api::FileEntry> {
     }
 }
 
+impl SseDecode for Vec<crate::api::OperationEntry> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<crate::api::OperationEntry>::sse_decode(deserializer));
+        }
+        return ans_;
+    }
+}
+
 impl SseDecode for Vec<u8> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1816,6 +2018,86 @@ impl SseDecode for Vec<crate::api::TagEntry> {
     }
 }
 
+impl SseDecode for crate::api::OperationEntry {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_id = <u64>::sse_decode(deserializer);
+        let mut var_kind = <String>::sse_decode(deserializer);
+        let mut var_peerName = <Option<String>>::sse_decode(deserializer);
+        let mut var_fileId = <Option<String>>::sse_decode(deserializer);
+        let mut var_serveSource = <Option<String>>::sse_decode(deserializer);
+        let mut var_status = <crate::api::OperationStatusDto>::sse_decode(deserializer);
+        let mut var_progressDone = <Option<u64>>::sse_decode(deserializer);
+        let mut var_progressTotal = <Option<u64>>::sse_decode(deserializer);
+        let mut var_startedAt = <i64>::sse_decode(deserializer);
+        let mut var_updatedAt = <i64>::sse_decode(deserializer);
+        return crate::api::OperationEntry {
+            id: var_id,
+            kind: var_kind,
+            peer_name: var_peerName,
+            file_id: var_fileId,
+            serve_source: var_serveSource,
+            status: var_status,
+            progress_done: var_progressDone,
+            progress_total: var_progressTotal,
+            started_at: var_startedAt,
+            updated_at: var_updatedAt,
+        };
+    }
+}
+
+impl SseDecode for crate::api::OperationStatusDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut tag_ = <i32>::sse_decode(deserializer);
+        match tag_ {
+            0 => {
+                return crate::api::OperationStatusDto::Active;
+            }
+            1 => {
+                return crate::api::OperationStatusDto::Completed;
+            }
+            2 => {
+                let mut var_reason = <String>::sse_decode(deserializer);
+                return crate::api::OperationStatusDto::Failed { reason: var_reason };
+            }
+            3 => {
+                return crate::api::OperationStatusDto::Aborted;
+            }
+            _ => {
+                unimplemented!("");
+            }
+        }
+    }
+}
+
+impl SseDecode for crate::api::OperationUpdateDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut tag_ = <i32>::sse_decode(deserializer);
+        match tag_ {
+            0 => {
+                return crate::api::OperationUpdateDto::Resynced;
+            }
+            1 => {
+                let mut var_operation = <crate::api::OperationEntry>::sse_decode(deserializer);
+                return crate::api::OperationUpdateDto::Started {
+                    operation: var_operation,
+                };
+            }
+            2 => {
+                let mut var_operation = <crate::api::OperationEntry>::sse_decode(deserializer);
+                return crate::api::OperationUpdateDto::Updated {
+                    operation: var_operation,
+                };
+            }
+            _ => {
+                unimplemented!("");
+            }
+        }
+    }
+}
+
 impl SseDecode for Option<String> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1832,6 +2114,28 @@ impl SseDecode for Option<ApiEvent> {
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         if (<bool>::sse_decode(deserializer)) {
             return Some(<ApiEvent>::sse_decode(deserializer));
+        } else {
+            return None;
+        }
+    }
+}
+
+impl SseDecode for Option<crate::api::OperationUpdateDto> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        if (<bool>::sse_decode(deserializer)) {
+            return Some(<crate::api::OperationUpdateDto>::sse_decode(deserializer));
+        } else {
+            return None;
+        }
+    }
+}
+
+impl SseDecode for Option<u64> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        if (<bool>::sse_decode(deserializer)) {
+            return Some(<u64>::sse_decode(deserializer));
         } else {
             return None;
         }
@@ -1873,6 +2177,13 @@ impl SseDecode for crate::api::TagEntry {
             name: var_name,
             color: var_color,
         };
+    }
+}
+
+impl SseDecode for u64 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        deserializer.cursor.read_u64::<NativeEndian>().unwrap()
     }
 }
 
@@ -1918,49 +2229,57 @@ fn pde_ffi_dispatcher_primary_impl(
         5 => wire__crate__api__OniSyncApp_delete_tag_impl(port, ptr, rust_vec_len, data_len),
         6 => wire__crate__api__OniSyncApp_get_file_entry_impl(port, ptr, rust_vec_len, data_len),
         7 => wire__crate__api__OniSyncApp_get_tag_entry_impl(port, ptr, rust_vec_len, data_len),
-        8 => wire__crate__api__OniSyncApp_local_path_for_file_by_string_impl(
+        8 => wire__crate__api__OniSyncApp_list_operations_impl(port, ptr, rust_vec_len, data_len),
+        9 => wire__crate__api__OniSyncApp_local_path_for_file_by_string_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        9 => {
+        10 => {
             wire__crate__api__OniSyncApp_move_file_by_string_impl(port, ptr, rust_vec_len, data_len)
         }
-        11 => wire__crate__api__OniSyncApp_rename_tag_impl(port, ptr, rust_vec_len, data_len),
-        12 => wire__crate__api__OniSyncApp_resolve_file_id_impl(port, ptr, rust_vec_len, data_len),
-        13 => wire__crate__api__OniSyncApp_resolve_tag_id_impl(port, ptr, rust_vec_len, data_len),
-        14 => wire__crate__api__OniSyncApp_run_query_impl(port, ptr, rust_vec_len, data_len),
-        15 => wire__crate__api__OniSyncApp_set_tag_color_impl(port, ptr, rust_vec_len, data_len),
-        17 => wire__crate__api__OniSyncApp_subscribe_impl(port, ptr, rust_vec_len, data_len),
-        18 => wire__crate__api__OniSyncApp_subtag_ids_for_tag_string_impl(
+        12 => wire__crate__api__OniSyncApp_rename_tag_impl(port, ptr, rust_vec_len, data_len),
+        13 => wire__crate__api__OniSyncApp_resolve_file_id_impl(port, ptr, rust_vec_len, data_len),
+        14 => wire__crate__api__OniSyncApp_resolve_tag_id_impl(port, ptr, rust_vec_len, data_len),
+        15 => wire__crate__api__OniSyncApp_run_query_impl(port, ptr, rust_vec_len, data_len),
+        16 => wire__crate__api__OniSyncApp_set_tag_color_impl(port, ptr, rust_vec_len, data_len),
+        18 => wire__crate__api__OniSyncApp_subscribe_impl(port, ptr, rust_vec_len, data_len),
+        19 => wire__crate__api__OniSyncApp_subscribe_operations_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        19 => wire__crate__api__OniSyncApp_tag_file_impl(port, ptr, rust_vec_len, data_len),
-        20 => wire__crate__api__OniSyncApp_tag_ids_for_file_string_impl(
+        20 => wire__crate__api__OniSyncApp_subtag_ids_for_tag_string_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        21 => wire__crate__api__OniSyncApp_tag_ids_for_tag_string_impl(
+        21 => wire__crate__api__OniSyncApp_tag_file_impl(port, ptr, rust_vec_len, data_len),
+        22 => wire__crate__api__OniSyncApp_tag_ids_for_file_string_impl(
             port,
             ptr,
             rust_vec_len,
             data_len,
         ),
-        22 => {
+        23 => wire__crate__api__OniSyncApp_tag_ids_for_tag_string_impl(
+            port,
+            ptr,
+            rust_vec_len,
+            data_len,
+        ),
+        24 => {
             wire__crate__api__OniSyncApp_tag_tag_by_string_impl(port, ptr, rust_vec_len, data_len)
         }
-        23 => wire__crate__api__OniSyncApp_tags_for_file_impl(port, ptr, rust_vec_len, data_len),
-        24 => wire__crate__api__OniSyncApp_untag_file_impl(port, ptr, rust_vec_len, data_len),
-        25 => {
+        25 => wire__crate__api__OniSyncApp_tags_for_file_impl(port, ptr, rust_vec_len, data_len),
+        26 => wire__crate__api__OniSyncApp_untag_file_impl(port, ptr, rust_vec_len, data_len),
+        27 => {
             wire__crate__api__OniSyncApp_untag_tag_by_string_impl(port, ptr, rust_vec_len, data_len)
         }
-        26 => wire__crate__api__OniSyncApp_upload_file_impl(port, ptr, rust_vec_len, data_len),
+        28 => wire__crate__api__OniSyncApp_upload_file_impl(port, ptr, rust_vec_len, data_len),
+        29 => wire__crate__api__OperationSubscription_next_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -1973,8 +2292,8 @@ fn pde_ffi_dispatcher_sync_impl(
 ) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
-        10 => wire__crate__api__OniSyncApp_public_key_impl(ptr, rust_vec_len, data_len),
-        16 => wire__crate__api__OniSyncApp_start_impl(ptr, rust_vec_len, data_len),
+        11 => wire__crate__api__OniSyncApp_public_key_impl(ptr, rust_vec_len, data_len),
+        17 => wire__crate__api__OniSyncApp_start_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -2057,6 +2376,26 @@ impl flutter_rust_bridge::IntoIntoDart<FrbWrapper<OniSyncApp>> for OniSyncApp {
 }
 
 // Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for FrbWrapper<OperationSubscription> {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, MoiArc<_>>(self.0)
+            .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for FrbWrapper<OperationSubscription>
+{
+}
+
+impl flutter_rust_bridge::IntoIntoDart<FrbWrapper<OperationSubscription>>
+    for OperationSubscription
+{
+    fn into_into_dart(self) -> FrbWrapper<OperationSubscription> {
+        self.into()
+    }
+}
+
+// Codec=Dco (DartCObject based), see doc to use other codecs
 impl flutter_rust_bridge::IntoDart for FrbWrapper<StartError> {
     fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
         flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, MoiArc<_>>(self.0)
@@ -2103,6 +2442,85 @@ impl flutter_rust_bridge::IntoDart for crate::api::FileEntry {
 impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::FileEntry {}
 impl flutter_rust_bridge::IntoIntoDart<crate::api::FileEntry> for crate::api::FileEntry {
     fn into_into_dart(self) -> crate::api::FileEntry {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::OperationEntry {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.id.into_into_dart().into_dart(),
+            self.kind.into_into_dart().into_dart(),
+            self.peer_name.into_into_dart().into_dart(),
+            self.file_id.into_into_dart().into_dart(),
+            self.serve_source.into_into_dart().into_dart(),
+            self.status.into_into_dart().into_dart(),
+            self.progress_done.into_into_dart().into_dart(),
+            self.progress_total.into_into_dart().into_dart(),
+            self.started_at.into_into_dart().into_dart(),
+            self.updated_at.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::OperationEntry {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::OperationEntry> for crate::api::OperationEntry {
+    fn into_into_dart(self) -> crate::api::OperationEntry {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::OperationStatusDto {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        match self {
+            crate::api::OperationStatusDto::Active => [0.into_dart()].into_dart(),
+            crate::api::OperationStatusDto::Completed => [1.into_dart()].into_dart(),
+            crate::api::OperationStatusDto::Failed { reason } => {
+                [2.into_dart(), reason.into_into_dart().into_dart()].into_dart()
+            }
+            crate::api::OperationStatusDto::Aborted => [3.into_dart()].into_dart(),
+            _ => {
+                unimplemented!("");
+            }
+        }
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::OperationStatusDto
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::OperationStatusDto>
+    for crate::api::OperationStatusDto
+{
+    fn into_into_dart(self) -> crate::api::OperationStatusDto {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::OperationUpdateDto {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        match self {
+            crate::api::OperationUpdateDto::Resynced => [0.into_dart()].into_dart(),
+            crate::api::OperationUpdateDto::Started { operation } => {
+                [1.into_dart(), operation.into_into_dart().into_dart()].into_dart()
+            }
+            crate::api::OperationUpdateDto::Updated { operation } => {
+                [2.into_dart(), operation.into_into_dart().into_dart()].into_dart()
+            }
+            _ => {
+                unimplemented!("");
+            }
+        }
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::OperationUpdateDto
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::OperationUpdateDto>
+    for crate::api::OperationUpdateDto
+{
+    fn into_into_dart(self) -> crate::api::OperationUpdateDto {
         self
     }
 }
@@ -2164,42 +2582,72 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::TagEntry> for crate::api::Tag
 impl SseEncode for ApiError {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ApiError>>>::sse_encode(flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, MoiArc<_>>(self), serializer);
+        <RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ApiError>>>::sse_encode(
+            flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, MoiArc<_>>(self),
+            serializer,
+        );
     }
 }
 
 impl SseEncode for ApiEvent {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ApiEvent>>>::sse_encode(flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, MoiArc<_>>(self), serializer);
+        <RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<ApiEvent>>>::sse_encode(
+            flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, MoiArc<_>>(self),
+            serializer,
+        );
     }
 }
 
 impl SseEncode for EventSubscription {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<EventSubscription>>>::sse_encode(flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, MoiArc<_>>(self), serializer);
+        <RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<EventSubscription>>>::sse_encode(
+            flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, MoiArc<_>>(self),
+            serializer,
+        );
     }
 }
 
 impl SseEncode for FileId {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<FileId>>>::sse_encode(flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, MoiArc<_>>(self), serializer);
+        <RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<FileId>>>::sse_encode(
+            flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, MoiArc<_>>(self),
+            serializer,
+        );
     }
 }
 
 impl SseEncode for OniSyncApp {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OniSyncApp>>>::sse_encode(flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, MoiArc<_>>(self), serializer);
+        <RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OniSyncApp>>>::sse_encode(
+            flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, MoiArc<_>>(self),
+            serializer,
+        );
+    }
+}
+
+impl SseEncode for OperationSubscription {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <RustOpaqueMoi<
+            flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OperationSubscription>,
+        >>::sse_encode(
+            flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, MoiArc<_>>(self),
+            serializer,
+        );
     }
 }
 
 impl SseEncode for StartError {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        <RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StartError>>>::sse_encode(flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, MoiArc<_>>(self), serializer);
+        <RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<StartError>>>::sse_encode(
+            flutter_rust_bridge::for_generated::rust_auto_opaque_encode::<_, MoiArc<_>>(self),
+            serializer,
+        );
     }
 }
 
@@ -2257,6 +2705,19 @@ impl SseEncode for RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpa
 
 impl SseEncode
     for RustOpaqueMoi<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OniSyncApp>>
+{
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        let (ptr, size) = self.sse_encode_raw();
+        <usize>::sse_encode(ptr, serializer);
+        <i32>::sse_encode(size, serializer);
+    }
+}
+
+impl SseEncode
+    for RustOpaqueMoi<
+        flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OperationSubscription>,
+    >
 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -2349,6 +2810,16 @@ impl SseEncode for Vec<crate::api::FileEntry> {
     }
 }
 
+impl SseEncode for Vec<crate::api::OperationEntry> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <crate::api::OperationEntry>::sse_encode(item, serializer);
+        }
+    }
+}
+
 impl SseEncode for Vec<u8> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -2369,6 +2840,68 @@ impl SseEncode for Vec<crate::api::TagEntry> {
     }
 }
 
+impl SseEncode for crate::api::OperationEntry {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <u64>::sse_encode(self.id, serializer);
+        <String>::sse_encode(self.kind, serializer);
+        <Option<String>>::sse_encode(self.peer_name, serializer);
+        <Option<String>>::sse_encode(self.file_id, serializer);
+        <Option<String>>::sse_encode(self.serve_source, serializer);
+        <crate::api::OperationStatusDto>::sse_encode(self.status, serializer);
+        <Option<u64>>::sse_encode(self.progress_done, serializer);
+        <Option<u64>>::sse_encode(self.progress_total, serializer);
+        <i64>::sse_encode(self.started_at, serializer);
+        <i64>::sse_encode(self.updated_at, serializer);
+    }
+}
+
+impl SseEncode for crate::api::OperationStatusDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        match self {
+            crate::api::OperationStatusDto::Active => {
+                <i32>::sse_encode(0, serializer);
+            }
+            crate::api::OperationStatusDto::Completed => {
+                <i32>::sse_encode(1, serializer);
+            }
+            crate::api::OperationStatusDto::Failed { reason } => {
+                <i32>::sse_encode(2, serializer);
+                <String>::sse_encode(reason, serializer);
+            }
+            crate::api::OperationStatusDto::Aborted => {
+                <i32>::sse_encode(3, serializer);
+            }
+            _ => {
+                unimplemented!("");
+            }
+        }
+    }
+}
+
+impl SseEncode for crate::api::OperationUpdateDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        match self {
+            crate::api::OperationUpdateDto::Resynced => {
+                <i32>::sse_encode(0, serializer);
+            }
+            crate::api::OperationUpdateDto::Started { operation } => {
+                <i32>::sse_encode(1, serializer);
+                <crate::api::OperationEntry>::sse_encode(operation, serializer);
+            }
+            crate::api::OperationUpdateDto::Updated { operation } => {
+                <i32>::sse_encode(2, serializer);
+                <crate::api::OperationEntry>::sse_encode(operation, serializer);
+            }
+            _ => {
+                unimplemented!("");
+            }
+        }
+    }
+}
+
 impl SseEncode for Option<String> {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -2385,6 +2918,26 @@ impl SseEncode for Option<ApiEvent> {
         <bool>::sse_encode(self.is_some(), serializer);
         if let Some(value) = self {
             <ApiEvent>::sse_encode(value, serializer);
+        }
+    }
+}
+
+impl SseEncode for Option<crate::api::OperationUpdateDto> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.is_some(), serializer);
+        if let Some(value) = self {
+            <crate::api::OperationUpdateDto>::sse_encode(value, serializer);
+        }
+    }
+}
+
+impl SseEncode for Option<u64> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.is_some(), serializer);
+        if let Some(value) = self {
+            <u64>::sse_encode(value, serializer);
         }
     }
 }
@@ -2419,6 +2972,13 @@ impl SseEncode for crate::api::TagEntry {
         <String>::sse_encode(self.tag_id, serializer);
         <String>::sse_encode(self.name, serializer);
         <String>::sse_encode(self.color, serializer);
+    }
+}
+
+impl SseEncode for u64 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        serializer.cursor.write_u64::<NativeEndian>(self).unwrap();
     }
 }
 
@@ -2458,14 +3018,15 @@ mod io {
 
     // Section: imports
 
-    use super::*;
-    use crate::api::*;
-    use crate::runtime::*;
     use flutter_rust_bridge::for_generated::byteorder::{
         NativeEndian, ReadBytesExt, WriteBytesExt,
     };
-    use flutter_rust_bridge::for_generated::{transform_result_dco, Lifetimeable, Lockable};
+    use flutter_rust_bridge::for_generated::{Lifetimeable, Lockable, transform_result_dco};
     use flutter_rust_bridge::{Handler, IntoIntoDart};
+
+    use super::*;
+    use crate::api::*;
+    use crate::runtime::*;
 
     // Section: boilerplate
 
@@ -2542,6 +3103,20 @@ mod io {
     }
 
     #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_onisync_app_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerOperationSubscription(
+        ptr: *const std::ffi::c_void,
+    ) {
+        MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OperationSubscription>>::increment_strong_count(ptr as _);
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn frbgen_onisync_app_rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerOperationSubscription(
+        ptr: *const std::ffi::c_void,
+    ) {
+        MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OperationSubscription>>::decrement_strong_count(ptr as _);
+    }
+
+    #[unsafe(no_mangle)]
     pub extern "C" fn frbgen_onisync_app_rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerStartError(
         ptr: *const std::ffi::c_void,
     ) {
@@ -2580,16 +3155,18 @@ mod web {
 
     // Section: imports
 
-    use super::*;
-    use crate::api::*;
-    use crate::runtime::*;
     use flutter_rust_bridge::for_generated::byteorder::{
         NativeEndian, ReadBytesExt, WriteBytesExt,
     };
-    use flutter_rust_bridge::for_generated::wasm_bindgen;
     use flutter_rust_bridge::for_generated::wasm_bindgen::prelude::*;
-    use flutter_rust_bridge::for_generated::{transform_result_dco, Lifetimeable, Lockable};
+    use flutter_rust_bridge::for_generated::{
+        Lifetimeable, Lockable, transform_result_dco, wasm_bindgen,
+    };
     use flutter_rust_bridge::{Handler, IntoIntoDart};
+
+    use super::*;
+    use crate::api::*;
+    use crate::runtime::*;
 
     // Section: boilerplate
 
@@ -2663,6 +3240,20 @@ mod web {
         ptr: *const std::ffi::c_void,
     ) {
         MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OniSyncApp>>::decrement_strong_count(ptr as _);
+    }
+
+    #[wasm_bindgen]
+    pub fn rust_arc_increment_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerOperationSubscription(
+        ptr: *const std::ffi::c_void,
+    ) {
+        MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OperationSubscription>>::increment_strong_count(ptr as _);
+    }
+
+    #[wasm_bindgen]
+    pub fn rust_arc_decrement_strong_count_RustOpaque_flutter_rust_bridgefor_generatedRustAutoOpaqueInnerOperationSubscription(
+        ptr: *const std::ffi::c_void,
+    ) {
+        MoiArc::<flutter_rust_bridge::for_generated::RustAutoOpaqueInner<OperationSubscription>>::decrement_strong_count(ptr as _);
     }
 
     #[wasm_bindgen]

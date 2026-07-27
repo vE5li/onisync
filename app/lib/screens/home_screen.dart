@@ -22,6 +22,7 @@ import '../bootstrap/bootstrap.dart';
 import '../rust/api.dart' as onisync;
 import '../widgets/tag_chip.dart';
 import 'file_detail_screen.dart';
+import 'operations_screen.dart';
 import 'tag_detail_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -209,6 +210,7 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('onisync'),
         actions: [
+          _OperationsButton(session: widget.session),
           if (publicKey != null) _CopyPublicKeyButton(publicKey: publicKey),
         ],
       ),
@@ -424,6 +426,158 @@ class _FileRow extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+}
+
+/// AppBar action that opens the [OperationsScreen] (the live view of what the
+/// daemon is doing). Always shown; disabled until a session is available.
+///
+/// It watches the operation stream itself so it can render a live badge with
+/// the number of operations currently active. This includes steady-state
+/// `peer_connected_*` rows, so the badge doubles as a connected-peer count when
+/// nothing else is in flight.
+class _OperationsButton extends StatefulWidget {
+  const _OperationsButton({required this.session});
+
+  final OniSyncSession? session;
+
+  @override
+  State<_OperationsButton> createState() => _OperationsButtonState();
+}
+
+class _OperationsButtonState extends State<_OperationsButton> {
+  /// Currently-active operations, keyed by id. Includes steady-state
+  /// peer-connection rows (see [_countsAsWork]).
+  final Map<BigInt, onisync.OperationEntry> _working = {};
+
+  bool _watching = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.session != null) _watch();
+  }
+
+  @override
+  void didUpdateWidget(covariant _OperationsButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // The session arrives asynchronously after connect; start watching once it
+    // first appears.
+    if (oldWidget.session == null && widget.session != null) _watch();
+  }
+
+  @override
+  void dispose() {
+    _watching = false;
+    super.dispose();
+  }
+
+  /// Whether an operation should count toward the badge: any active operation
+  /// (including steady-state peer connections).
+  static bool _countsAsWork(onisync.OperationEntry op) {
+    return op.status is onisync.OperationStatusDto_Active;
+  }
+
+  void _apply(onisync.OperationEntry op) {
+    if (_countsAsWork(op)) {
+      _working[op.id] = op;
+    } else {
+      _working.remove(op.id);
+    }
+  }
+
+  Future<void> _watch() async {
+    final session = widget.session;
+    if (session == null || _watching) return;
+    _watching = true;
+    try {
+      // Seed from a snapshot so an already-in-flight transfer is counted
+      // immediately, then apply live updates on top.
+      final snapshot = await session.app.listOperations();
+      if (!mounted) return;
+      setState(() {
+        _working.clear();
+        for (final op in snapshot) {
+          _apply(op);
+        }
+      });
+
+      final updates = await session.app.subscribeOperations();
+      while (mounted && _watching) {
+        final update = await updates.next();
+        if (update == null) break;
+        if (!mounted) break;
+        switch (update) {
+          case onisync.OperationUpdateDto_Resynced():
+            final refreshed = await session.app.listOperations();
+            if (!mounted) break;
+            setState(() {
+              _working.clear();
+              for (final op in refreshed) {
+                _apply(op);
+              }
+            });
+          case onisync.OperationUpdateDto_Started(:final operation):
+            setState(() => _apply(operation));
+          case onisync.OperationUpdateDto_Updated(:final operation):
+            setState(() => _apply(operation));
+        }
+      }
+    } catch (_) {
+      // Transient stream hiccups are surfaced elsewhere; don't kill the button.
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final session = widget.session;
+    final count = _working.length;
+    final button = IconButton(
+      icon: const Icon(Icons.sync),
+      tooltip: 'Operations',
+      onPressed: session == null
+          ? null
+          : () {
+              FocusManager.instance.primaryFocus?.unfocus();
+              Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => OperationsScreen(session: session),
+                ),
+              );
+            },
+    );
+
+    if (count == 0) return button;
+
+    // Overlay a small count badge on the top-right of the icon.
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        button,
+        Positioned(
+          top: 8,
+          right: 6,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.error,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            constraints: const BoxConstraints(minWidth: 16),
+            child: Text(
+              '$count',
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onError,
+                fontSize: 10,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }

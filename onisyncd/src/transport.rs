@@ -1,19 +1,19 @@
-//! Transport abstraction (portability plan section 6).
+//! Transport abstraction.
 //!
-//! The UI always talks to the same logical [section-5 API](crate::api). Only
-//! the transport underneath differs:
+//! The UI always talks to the same logical [API](crate::api). Only the
+//! transport underneath differs:
 //!
 //! - **In-process** (Android, and optional single-process desktop): calls
 //!   straight into [`Api`](crate::api::Api) / the change pipeline.
 //! - **IPC-client** (Linux daemon mode): a thin embedded Rust client that
-//!   connects to the daemon's control socket (section 7), serialises API calls,
-//!   and returns results/events.
+//!   connects to the daemon's control socket, serialises API calls, and returns
+//!   results/events.
 //!
 //! This module defines the transport-agnostic surface as the
 //! [`TransportBackend`] trait and provides the **in-process** implementation
-//! ([`InProcessBackend`]). The IPC-client backend is deferred to section 7
-//! (the daemon control socket it would talk to does not exist yet); see the
-//! `Backend::Ipc` note below.
+//! ([`InProcessBackend`]). The IPC-client backend
+//! ([`IpcClientBackend`](crate::control::IpcClientBackend)) lives in the
+//! `control` module.
 //!
 //! `flutter_rust_bridge` always targets [`Backend`] on both platforms. On
 //! Android it wraps the in-process backend; on Linux it will wrap the
@@ -44,22 +44,22 @@ use tokio::sync::broadcast;
 
 use crate::api::{Api, ApiError, ApiEvent, QueryResult};
 use crate::database::{SubtagRule, Tag};
+use crate::operations::{Operation, OperationEvent};
 
-/// The transport-agnostic UI-facing API (portability plan section 6).
+/// The transport-agnostic UI-facing API.
 ///
 /// This mirrors [`Api`](crate::api::Api) method-for-method, but every operation
-/// is `async` so both the in-process backend (immediate) and the future
-/// IPC-client backend (socket round-trip) can implement it behind one surface.
+/// is `async` so both the in-process backend (immediate) and the IPC-client
+/// backend (socket round-trip) can implement it behind one surface.
 ///
-/// Implemented by [`InProcessBackend`] today and dispatched through the
-/// [`Backend`] enum.
+/// Implemented by [`InProcessBackend`] and
+/// [`IpcClientBackend`](crate::control::IpcClientBackend), and dispatched
+/// through the [`Backend`] enum.
 ///
 /// The returned futures are declared `+ Send` (rather than plain `async fn`)
 /// so callers — notably `flutter_rust_bridge`, which spawns them on a
 /// multi-threaded runtime — can move them across threads.
 pub trait TransportBackend {
-    // --- Read API (plan 5.3) -------------------------------------------------
-
     /// Resolve a full-or-short file id `prefix` to a single [`FileId`]. Errors
     /// with `NotFound` if nothing matches or `Ambiguous` if several do.
     fn resolve_file_id(
@@ -108,8 +108,6 @@ pub trait TransportBackend {
         tag_id: TagId,
         subtag_rule: SubtagRule,
     ) -> impl Future<Output = Result<Vec<TagId>, ApiError>> + Send;
-
-    // --- Write API (plan 5.4) ------------------------------------------------
 
     /// Create a tag; returns the freshly-minted id.
     fn create_tag(
@@ -215,11 +213,20 @@ pub trait TransportBackend {
         subtag_id: TagId,
     ) -> impl Future<Output = Result<(), ApiError>> + Send;
 
-    // --- Event stream (plan 5.5) ---------------------------------------------
-
     /// Subscribe to the live change stream. Returns an [`EventStream`] whose
     /// [`recv`](EventStream::recv) yields [`ApiEvent`]s.
     fn subscribe(&self) -> EventStream;
+
+    /// Snapshot every currently-active sync operation (peer transfers,
+    /// reconciliation, fetches, ...). The read the UI issues for its initial
+    /// paint before applying live [`OperationEvent`]s from
+    /// [`subscribe_operations`](Self::subscribe_operations).
+    fn list_operations(&self) -> impl Future<Output = Result<Vec<Operation>, ApiError>> + Send;
+
+    /// Subscribe to the live sync-operation stream. Returns an
+    /// [`OperationStream`] whose [`recv`](OperationStream::recv) yields
+    /// [`OperationUpdate`]s.
+    fn subscribe_operations(&self) -> OperationStream;
 }
 
 /// The transport-agnostic event stream returned by
@@ -247,15 +254,15 @@ impl EventStream {
     /// Returns:
     /// - `Some(ApiEvent::Changed(_))` for each applied change,
     /// - `Some(ApiEvent::Resynced)` when the subscriber lagged past the channel
-    ///   capacity (plan 5.5: the UI should re-fetch state), and
+    ///   capacity (the UI should re-fetch state), and
     /// - `None` once the stream is permanently closed (runtime shut down).
     pub async fn recv(&mut self) -> Option<ApiEvent> {
         match self {
             EventStream::InProcess(receiver) => match receiver.recv().await {
                 Ok(change) => Some(ApiEvent::Changed(change)),
                 // A slow subscriber fell behind: surface a resync request so
-                // the UI re-fetches current state (plan 5.5) rather than
-                // silently dropping changes.
+                // the UI re-fetches current state rather than silently
+                // dropping changes.
                 Err(broadcast::error::RecvError::Lagged(_)) => Some(ApiEvent::Resynced),
                 // Sender dropped: the runtime is gone, the stream is done.
                 Err(broadcast::error::RecvError::Closed) => None,
@@ -273,7 +280,55 @@ impl EventStream {
     }
 }
 
-/// In-process transport backend (plan section 6).
+/// A live update on the operation stream, normalised across transports.
+///
+/// Mirrors the [`ApiEvent`] shape for the change stream: an in-process or IPC
+/// subscriber that lags past the channel capacity gets a
+/// [`Resynced`](OperationUpdate::Resynced) prompt to re-snapshot via
+/// [`list_operations`](TransportBackend::list_operations) rather than silently
+/// dropping updates.
+#[derive(Debug, Clone)]
+pub enum OperationUpdate {
+    /// The stream lagged (or reconnected over IPC); the UI should re-snapshot.
+    Resynced,
+    /// A concrete operation event (started / progress / terminal).
+    Event(OperationEvent),
+}
+
+/// The transport-agnostic operation stream returned by
+/// [`TransportBackend::subscribe_operations`].
+///
+/// The operation counterpart of [`EventStream`]; same two delivery mechanisms
+/// behind one type. Poll it with [`OperationStream::recv`].
+pub enum OperationStream {
+    /// In-process delivery: a direct subscription to the runtime's operation
+    /// broadcast.
+    InProcess(broadcast::Receiver<OperationEvent>),
+    /// IPC delivery: a subscription to the control client's broadcast of
+    /// operation events decoded off the control socket.
+    Ipc(broadcast::Receiver<OperationEvent>),
+}
+
+impl OperationStream {
+    /// Await the next operation update.
+    ///
+    /// Returns `Some(OperationUpdate::Event(_))` per operation event,
+    /// `Some(OperationUpdate::Resynced)` when the subscriber lagged
+    /// (re-snapshot needed), and `None` once the stream is permanently
+    /// closed.
+    pub async fn recv(&mut self) -> Option<OperationUpdate> {
+        let receiver = match self {
+            OperationStream::InProcess(receiver) | OperationStream::Ipc(receiver) => receiver,
+        };
+        match receiver.recv().await {
+            Ok(event) => Some(OperationUpdate::Event(event)),
+            Err(broadcast::error::RecvError::Lagged(_)) => Some(OperationUpdate::Resynced),
+            Err(broadcast::error::RecvError::Closed) => None,
+        }
+    }
+}
+
+/// In-process transport backend.
 ///
 /// Thinnest possible wrapper over [`Api`](crate::api::Api): every call
 /// delegates directly, completing immediately. Used on Android (single
@@ -445,23 +500,31 @@ impl TransportBackend for InProcessBackend {
     fn subscribe(&self) -> EventStream {
         EventStream::InProcess(self.api.subscribe())
     }
+
+    async fn list_operations(&self) -> Result<Vec<Operation>, ApiError> {
+        Ok(self.api.list_operations())
+    }
+
+    fn subscribe_operations(&self) -> OperationStream {
+        OperationStream::InProcess(self.api.subscribe_operations())
+    }
 }
 
 /// The transport-agnostic handle `flutter_rust_bridge` targets on every
-/// platform (plan section 6).
+/// platform.
 ///
 /// An `enum` over the concrete backends, forwarding the whole
 /// [`TransportBackend`] surface to whichever variant is present. The Dart UI
 /// holds one `Backend` and never learns which transport backs it.
 ///
 /// [`Backend::InProcess`] is used on Android / single-process desktop;
-/// [`Backend::Ipc`] connects to the daemon control socket (section 7) on the
-/// Linux daemon topology.
+/// [`Backend::Ipc`] connects to the daemon control socket on the Linux daemon
+/// topology.
 #[derive(Clone)]
 pub enum Backend {
     /// In-process backend (Android / single-process desktop).
     InProcess(InProcessBackend),
-    /// IPC-client backend talking to the daemon control socket (section 7).
+    /// IPC-client backend talking to the daemon control socket.
     Ipc(crate::control::IpcClientBackend),
 }
 
@@ -664,6 +727,20 @@ impl TransportBackend for Backend {
         match self {
             Backend::InProcess(backend) => backend.subscribe(),
             Backend::Ipc(backend) => backend.subscribe(),
+        }
+    }
+
+    async fn list_operations(&self) -> Result<Vec<Operation>, ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.list_operations().await,
+            Backend::Ipc(backend) => backend.list_operations().await,
+        }
+    }
+
+    fn subscribe_operations(&self) -> OperationStream {
+        match self {
+            Backend::InProcess(backend) => backend.subscribe_operations(),
+            Backend::Ipc(backend) => backend.subscribe_operations(),
         }
     }
 }

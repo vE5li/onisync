@@ -2,25 +2,20 @@
 //! directory. Keeping this in one struct avoids re-building paths by hand in
 //! every call site.
 //!
-//! Historically these were free functions that read `ONISYNC_DATA_DIR` /
-//! `ONISYNC_PRIVATE_KEY_FILE` from the environment and `expect()`ed them. That
-//! is fine for a shell-launched daemon but wrong for other frontends (e.g.
-//! Android, where there is no shell environment and a panic crashes the app).
-//!
-//! The environment is therefore no longer consulted here. Each frontend
-//! constructs a [`Paths`] value explicitly:
+//! Each frontend constructs a [`Paths`] value explicitly:
 //!
 //! - the desktop binary reads the environment (see `main.rs`),
 //! - Android would pass `getFilesDir()` through the bridge.
+//!
+//! No frontend-agnostic environment lookup lives here: a panic deep in the
+//! library would crash an Android app without a shell environment.
 
 use std::path::{Path, PathBuf};
 
 /// Resolved on-disk locations for a single onisync instance.
 ///
 /// `data_dir` holds the databases (`main.db`, per-sync-directory `*.db`).
-/// `identity_file` is the path to this machine's long-lived identity key; it
-/// is kept separate rather than derived from `data_dir` so existing
-/// deployments that point it elsewhere keep working.
+/// `identity_file` is the path to this machine's long-lived identity key.
 #[derive(Debug, Clone)]
 pub struct Paths {
     data_dir: PathBuf,
@@ -96,16 +91,15 @@ impl Paths {
     }
 }
 
-/// The daemon's local control socket (portability plan section 7).
+/// The daemon's local control socket.
 ///
 /// This is a **fixed, well-known absolute path**, deliberately with **no
 /// environment-variable resolution and no fallback**. The daemon and every
-/// client (the CLI, later the desktop UI) must agree on the exact same address,
-/// and a fallback chain is precisely what lets them silently disagree: an
-/// earlier design resolved `$XDG_RUNTIME_DIR/onisync.sock` with a `/tmp`
-/// fallback, so a systemd *system* service (which has no `XDG_RUNTIME_DIR`)
-/// happily bound `/tmp/onisync.sock` while an interactive CLI looked in
-/// `/run/user/1000/onisync.sock` and failed. One constant removes that whole
+/// client (the CLI, later the desktop UI) must agree on the exact same
+/// address, and a fallback chain silently lets them disagree: a systemd
+/// *system* service has no `XDG_RUNTIME_DIR` and would bind
+/// `/tmp/onisync.sock`, while an interactive CLI would look in
+/// `/run/user/1000/onisync.sock` and fail. One constant removes that whole
 /// class of bug.
 ///
 /// The directory `/run/onisync` is owned and secured by systemd via
@@ -122,7 +116,7 @@ impl Paths {
 /// and the CLI `--socket` flag, rather than relying on discovery here.
 pub const CONTROL_SOCKET_PATH: &str = "/run/onisync/onisync.sock";
 
-/// Path to the daemon's local control socket (portability plan section 7).
+/// Path to the daemon's local control socket.
 ///
 /// Returns the fixed [`CONTROL_SOCKET_PATH`]. See its docs for why there is no
 /// environment lookup or fallback.

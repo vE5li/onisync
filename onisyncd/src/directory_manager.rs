@@ -227,7 +227,7 @@ impl SyncDirectoryManager {
     }
 
     /// Decide whether a watcher event for `path` reflects a self-write and, if
-    /// so, consume the record (first-match wins, mirroring the old skip queue).
+    /// so, consume the record (first-match wins).
     ///
     /// - Ingest events (Create / move-in): any pending self-write for the path
     ///   is our own materialization; pass `observed_hash: None` to match on
@@ -926,7 +926,9 @@ impl SyncDirectoryManager {
                     std::fs::remove_file(&file_path)
                         .map_err(|_| SyncDirectoryError::FailedRemovingFile)?;
 
-                    if let Some(directory) = PathBuf::from(file.physical_path.as_str()).parent() {
+                    if let Some(directory) = PathBuf::from(file.physical_path.as_str()).parent()
+                        && !directory.as_os_str().is_empty()
+                    {
                         self.try_remove_empty_directory(sync_directory.path.join(directory));
                     }
 
@@ -1138,7 +1140,11 @@ impl SyncDirectoryManager {
 
                         // If the moved file was in a directory that is now empty, we want to remove the
                         // directory as well.
-                        self.try_remove_empty_directory(old_file_path.parent().unwrap());
+                        if let Some(directory) = PathBuf::from(file.physical_path.as_str()).parent()
+                            && !directory.as_os_str().is_empty()
+                        {
+                            self.try_remove_empty_directory(old_file_path.parent().unwrap());
+                        }
 
                         // The rename is self-caused. Depending on how the OS and
                         // debouncer report it we may see a combined `Move`, or a
@@ -1218,6 +1224,7 @@ impl SyncDirectoryManager {
                 // the directory as well.
                 if let SyncType::TagBased { .. } = &sync_directory.sync_type
                     && let Some(directory) = PathBuf::from(file.physical_path.as_str()).parent()
+                    && !directory.as_os_str().is_empty()
                 {
                     let directory_path = sync_directory.path.join(directory);
                     self.try_remove_empty_directory(directory_path);
@@ -1944,8 +1951,8 @@ mod tests {
 
     /// A `Modify` whose on-disk content matches the bytes the daemon just wrote
     /// (via `ChangeFile`) is recognized as our own write and suppressed — no
-    /// change is re-emitted. This is the case the old path-only guard could not
-    /// distinguish from a real edit.
+    /// change is re-emitted. A path-only guard cannot distinguish this from a
+    /// real edit; the hash comparison is what makes the distinction reliable.
     #[tokio::test]
     async fn self_caused_modify_is_suppressed() {
         let data_dir = temp_dir("selfmod-data");

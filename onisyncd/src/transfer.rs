@@ -32,6 +32,17 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::file_bytes::FileBytes;
 
+/// A sink for byte-transfer progress.
+///
+/// Both endpoints report the running total of bytes transferred (and the known
+/// total, if any) through this so a caller — the peer session — can surface a
+/// live [`Operation`](crate::operations) with a progress bar. It is a thin
+/// boxed callback rather than a hard dependency on the operations module, so
+/// [`run_sender`]/[`run_receiver`] stay unit-testable in isolation.
+///
+/// Reporting is best-effort and never affects transfer correctness.
+pub type ProgressSink = Box<dyn Fn(u64, Option<u64>) + Send + Sync>;
+
 /// Bytes per chunk. A chunk request/reply pair moves at most this many bytes.
 pub const CHUNK_SIZE: usize = 64 * 1024;
 
@@ -183,7 +194,7 @@ impl std::error::Error for TransferError {}
 /// catalog/manifest). It is used only to cap the request window so the receiver
 /// never asks for chunks past end-of-file — completion and correctness still
 /// rest on the sender's `last` flag and the BLAKE3 verification. A `0` here
-/// means "size unknown" and disables the cap (falls back to the old behaviour).
+/// means "size unknown" and disables the cap.
 ///
 /// On any error the temp file is removed and an abort is sent to the peer.
 pub async fn run_receiver(
@@ -193,6 +204,7 @@ pub async fn run_receiver(
     temp_path: PathBuf,
     outbound: UnboundedSender<TransferMessage>,
     mut inbound: UnboundedReceiver<TransferMessage>,
+    progress: Option<ProgressSink>,
 ) -> Result<FileBytes, TransferError> {
     let result = receive_inner(
         file_id,
@@ -201,6 +213,7 @@ pub async fn run_receiver(
         &temp_path,
         &outbound,
         &mut inbound,
+        progress.as_ref(),
     )
     .await;
 
@@ -215,6 +228,7 @@ pub async fn run_receiver(
     result.map(|()| FileBytes::FileToMove(temp_path))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn receive_inner(
     file_id: FileId,
     content_hash: &str,
@@ -222,6 +236,7 @@ async fn receive_inner(
     temp_path: &PathBuf,
     outbound: &UnboundedSender<TransferMessage>,
     inbound: &mut UnboundedReceiver<TransferMessage>,
+    progress: Option<&ProgressSink>,
 ) -> Result<(), TransferError> {
     let mut file = tokio::fs::File::create(temp_path)
         .await
@@ -288,6 +303,10 @@ async fn receive_inner(
                     hasher.update(&chunk);
                     file.write_all(&chunk).await.map_err(TransferError::Io)?;
                     write_offset += chunk.len() as u64;
+                    if let Some(report) = progress {
+                        let total = (expected_size != 0).then_some(expected_size);
+                        report(write_offset, total);
+                    }
                     if chunk_last {
                         // Final chunk written: verify and finish. With a known
                         // size we cap requests at EOF, so normally nothing is
@@ -452,11 +471,32 @@ impl ChunkSource for ProviderSource {
     }
 }
 
+/// The outcome of a **sender** transfer, delivered once the sender endpoint
+/// stops serving.
+///
+/// A sender "completes" the moment it has served the final chunk (`last`),
+/// even though it may keep looping afterwards to answer stray in-flight
+/// requests: the receiver-driven protocol has no explicit "done" ack, so `last`
+/// is the authoritative completion signal on this side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SenderOutcome {
+    /// The final chunk was served successfully.
+    Complete,
+    /// The transfer aborted (receiver aborted, a read failed, or the link
+    /// dropped) before the final chunk was served.
+    Aborted(String),
+}
+
 pub async fn run_sender<S: ChunkSource>(
     source: S,
     outbound: UnboundedSender<TransferMessage>,
     mut inbound: UnboundedReceiver<TransferMessage>,
-) {
+    progress: Option<ProgressSink>,
+) -> SenderOutcome {
+    // Highest byte offset served so far, so out-of-order/duplicate requests do
+    // not make the reported total regress. The sender does not know the file's
+    // total size up front (the source streams it), so `total` is always None.
+    let mut served_high_water: u64 = 0;
     while let Some(message) = inbound.recv().await {
         match message {
             TransferMessage::Start { .. } => {
@@ -466,6 +506,13 @@ pub async fn run_sender<S: ChunkSource>(
             TransferMessage::ChunkRequest { offset } => {
                 match source.read_chunk_at(offset, CHUNK_SIZE).await {
                     Ok((bytes, last)) => {
+                        if let Some(report) = &progress {
+                            let end = offset + bytes.len() as u64;
+                            if end > served_high_water {
+                                served_high_water = end;
+                                report(served_high_water, None);
+                            }
+                        }
                         if outbound
                             .send(TransferMessage::Chunk {
                                 offset,
@@ -474,23 +521,37 @@ pub async fn run_sender<S: ChunkSource>(
                             })
                             .is_err()
                         {
-                            // Receiver gone.
-                            return;
+                            // Receiver gone before we could serve the chunk.
+                            return SenderOutcome::Aborted("receiver gone".to_owned());
+                        }
+                        if last {
+                            // Served the final chunk: the transfer is complete.
+                            // Return immediately rather than looping to answer
+                            // any windowed past-EOF requests — the receiver
+                            // discards those, and holding the endpoint open only
+                            // keeps the operation looking "active".
+                            return SenderOutcome::Complete;
                         }
                     }
                     Err(error) => {
                         let _ = outbound.send(TransferMessage::Abort {
                             reason: format!("sender read error: {error}"),
                         });
-                        return;
+                        return SenderOutcome::Aborted(error.to_string());
                     }
                 }
             }
-            TransferMessage::Abort { .. } => return,
+            // An abort before we served the final chunk is a genuine failure
+            // (the receiver gave up, or the link dropped). Aborts that arrive
+            // *after* the final chunk never reach here: we return `Complete`
+            // above the moment we serve `last`.
+            TransferMessage::Abort { reason } => return SenderOutcome::Aborted(reason),
             // A sender should not get Chunk; ignore defensively.
             TransferMessage::Chunk { .. } => {}
         }
     }
+    // Inbound channel closed without ever serving the final chunk.
+    SenderOutcome::Aborted("transfer channel closed".to_owned())
 }
 
 /// The outcome of a receiver transfer, delivered once it finishes.
@@ -518,6 +579,7 @@ pub fn spawn_receiver<F>(
     peer_tx: UnboundedSender<F>,
     wrap: impl Fn(SyncMessage) -> F + Send + 'static,
     done: tokio::sync::oneshot::Sender<ReceiveOutcome>,
+    progress: Option<ProgressSink>,
 ) -> UnboundedSender<TransferMessage>
 where
     F: Send + 'static,
@@ -543,6 +605,7 @@ where
             temp_path,
             endpoint_out_tx,
             inbound_rx,
+            progress,
         )
         .await
         {
@@ -561,11 +624,14 @@ where
 /// As with [`spawn_receiver`], returns the inbound `TransferMessage` sender for
 /// the demux table; the endpoint's replies are wrapped under `transfer_id` and
 /// pushed onto `peer_tx`.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_sender<F, S>(
     transfer_id: TransferId,
     source: S,
     peer_tx: UnboundedSender<F>,
     wrap: impl Fn(SyncMessage) -> F + Send + 'static,
+    progress: Option<ProgressSink>,
+    done: tokio::sync::oneshot::Sender<SenderOutcome>,
 ) -> UnboundedSender<TransferMessage>
 where
     F: Send + 'static,
@@ -583,7 +649,10 @@ where
         }
     });
 
-    tokio::spawn(run_sender(source, endpoint_out_tx, inbound_rx));
+    tokio::spawn(async move {
+        let outcome = run_sender(source, endpoint_out_tx, inbound_rx, progress).await;
+        let _ = done.send(outcome);
+    });
 
     inbound_tx
 }
@@ -618,7 +687,7 @@ mod tests {
         // sender -> receiver
         let (s2r_tx, s2r_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let sender = tokio::spawn(run_sender(source, s2r_tx, r2s_rx));
+        let sender = tokio::spawn(run_sender(source, s2r_tx, r2s_rx, None));
         let received = run_receiver(
             file_id,
             content_hash,
@@ -626,9 +695,14 @@ mod tests {
             dest.clone(),
             r2s_tx,
             s2r_rx,
+            None,
         )
         .await;
-        sender.await.unwrap();
+        // A successful transfer must leave the sender reporting `Complete` — the
+        // regression that left "Sending file" operations stuck as active came
+        // from the sender never signalling completion (it looped waiting for an
+        // abort that the receiver, capped at EOF, never sends).
+        assert_eq!(sender.await.unwrap(), SenderOutcome::Complete);
 
         let result = received.map(|file_bytes| {
             let path = file_bytes.path().unwrap().to_path_buf();
@@ -677,6 +751,7 @@ mod tests {
             FileBytes::InMemory(b"real bytes".to_vec()),
             s2r_tx,
             r2s_rx,
+            None,
         ));
         let wrong_hash = blake3::hash(b"different").to_hex().to_string();
         let received = run_receiver(
@@ -686,6 +761,7 @@ mod tests {
             dest.clone(),
             r2s_tx,
             s2r_rx,
+            None,
         )
         .await;
         sender.await.unwrap();
@@ -704,11 +780,16 @@ mod tests {
         let (r2s_tx, r2s_rx) = tokio::sync::mpsc::unbounded_channel();
         let (s2r_tx, s2r_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let sender = tokio::spawn(run_sender(FileBytes::FileToCopy(missing), s2r_tx, r2s_rx));
+        let sender = tokio::spawn(run_sender(
+            FileBytes::FileToCopy(missing),
+            s2r_tx,
+            r2s_rx,
+            None,
+        ));
         let hash = blake3::hash(b"whatever").to_hex().to_string();
         // Size unknown (source is missing): pass 0 to disable the request cap
         // so we still request offset 0 and receive the sender's abort.
-        let received = run_receiver(file_id, hash, 0, dest.clone(), r2s_tx, s2r_rx).await;
+        let received = run_receiver(file_id, hash, 0, dest.clone(), r2s_tx, s2r_rx, None).await;
         sender.await.unwrap();
 
         assert!(matches!(received, Err(TransferError::Aborted(_))));
@@ -722,7 +803,7 @@ mod tests {
     #[tokio::test]
     async fn known_size_never_requests_past_eof() {
         // A size that is NOT a multiple of CHUNK_SIZE, so the final chunk is
-        // partial — the case that used to overshoot.
+        // partial: the case where a naive receiver would overshoot end-of-file.
         let bytes: Vec<u8> = (0..(CHUNK_SIZE * 3 + 7)).map(|i| i as u8).collect();
         let size = bytes.len() as u64;
         let content_hash = blake3::hash(&bytes).to_hex().to_string();
@@ -768,8 +849,16 @@ mod tests {
             requested
         });
 
-        let received =
-            run_receiver(file_id, content_hash, size, dest.clone(), r2s_tx, s2r_rx).await;
+        let received = run_receiver(
+            file_id,
+            content_hash,
+            size,
+            dest.clone(),
+            r2s_tx,
+            s2r_rx,
+            None,
+        )
+        .await;
         let requested = sender.await.unwrap();
 
         let received_bytes = received

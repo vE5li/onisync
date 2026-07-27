@@ -1,13 +1,9 @@
 //! Daemon-internal representation of a file's content in transit.
 //!
-//! Historically file content was carried everywhere as an owned, fully-buffered
-//! `Vec<u8>` (see the wire types in `onisync-core`). That does not scale to
-//! large files: every ingestion read the whole file into memory before it could
-//! be placed into a sync directory.
-//!
-//! [`FileBytes`] lets an internal producer describe *where* a file's content
-//! lives and *how* the consumer is allowed to obtain it, without eagerly
-//! reading it into memory:
+//! Carrying content as an owned, fully-buffered `Vec<u8>` (as the wire types
+//! in `onisync-core` do) does not scale to large files. [`FileBytes`] lets an
+//! internal producer describe *where* a file's content lives and *how* the
+//! consumer is allowed to obtain it, without eagerly reading it into memory:
 //!
 //! - [`FileBytes::InMemory`] — the bytes are already in memory (e.g. a small
 //!   programmatic upload through the API). Nothing to read from disk.
@@ -21,9 +17,8 @@
 //!
 //! This type is deliberately **daemon-only** and is never serialized: the
 //! `FileToMove`/`FileToCopy` variants carry machine-local paths that are
-//! meaningless to a peer. Content bound for a peer crosses the wire boundary as
-//! a `Vec<u8>` via [`FileBytes::into_vec`] (see the peer-forward seam in
-//! `handle_changes`); a streaming peer transport is a separate, later step.
+//! meaningless to a peer. Content bound for a peer is streamed chunk-by-chunk
+//! via [`FileBytes::read_chunk_at`] over the transfer protocol.
 //!
 //! ## Ownership / cleanup
 //!

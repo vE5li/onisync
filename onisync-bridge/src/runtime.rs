@@ -1,5 +1,4 @@
-//! Native runtime lifecycle for embedded frontends (portability plan
-//! section 8).
+//! Native runtime lifecycle for embedded frontends.
 //!
 //! On Android there is no `main()` and no `#[tokio::main]`: the app loads this
 //! native library and calls in. The OS also freezes background threads under
@@ -14,9 +13,8 @@
 //!    startup ([`onisyncd::run`]) on that runtime, and returns once the
 //!    UI-facing [`Backend`] is ready.
 //! 2. The runtime thread then drives the sync engine to completion.
-//! 3. [`RuntimeHandle::stop`] triggers the section-3 [`ShutdownSignal`] and
-//!    joins the thread, so the service `onDestroy` tears everything down
-//!    cleanly.
+//! 3. [`RuntimeHandle::stop`] triggers the [`ShutdownSignal`] and joins the
+//!    thread, so the service `onDestroy` tears everything down cleanly.
 
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -102,10 +100,8 @@ impl RuntimeHandle {
     /// only until startup either succeeds (returning `Self`) or fails.
     ///
     /// On first launch the data directory is created and this device's
-    /// ed25519 identity is generated and persisted (plan section 8: "app
-    /// generates the ed25519 identity on first launch"), so the frontend does
-    /// not need a separate keygen step. An existing identity is never
-    /// overwritten.
+    /// ed25519 identity is generated and persisted, so the frontend does not
+    /// need a separate keygen step. An existing identity is never overwritten.
     pub fn start(configuration_json: &str, paths: Paths) -> Result<Self, StartError> {
         let configuration =
             Configuration::from_str(configuration_json).map_err(StartError::Configuration)?;
@@ -148,8 +144,8 @@ impl RuntimeHandle {
         }
     }
 
-    /// The UI-facing transport backend (section 6). Clone it to hand to the
-    /// API layer; every clone shares the one running engine.
+    /// The UI-facing transport backend. Clone it to hand to the API layer;
+    /// every clone shares the one running engine.
     pub fn backend(&self) -> Backend {
         self.backend.clone()
     }
@@ -163,9 +159,8 @@ impl RuntimeHandle {
     /// Request a clean shutdown and join the runtime thread.
     ///
     /// Idempotent-safe to call once; consumes the handle. Triggers the
-    /// section-3 [`ShutdownSignal`] so the engine drains its tasks, then waits
-    /// for the runtime thread to exit. Intended for the Android service
-    /// `onDestroy`.
+    /// [`ShutdownSignal`] so the engine drains its tasks, then waits for the
+    /// runtime thread to exit. Intended for the Android service `onDestroy`.
     pub fn stop(mut self) {
         self.shutdown.shutdown();
         if let Some(thread) = self.thread.take() {
@@ -233,9 +228,9 @@ fn bootstrap_on_disk_state(paths: &Paths) -> Result<String, StartError> {
 
 /// Body of the dedicated runtime thread.
 ///
-/// Builds the tokio runtime by hand (deliberately not `#[tokio::main]`, per the
-/// plan) and blocks on it. Startup runs first and its outcome is reported back
-/// over `ready_sender`; on success the driver future is awaited to completion,
+/// Builds the tokio runtime by hand (deliberately not `#[tokio::main]`) and
+/// blocks on it. Startup runs first and its outcome is reported back over
+/// `ready_sender`; on success the driver future is awaited to completion,
 /// which is where the engine actually does its work until `shutdown` fires.
 fn run_thread(
     configuration: Configuration,

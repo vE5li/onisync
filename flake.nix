@@ -302,8 +302,6 @@
           ${runAndroidLaunchBody}
         '';
 
-        # --- Linux desktop (two-process topology, plan sections 6-7) ---------
-
         # Build/run the Flutter Linux desktop app. Unlike Android, the native
         # library is built and bundled by the runner's CMake hook
         # (app/linux/CMakeLists.txt) during `flutter run`, so there is no
@@ -330,7 +328,6 @@
           # Shared across platforms.
           codegen = codegenBody;
 
-          # --- Android apps --------------------------------------------------
           # Full build-and-run: regenerate bindings, rebuild the native .so for
           # the connected device's ABI, then launch. The safe default; safe to
           # re-run.
@@ -355,7 +352,6 @@
           # (defaults to arm64-v8a; set ONISYNC_ANDROID_ABIS for a release build).
           build-native-android = buildNativeAndroidBody;
 
-          # --- Linux desktop apps (two-process topology) ---------------------
           # Full build-and-run: regenerate bindings, then launch (the native
           # library is built by the CMake hook during `flutter run`). Safe to
           # re-run.

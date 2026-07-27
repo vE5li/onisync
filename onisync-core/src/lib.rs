@@ -14,14 +14,12 @@ pub mod tag {
     pub enum WeakType {
         String,
         Float,
-        // Timestamp,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub enum WeakData {
         String(String),
         Float(f64),
-        // Timestamp(),
     }
 
     pub enum QueryError {
@@ -92,17 +90,14 @@ pub mod state {
     /// - Allowed to be accessed by the user
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub enum Change {
-        // The client can't know the Id of the file initially.
-        //
-        // `FileMetadataAdded` / `FileMetadataChanged` are named to make it
-        // explicit that they are **metadata-only announcements** carrying no
-        // file bytes — a receiver pulls the content over a separate transfer.
+        /// `FileMetadataAdded` / `FileMetadataChanged` are named to make it
+        /// explicit that they are **metadata-only announcements** carrying no
+        /// file bytes — a receiver pulls the content over a separate transfer.
         FileMetadataAdded {
             file_id: FileId,
             /// The file's logical identity. Receivers store this in the main
             /// database and each derive their own on-disk placement from it.
             logical_path: LogicalPath,
-            // encoding: ,
             /// BLAKE3 hex digest of the file's content. `FileMetadataAdded` is
             /// a metadata-only announcement: it carries no bytes. A
             /// receiver that does not already hold this hash pulls
@@ -125,7 +120,6 @@ pub mod state {
         },
         FileMetadataChanged {
             file_id: FileId,
-            // encoding: ,
             /// BLAKE3 hex digest of the file's new content. Like
             /// `FileMetadataAdded`, `FileMetadataChanged` is metadata-only and
             /// carries no bytes; the receiver pulls them over a separate
@@ -362,8 +356,6 @@ pub mod state {
             request_id: RequestId,
         },
 
-        // --- File transfer (pull-based bulk byte movement) --------------------
-        //
         // Bytes are moved over a link by a *pull* protocol: the **receiver**
         // drives, the **sender** only ever replies. This gives fair
         // interleaving with other traffic for free (the sender never emits a
@@ -453,7 +445,7 @@ pub mod state {
 /// content hash + number of its latest recorded version.
 ///
 /// Produced by `FileDatabase::get_all_files` and returned by the UI-facing
-/// read API (portability plan section 5).
+/// read API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileInfo {
     pub file_id: FileId,

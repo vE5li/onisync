@@ -2,12 +2,12 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef};
-use rusqlite::{Connection, OptionalExtension, ToSql};
-use serde::{Deserialize, Serialize};
 use onisync_core::state::{RelationshipKind, RelationshipManifestEntry, TagManifestEntry};
 use onisync_core::tag::MetadataFormat;
 use onisync_core::{FileId, FileInfo, LogicalPath, PhysicalPath, TagId};
+use rusqlite::types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef};
+use rusqlite::{Connection, OptionalExtension, ToSql};
+use serde::{Deserialize, Serialize};
 
 /// A file's version history as `(version_number, content_hash, size)` triples
 /// ordered oldest-to-newest. `size` is the version's content size in bytes.
@@ -299,7 +299,7 @@ impl FileDatabase {
             deleted         INTEGER NOT NULL,
             deleted_at      INTEGER NOT NULL
         )",
-                (), // empty list of parameters.
+                (),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
@@ -331,7 +331,7 @@ impl FileDatabase {
             modified_at INTEGER NOT NULL DEFAULT 0,
             deleted     INTEGER NOT NULL
         )",
-                (), // empty list of parameters.
+                (),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
@@ -358,7 +358,7 @@ impl FileDatabase {
             deleted     INTEGER NOT NULL DEFAULT 0,
             UNIQUE (tag_id, target_id, type)
         )",
-                (), // empty list of parameters.
+                (),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
@@ -2133,7 +2133,7 @@ impl SyncDirectoryDatabase {
             id              TEXT PRIMARY KEY,
             physical_path   TEXT NOT NULL
         )",
-                (), // empty list of parameters.
+                (),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
@@ -2564,8 +2564,6 @@ mod tests {
         }
     }
 
-    // --- Tag short-id resolution ---------------------------------------------
-
     /// Build a `TagId` from a 32-char hex string so tests can control the exact
     /// prefix relationships between ids.
     fn tag_id_from_hex(hex: &str) -> TagId {
@@ -2638,8 +2636,6 @@ mod tests {
             );
         }
     }
-
-    // --- Tag hierarchy (subtags) ---------------------------------------------
 
     #[test]
     fn tag_tag_then_subtag_ids_lists_children() {
@@ -2721,8 +2717,6 @@ mod tests {
             Err(DatabaseError::CantTagItself)
         ));
     }
-
-    // --- Tag last-writer-wins ------------------------------------------------
 
     #[test]
     fn add_tag_newer_modified_at_wins_older_is_noop() {
@@ -3029,8 +3023,6 @@ mod tests {
         assert_eq!(matched, BTreeSet::from([file_c]));
     }
 
-    // --- File size ---------------------------------------------------------
-
     #[test]
     fn size_round_trips_through_version_and_file_info() {
         let mut database = memory_db();
@@ -3083,8 +3075,6 @@ mod tests {
             vec![(1, "h1".to_owned(), 10), (2, "h2".to_owned(), 20),]
         );
     }
-
-    // --- File deletion tombstones -----------------------------------------
 
     #[test]
     fn file_delete_soft_deletes_and_hides_from_reads() {
@@ -3179,8 +3169,6 @@ mod tests {
         // History (with sizes) is retained so the file can be restored.
         assert_eq!(history, &vec![(1, "h1".to_owned(), 7)]);
     }
-
-    // --- Tag deletion tombstones ------------------------------------------
 
     #[test]
     fn tag_delete_soft_deletes_and_hides_from_reads() {

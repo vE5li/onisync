@@ -1,17 +1,16 @@
 //! The daemon ingest bus.
 //!
-//! Historically the runtime had a single `mpsc` channel carrying
-//! `(Change, ChangeOrigin)` from every producer (the UI-facing [`Api`], the
-//! sync-directory watcher, and inbound peer sessions) to the single
-//! `handle_changes` task that is the sole DB writer.
+//! One `mpsc` channel carries messages from every producer (the UI-facing
+//! [`Api`], the sync-directory watcher, and inbound peer sessions) to the
+//! single `handle_changes` task, which is the sole DB writer.
 //!
-//! [`DaemonMessage`] widens that one channel into an enum so the *same* ordered
-//! FIFO can also carry a request-reply message ([`DaemonMessage::Fetch`]) used
-//! by `onisync edit` to pull a file's bytes from a peer on demand. Keeping it
-//! on the existing channel (rather than a second channel + `select!`) preserves
-//! the order of a producer's messages relative to each other — e.g. an edit
-//! enqueued just before a fetch of the same file — and reuses the existing
-//! clone/drain/shutdown wiring.
+//! [`DaemonMessage`] is an enum so the same ordered FIFO can carry both
+//! fire-and-forget mutations and a request-reply message
+//! ([`DaemonMessage::Fetch`]) used by `onisync edit` to pull a file's bytes
+//! from a peer on demand. Keeping everything on one channel (rather than a
+//! second channel + `select!`) preserves the order of a producer's messages
+//! relative to each other — e.g. an edit enqueued just before a fetch of the
+//! same file — and reuses one set of clone/drain/shutdown wiring.
 //!
 //! The reply travels back out-of-band via the `oneshot` carried in the `Fetch`
 //! variant, mirroring the `SyncDirectoryCommand::ReadFile { respond_to }`
@@ -93,8 +92,8 @@ impl Ingest {
 
 /// A message on the daemon ingest bus.
 ///
-/// One ordered channel, two message kinds: the historical fire-and-forget
-/// change, and a request-reply fetch.
+/// One ordered channel; two message kinds: fire-and-forget mutations and a
+/// request-reply fetch.
 pub enum DaemonMessage {
     /// A mutation to apply. Fire-and-forget: no reply.
     Change(Ingest, ChangeOrigin),
@@ -126,8 +125,8 @@ pub enum DaemonMessage {
         content: FileBytes,
         /// The hash the bytes were verified against by the transfer receiver.
         content_hash: String,
-        /// Which peer announced this. Retained for context/logging; no longer
-        /// used to record a version (that happened at announce time).
+        /// Which peer announced this. Carried for context/logging; the
+        /// version was recorded at announce time.
         origin: ChangeOrigin,
         placement: MaterializePlacement,
     },

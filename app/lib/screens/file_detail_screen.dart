@@ -26,10 +26,10 @@ class FileDetailScreen extends StatefulWidget {
 
   final OniSyncSession session;
 
-  /// The string id of the file to display. Callers still pass a captured
-  /// [onisync.FileEntry] via the constructor for continuity with the existing
-  /// list rows; the screen only holds onto its id and refetches the full
-  /// entry itself.
+  /// The string id of the file to display. The constructor takes a full
+  /// [onisync.FileEntry] for convenience at call sites (list rows already
+  /// have one), but the screen retains only its id and refetches the entry
+  /// itself so it always reflects the current state of the store.
   final String fileId;
 
   @override

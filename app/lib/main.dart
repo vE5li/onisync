@@ -11,8 +11,7 @@
 //   flutter run --dart-define=ONISYNC_BACKEND=android   # (default)
 //   flutter run --dart-define=ONISYNC_BACKEND=linux -d linux
 //
-// The flake's run-android / run-linux apps pass the right value, so there is no
-// longer a per-platform main.dart to swap in.
+// The flake's run-android / run-linux apps pass the right value.
 
 import 'package:flutter/material.dart';
 

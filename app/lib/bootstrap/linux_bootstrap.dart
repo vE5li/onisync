@@ -1,5 +1,5 @@
 // Linux desktop backend: attach to the running onisync daemon over IPC
-// (portability plan sections 6-7, two-process topology).
+// (two-process topology).
 //
 // Unlike Android, this process does NOT start its own sync engine or open the
 // database. The systemd daemon owns the DB and serves a Unix control socket

@@ -7,13 +7,14 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, ContentArrangement, Table};
-use owo_colors::OwoColorize;
-use serde::Serialize;
-use serde_json::json;
 use onisync_core::{FileId, FileInfo, TagId};
 use onisyncd::control::IpcClientBackend;
 use onisyncd::database::{SubtagRule, Tag};
+use onisyncd::operations::{Operation, OperationKind, OperationStatus};
 use onisyncd::transport::TransportBackend;
+use owo_colors::OwoColorize;
+use serde::Serialize;
+use serde_json::json;
 
 /// How command results are rendered to stdout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +108,7 @@ fn highlight_id(id: &str, prefix_length: usize) -> String {
 }
 
 /// Translate the `--include-subtags` (or `--recursive`) flag into a
+/// [`SubtagRule`].
 fn subtag_rule(include: bool) -> SubtagRule {
     if include {
         SubtagRule::Include
@@ -242,14 +244,120 @@ fn emit_files(
     }
 }
 
+/// Human-readable label for an [`OperationKind`]: a short verb phrase for the
+/// "Action" column of the operations table.
+fn operation_kind_label(kind: &OperationKind) -> String {
+    match kind {
+        OperationKind::ConnectingToPeer { url, .. } => format!("Connecting ({url})"),
+        OperationKind::PeerConnected { direction, .. } => match direction {
+            onisyncd::operations::Direction::Outbound => "Connected (outbound)".to_owned(),
+            onisyncd::operations::Direction::Inbound => "Connected (inbound)".to_owned(),
+        },
+        OperationKind::SendingFile { source, .. } => {
+            let source = match source {
+                onisyncd::operations::ServeSource::SyncDirectory => "sync dir",
+                onisyncd::operations::ServeSource::Provider => "provider",
+                onisyncd::operations::ServeSource::FetchCache => "fetch cache",
+            };
+            format!("Sending ({source})")
+        }
+        OperationKind::ReceivingFile { .. } => "Receiving".to_owned(),
+        OperationKind::Fetching { .. } => "Fetching".to_owned(),
+        OperationKind::RelayingFetch { .. } => "Relaying fetch".to_owned(),
+        OperationKind::ReconcilingManifest { .. } => "Reconciling manifest".to_owned(),
+        OperationKind::ReconcilingTags { .. } => "Reconciling tags".to_owned(),
+        OperationKind::PlacingFile { .. } => "Placing file".to_owned(),
+    }
+}
+
+/// The peer an operation involves, if any (its configured name).
+fn operation_peer(kind: &OperationKind) -> Option<&str> {
+    match kind {
+        OperationKind::ConnectingToPeer { peer_name, .. }
+        | OperationKind::PeerConnected { peer_name, .. }
+        | OperationKind::SendingFile { peer_name, .. }
+        | OperationKind::ReceivingFile { peer_name, .. }
+        | OperationKind::ReconcilingManifest { peer_name }
+        | OperationKind::ReconcilingTags { peer_name } => Some(peer_name),
+        OperationKind::RelayingFetch { from_peer, .. } => Some(from_peer),
+        OperationKind::Fetching { .. } | OperationKind::PlacingFile { .. } => None,
+    }
+}
+
+/// The file an operation concerns, if any (its id string).
+fn operation_file(kind: &OperationKind) -> Option<&str> {
+    match kind {
+        OperationKind::SendingFile { file_id, .. }
+        | OperationKind::ReceivingFile { file_id, .. }
+        | OperationKind::Fetching { file_id }
+        | OperationKind::RelayingFetch { file_id, .. }
+        | OperationKind::PlacingFile { file_id } => Some(file_id),
+        OperationKind::ConnectingToPeer { .. }
+        | OperationKind::PeerConnected { .. }
+        | OperationKind::ReconcilingManifest { .. }
+        | OperationKind::ReconcilingTags { .. } => None,
+    }
+}
+
+/// Human-readable label for an [`OperationStatus`], including a `done/total`
+/// progress fragment for active operations that report one.
+fn operation_status_label(status: &OperationStatus) -> String {
+    match status {
+        OperationStatus::Active { progress: None } => "active".to_owned(),
+        OperationStatus::Active {
+            progress: Some(progress),
+        } => match progress.total {
+            Some(total) => format!("active ({}/{})", progress.done, total),
+            None => format!("active ({})", progress.done),
+        },
+        OperationStatus::Completed => "completed".to_owned(),
+        OperationStatus::Failed { reason } => format!("failed: {reason}"),
+        OperationStatus::Aborted => "aborted".to_owned(),
+    }
+}
+
+/// Build the operations table (see [`file_table`] for the shared pattern).
+fn operation_table(operations: &[Operation]) -> Table {
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec!["Id", "Action", "Peer", "File", "Status"]);
+
+    for operation in operations {
+        table.add_row(vec![
+            Cell::new(operation.id.as_u64()),
+            Cell::new(operation_kind_label(&operation.kind)),
+            Cell::new(operation_peer(&operation.kind).unwrap_or("")),
+            Cell::new(operation_file(&operation.kind).unwrap_or("")),
+            Cell::new(operation_status_label(&operation.status)),
+        ]);
+    }
+
+    table
+}
+
+/// Emit the currently-active operations in the selected [`OutputMode`]: the
+/// shared [`operation_table`] (or `(no operations)`) for humans, or the raw
+/// [`Operation`]s as a JSON array for scripts (they already derive
+/// `Serialize`).
+fn emit_operations(output_mode: OutputMode, operations: &[Operation]) {
+    match output_mode {
+        OutputMode::Human => {
+            if operations.is_empty() {
+                println!("(no operations)");
+            } else {
+                println!("{}", operation_table(operations));
+            }
+        }
+        OutputMode::Json => print_json(&operations),
+    }
+}
+
 /// Resolve `tag_ids` to display names, one `get_tag` per *distinct* id,
 /// memoized in `cache` across calls so a tag seen on many files/tags is fetched
-/// once.
-///
-/// This replaces the old whole-store `list_tags` map: instead of fetching every
-/// tag up front (an O(all-tags) hazard), it looks up only the ids actually
-/// referenced. An id that no longer resolves (deleted) falls back to its
-/// stringified form.
+/// once. An id that no longer resolves (deleted) falls back to its stringified
+/// form.
 async fn resolve_tag_names(
     backend: &IpcClientBackend,
     tag_ids: &[TagId],
@@ -275,9 +383,7 @@ async fn resolve_tag_names(
 }
 
 /// Materialize a set of tag ids into full [`Tag`] rows via `get_tag`, one
-/// lookup per id. Replaces the old "list every tag, then filter to these ids"
-/// pattern, which scanned the whole tag store to render a handful of rows. Ids
-/// that no longer resolve (deleted) are skipped.
+/// lookup per id. Ids that no longer resolve (deleted) are skipped.
 async fn tags_from_ids(
     backend: &IpcClientBackend,
     tag_ids: impl IntoIterator<Item = TagId>,
@@ -553,6 +659,10 @@ enum Commands {
         #[arg(long)]
         recursive: bool,
     },
+    /// List the daemon's currently-active sync operations (connecting to peers,
+    /// sending/receiving files, reconciling, ...).
+    #[command(visible_alias = "ops")]
+    ListOperations,
 }
 
 #[tokio::main]
@@ -565,7 +675,6 @@ async fn main() -> ExitCode {
         OutputMode::Human
     };
 
-    // Connect the IPC-client backend to the daemon's control socket.
     let backend = match &arguments.socket {
         Some(path) => IpcClientBackend::connect(path).await,
         None => IpcClientBackend::connect_default().await,
@@ -824,7 +933,6 @@ async fn run(
                 .tags_for_file(file_id, subtag_rule(include_subtags))
                 .await
                 .map_err(|error| error.to_string())?;
-            // Materialize the matched ids into full rows via `get_tag`.
             let tags = tags_from_ids(backend, tag_ids).await?;
             let mut name_cache = HashMap::new();
             // The Tags column shows each tag's own direct tags, regardless of
@@ -933,7 +1041,6 @@ async fn run(
                 .subtags_for_tag(tag_id, subtag_rule(recursive))
                 .await
                 .map_err(|error| error.to_string())?;
-            // Materialize the matched ids into full rows via `get_tag`.
             let tags = tags_from_ids(backend, subtag_ids).await?;
             let mut name_cache = HashMap::new();
             // The Tags column shows each tag's own direct tags, regardless of
@@ -942,6 +1049,14 @@ async fn run(
                 tags_by_tag(backend, &tags, &mut name_cache, SubtagRule::Exclude).await?;
 
             emit_tags(output_mode, &tags, &tag_tags);
+        }
+        Commands::ListOperations => {
+            let operations = backend
+                .list_operations()
+                .await
+                .map_err(|error| error.to_string())?;
+
+            emit_operations(output_mode, &operations);
         }
     }
     Ok(())
