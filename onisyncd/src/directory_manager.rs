@@ -597,10 +597,7 @@ impl SyncDirectoryManager {
         // behaviour we want. The parent directory is preserved verbatim.
         let base_path = Path::new(base.as_str());
         let parent = base_path.parent();
-        let stem = base_path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy();
+        let stem = base_path.file_stem().unwrap_or_default().to_string_lossy();
         let extension = base_path.extension().map(|ext| ext.to_string_lossy());
 
         // Lowest free integer. Bounded loop guards against a pathological
@@ -961,11 +958,8 @@ impl SyncDirectoryManager {
                     // disambiguated with a suffix.
                     let base_physical_path =
                         sync_directory.sync_type.physical_for(logical_path, file_id);
-                    let physical_path = self.resolve_unique_physical(
-                        sync_directory,
-                        &base_physical_path,
-                        file_id,
-                    );
+                    let physical_path =
+                        self.resolve_unique_physical(sync_directory, &base_physical_path, file_id);
                     let file_path = sync_directory.path.join(physical_path.as_str());
 
                     log::info!(

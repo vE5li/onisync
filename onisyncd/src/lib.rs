@@ -1839,16 +1839,14 @@ fn build_local_manifest(database: &FileDatabase) -> Result<Vec<ManifestEntry>, S
                 logical_path_modified_at,
                 deleted,
                 deleted_at,
-            )| {
-                ManifestEntry {
-                    file_id,
-                    history,
-                    latest_observed_at,
-                    logical_path,
-                    logical_path_modified_at,
-                    deleted,
-                    deleted_at,
-                }
+            )| ManifestEntry {
+                file_id,
+                history,
+                latest_observed_at,
+                logical_path,
+                logical_path_modified_at,
+                deleted,
+                deleted_at,
             },
         )
         .collect())

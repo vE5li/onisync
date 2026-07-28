@@ -487,8 +487,7 @@ impl FileDatabase {
             .is_ok()
         {
             let _ = connection.execute(
-                "UPDATE files SET logical_path_modified_at = (unixepoch('now') * 1000) \
-                 WHERE logical_path_modified_at = 0",
+                "UPDATE files SET logical_path_modified_at = (unixepoch('now') * 1000) WHERE logical_path_modified_at = 0",
                 (),
             );
         }
@@ -2055,10 +2054,7 @@ impl FileDatabase {
     /// reconciliation can order a peer's move against our recorded time
     /// regardless of local delete state. Used to decide whether to adopt a
     /// peer's moved path on reconnect.
-    pub fn logical_path_modified_at(
-        &self,
-        file_id: FileId,
-    ) -> Result<Option<i64>, DatabaseError> {
+    pub fn logical_path_modified_at(&self, file_id: FileId) -> Result<Option<i64>, DatabaseError> {
         self.connection
             .query_row(
                 "SELECT logical_path_modified_at FROM files WHERE id = ?1",
@@ -2303,12 +2299,13 @@ impl SyncDirectoryDatabase {
         Ok(file)
     }
 
-    /// Whether some *other* file (any `file_id` except `except_file_id`) already
-    /// occupies `physical_path` in this sync directory. Used to resolve on-disk
-    /// naming collisions: two files may share a logical path, but their bytes
-    /// must live at distinct physical paths, so placement appends a suffix until
-    /// this returns `false`. Self-exclusion keeps re-placement/no-op moves of an
-    /// already-placed file from being treated as a collision with themselves.
+    /// Whether some *other* file (any `file_id` except `except_file_id`)
+    /// already occupies `physical_path` in this sync directory. Used to
+    /// resolve on-disk naming collisions: two files may share a logical
+    /// path, but their bytes must live at distinct physical paths, so
+    /// placement appends a suffix until this returns `false`.
+    /// Self-exclusion keeps re-placement/no-op moves of an already-placed
+    /// file from being treated as a collision with themselves.
     pub fn physical_path_in_use_by_other(
         &self,
         physical_path: &PhysicalPath,
@@ -2620,8 +2617,12 @@ mod tests {
         let database = memory_db();
         let shared_a = file_id_from_hex("abcd000000000000000000000000000a");
         let shared_b = file_id_from_hex("abcd000000000000000000000000000b");
-        database.add_file(shared_a, &LogicalPath::new("a"), 0).unwrap();
-        database.add_file(shared_b, &LogicalPath::new("b"), 0).unwrap();
+        database
+            .add_file(shared_a, &LogicalPath::new("a"), 0)
+            .unwrap();
+        database
+            .add_file(shared_b, &LogicalPath::new("b"), 0)
+            .unwrap();
 
         // `abcd` matches both.
         assert!(matches!(
@@ -3282,7 +3283,10 @@ mod tests {
             database.logical_path_for_file_id(file_id).unwrap(),
             LogicalPath::new("new.txt")
         );
-        assert_eq!(database.logical_path_modified_at(file_id).unwrap(), Some(20));
+        assert_eq!(
+            database.logical_path_modified_at(file_id).unwrap(),
+            Some(20)
+        );
     }
 
     #[test]
@@ -3309,7 +3313,10 @@ mod tests {
             database.logical_path_for_file_id(file_id).unwrap(),
             LogicalPath::new("current.txt")
         );
-        assert_eq!(database.logical_path_modified_at(file_id).unwrap(), Some(20));
+        assert_eq!(
+            database.logical_path_modified_at(file_id).unwrap(),
+            Some(20)
+        );
     }
 
     #[test]
@@ -3325,8 +3332,7 @@ mod tests {
 
         let entries = database.manifest_entries().unwrap();
         assert_eq!(entries.len(), 1);
-        let (id, history, _observed, _path, _path_modified, deleted, got_deleted_at) =
-            &entries[0];
+        let (id, history, _observed, _path, _path_modified, deleted, got_deleted_at) = &entries[0];
         assert_eq!(*id, file_id);
         assert!(*deleted);
         assert_eq!(*got_deleted_at, deleted_at);

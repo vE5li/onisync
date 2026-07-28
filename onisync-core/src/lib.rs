@@ -124,9 +124,10 @@ pub mod state {
             /// each receiving sync directory derives its own
             /// physical placement.
             logical_path: LogicalPath,
-            /// The unix-millis wall-clock time the move happened, stamped on the
-            /// *originating* device and preserved verbatim across the wire.
-            /// Drives last-writer-wins reconciliation of the logical path *only*
+            /// The unix-millis wall-clock time the move happened, stamped on
+            /// the *originating* device and preserved verbatim
+            /// across the wire. Drives last-writer-wins
+            /// reconciliation of the logical path *only*
             /// (content and deletes have their own clocks): a receiver adopts
             /// this path solely when `modified_at` is strictly newer than its
             /// own recorded path-change time. Never restamp it when forwarding
