@@ -275,112 +275,17 @@ impl FileDatabase {
         let connection =
             Connection::open(database_path).map_err(|_| DatabaseError::UnableToOpenOrCreate)?;
 
-        // TODO: DELETE after all devices migrated.
-        //
-        // Temporary, hardcoded, idempotent pre-migration for dev DBs that
-        // still have the pre-versioning tables (`files`, `tags`, ...) but
-        // are missing columns added late in that unversioned era. Brings
-        // those legacy tables up to the *final* pre-versioning shape so the
-        // `migrate_*_to_v1` functions below can copy them column-for-column
-        // without special cases. `add_column_if_missing` no-ops when the
-        // pre-versioning table doesn't exist, so this whole block is a
-        // no-op on a fresh install and on any dev DB that has already
-        // migrated to v1 (the old `files` / `tags` / `file_versions` tables
-        // are dropped by the v1 migration below).
-        //
-        // These use `DEFAULT` purely to backfill existing rows (SQLite
-        // requires a default when adding a NOT NULL column). The v1 `CREATE
-        // TABLE` statements in the migration functions deliberately have no
-        // default so that omitting a value in normal operation is an error.
-        //
-        // - `file_versions.size`: backfill to 1 byte; files get their true size the
-        //   next time they are modified.
-        // - `files.deleted` / `files.deleted_at`: backfill to 0 (live, no delete time).
-        // - `tags.deleted`: backfill to 0 (live).
-        Self::add_column_if_missing(
-            &connection,
-            "file_versions",
-            "size",
-            "ALTER TABLE file_versions ADD COLUMN size INTEGER NOT NULL DEFAULT 1",
-        )?;
-        Self::add_column_if_missing(
-            &connection,
-            "files",
-            "deleted",
-            "ALTER TABLE files ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
-        )?;
-        Self::add_column_if_missing(
-            &connection,
-            "files",
-            "deleted_at",
-            "ALTER TABLE files ADD COLUMN deleted_at INTEGER NOT NULL DEFAULT 0",
-        )?;
-        Self::add_column_if_missing(
-            &connection,
-            "tags",
-            "deleted",
-            "ALTER TABLE tags ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
-        )?;
+        // Run migrations here.
 
-        // TODO: DELETE after all devices migrated.
-        //
-        // DEV-ONLY, REMOVE LATER: not a real migration. Nobody but the dev is
-        // running this yet, so `logical_path_modified_at` doesn't need to be
-        // backfilled onto pre-existing DBs the careful way. This blind ALTER
-        // is just enough to keep an existing dev DB loadable so the v1
-        // migration below can then copy it; delete this block (and recreate
-        // the DB) once the schema settles.
-        //
-        // SQLite requires a *constant* default when adding a NOT NULL column,
-        // so the ADD backfills every existing row with 0. The follow-up
-        // UPDATE then stamps those rows with the current time (unix millis,
-        // matching `now_millis`). We only touch rows still at 0 so it stays
-        // idempotent across restarts (a later real move stamps a nonzero
-        // value we keep). The `Err` is ignored on the ALTER because the
-        // column already exists on second run — or the whole `files` table is
-        // gone (already migrated to `files_v1`), which is fine.
-        if connection
-            .execute(
-                "ALTER TABLE files ADD COLUMN logical_path_modified_at INTEGER NOT NULL DEFAULT 0",
-                (),
-            )
-            .is_ok()
-        {
-            let _ = connection.execute(
-                "UPDATE files SET logical_path_modified_at = (unixepoch('now') * 1000) WHERE logical_path_modified_at = 0",
-                (),
-            );
-        }
-
-        // Bring each table up to its v1 shape. On a fresh DB these create the
-        // empty `_v1` tables. On a dev DB with the pre-versioning tables
-        // still present, they copy every row across and drop the old table.
-        // Each function is idempotent (no-op if already at v1) and self-
-        // contained (creates its own transaction), so they compose cleanly
-        // and can be called in any order — but we run them in the order the
-        // rest of the schema tends to reference them.
-        Self::migrate_files_to_v1(&connection)?;
-        Self::migrate_tags_to_v1(&connection)?;
-        Self::migrate_entries_to_v1(&connection)?;
-        Self::migrate_file_versions_to_v1(&connection)?;
+        Self::create_files_v1(&connection)?;
+        Self::create_tags_v1(&connection)?;
+        Self::create_entries_v1(&connection)?;
+        Self::create_file_versions_v1(&connection)?;
 
         Ok(Self { connection })
     }
 
-    /// Ensure `files_v1` exists. If the pre-versioning `files` table still
-    /// exists, copy every row into `files_v1` and drop `files`.
-    ///
-    /// Idempotent: safe to call on every startup. On a fresh install this
-    /// just creates the empty `files_v1` table. On a dev DB that ran the
-    /// pre-versioning code, the temporary `ALTER TABLE` block in
-    /// [`Self::initialize`] has already brought `files` up to the final
-    /// pre-versioning shape, so a straight column-listed `INSERT SELECT`
-    /// is safe. Once `files_v1` is populated and `files` is dropped, later
-    /// calls short-circuit at the `table_exists` check.
-    ///
-    /// The temporary `files` → `files_v1` bootstrap will need to be removed
-    /// once all dev devices are migrated (see the top-level TODOs).
-    fn migrate_files_to_v1(connection: &Connection) -> Result<(), DatabaseError> {
+    fn create_files_v1(connection: &Connection) -> Result<(), DatabaseError> {
         // `logical_path` is the file's logical identity: its human-readable
         // path/name (possibly nested, e.g. `foo/bar/name.txt`), independent
         // of where any individual sync directory stores the bytes on disk.
@@ -424,28 +329,10 @@ impl FileDatabase {
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        // TODO: DELETE after all devices migrated. Bootstrap from the
-        // pre-versioning `files` table.
-        if Self::table_exists(connection, "files")? {
-            connection
-                .execute(
-                    "INSERT INTO files_v1 (id, logical_path, logical_path_modified_at, deleted, deleted_at)
-                     SELECT id, logical_path, logical_path_modified_at, deleted, deleted_at FROM files",
-                    (),
-                )
-                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-            connection
-                .execute("DROP TABLE files", ())
-                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-        }
-
         Ok(())
     }
 
-    /// Ensure `tags_v1` exists. If the pre-versioning `tags` table still
-    /// exists, copy every row into `tags_v1` and drop `tags`. See
-    /// [`Self::migrate_files_to_v1`] for the general shape.
-    fn migrate_tags_to_v1(connection: &Connection) -> Result<(), DatabaseError> {
+    fn create_tags_v1(connection: &Connection) -> Result<(), DatabaseError> {
         // `name` is intentionally NOT `UNIQUE`: two devices editing offline
         // can each mint a tag with the same name but a different `TagId`.
         // When they reconcile, both tags must be able to coexist rather than
@@ -480,28 +367,10 @@ impl FileDatabase {
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        // TODO: DELETE after all devices migrated. Bootstrap from the
-        // pre-versioning `tags` table.
-        if Self::table_exists(connection, "tags")? {
-            connection
-                .execute(
-                    "INSERT INTO tags_v1 (id, name, color, metadata, modified_at, deleted)
-                     SELECT id, name, color, metadata, modified_at, deleted FROM tags",
-                    (),
-                )
-                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-            connection
-                .execute("DROP TABLE tags", ())
-                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-        }
-
         Ok(())
     }
 
-    /// Ensure `entries_v1` exists. If the pre-versioning `entries` table
-    /// still exists, copy every row into `entries_v1` and drop `entries`.
-    /// See [`Self::migrate_files_to_v1`] for the general shape.
-    fn migrate_entries_to_v1(connection: &Connection) -> Result<(), DatabaseError> {
+    fn create_entries_v1(connection: &Connection) -> Result<(), DatabaseError> {
         // `modified_at` drives last-writer-wins reconciliation of
         // relationships, exactly as for `tags_v1` above.
         //
@@ -529,29 +398,10 @@ impl FileDatabase {
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        // TODO: DELETE after all devices migrated. Bootstrap from the
-        // pre-versioning `entries` table.
-        if Self::table_exists(connection, "entries")? {
-            connection
-                .execute(
-                    "INSERT INTO entries_v1 (id, tag_id, target_id, type, modified_at, deleted)
-                     SELECT id, tag_id, target_id, type, modified_at, deleted FROM entries",
-                    (),
-                )
-                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-            connection
-                .execute("DROP TABLE entries", ())
-                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-        }
-
         Ok(())
     }
 
-    /// Ensure `file_versions_v1` (and its index) exist. If the
-    /// pre-versioning `file_versions` table still exists, copy every row
-    /// into `file_versions_v1` and drop `file_versions`. See
-    /// [`Self::migrate_files_to_v1`] for the general shape.
-    fn migrate_file_versions_to_v1(connection: &Connection) -> Result<(), DatabaseError> {
+    fn create_file_versions_v1(connection: &Connection) -> Result<(), DatabaseError> {
         // Append-only log of content hashes per file. The latest row per
         // `file_id` (highest `version_number`) is the current version.
         //
@@ -600,69 +450,6 @@ impl FileDatabase {
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        // TODO: DELETE after all devices migrated. Bootstrap from the
-        // pre-versioning `file_versions` table.
-        if Self::table_exists(connection, "file_versions")? {
-            connection
-                .execute(
-                    "INSERT INTO file_versions_v1 (file_id, content_hash, observed_at, version_number, origin, size)
-                     SELECT file_id, content_hash, observed_at, version_number, origin, size FROM file_versions",
-                    (),
-                )
-                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-            connection
-                .execute("DROP TABLE file_versions", ())
-                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-        }
-
-        Ok(())
-    }
-
-    /// Whether a table with exactly `name` exists in this database.
-    fn table_exists(connection: &Connection, name: &str) -> Result<bool, DatabaseError> {
-        let mut statement = connection
-            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-        let exists = statement
-            .query_map([name], |_| Ok(()))
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
-            .next()
-            .is_some();
-        Ok(exists)
-    }
-
-    /// TODO: DELETE after all devices migrated.
-    ///
-    /// Run `alter_sql` (an `ALTER TABLE ... ADD COLUMN`) only if `table`
-    /// exists and does not already have `column`. Idempotent: safe to call
-    /// on every startup. Used solely by the temporary pre-v1 patch-up in
-    /// [`Self::initialize`], where the target `table` is a pre-versioning
-    /// name (`files`, `tags`, `file_versions`) that will not exist on a
-    /// fresh install or on a dev DB that has already been migrated to v1 —
-    /// hence the up-front existence check.
-    fn add_column_if_missing(
-        connection: &Connection,
-        table: &str,
-        column: &str,
-        alter_sql: &str,
-    ) -> Result<(), DatabaseError> {
-        if !Self::table_exists(connection, table)? {
-            return Ok(());
-        }
-        let mut statement = connection
-            .prepare(&format!("PRAGMA table_info({table})"))
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-        let existing: Vec<String> = statement
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-        if existing.iter().any(|name| name == column) {
-            return Ok(());
-        }
-        connection
-            .execute(alter_sql, ())
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
         Ok(())
     }
 
@@ -2356,18 +2143,14 @@ impl SyncDirectoryDatabase {
         let connection =
             Connection::open(database_path).map_err(|_| DatabaseError::UnableToOpenOrCreate)?;
 
-        Self::migrate_files_to_v1(&connection)?;
+        // Run migrations here.
+
+        Self::create_files_v1(&connection)?;
 
         Ok(Self { connection })
     }
 
-    /// Ensure `files_v1` exists. If the pre-versioning `files` table still
-    /// exists, copy every row into `files_v1` and drop `files`.
-    ///
-    /// Idempotent — see `FileDatabase::migrate_files_to_v1` for the general
-    /// shape. Note that this is a *different* `files` table than
-    /// `FileDatabase`'s, in a different DB file, with a different schema.
-    fn migrate_files_to_v1(connection: &Connection) -> Result<(), DatabaseError> {
+    fn create_files_v1(connection: &Connection) -> Result<(), DatabaseError> {
         // `physical_path` is where the bytes live on disk relative to this
         // sync directory's root, and doubles as the reverse index for
         // filesystem events (path -> file_id). For TagBased it equals the
@@ -2383,35 +2166,7 @@ impl SyncDirectoryDatabase {
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        // TODO: DELETE after all devices migrated. Bootstrap from the
-        // pre-versioning `files` table.
-        if Self::table_exists(connection, "files")? {
-            connection
-                .execute(
-                    "INSERT INTO files_v1 (id, physical_path)
-                     SELECT id, physical_path FROM files",
-                    (),
-                )
-                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-            connection
-                .execute("DROP TABLE files", ())
-                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-        }
-
         Ok(())
-    }
-
-    /// Whether a table with exactly `name` exists in this database.
-    fn table_exists(connection: &Connection, name: &str) -> Result<bool, DatabaseError> {
-        let mut statement = connection
-            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-        let exists = statement
-            .query_map([name], |_| Ok(()))
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
-            .next()
-            .is_some();
-        Ok(exists)
     }
 
     /// Add a new file.

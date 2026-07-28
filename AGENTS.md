@@ -38,47 +38,29 @@ Schema changes are handled by per-table migration functions on
 `FileDatabase` and `SyncDirectoryDatabase`, called in sequence from each
 `initialize`:
 
-- `migrate_files_to_v1`, `migrate_tags_to_v1`, `migrate_entries_to_v1`,
-  `migrate_file_versions_to_v1` (main DB).
-- `SyncDirectoryDatabase::migrate_files_to_v1` (sync-dir DB).
-
-Each function is idempotent: it runs `CREATE TABLE IF NOT EXISTS <name>_vN`,
-and if a lower-version predecessor still exists it copies the rows across
-with a straight column-listed `INSERT SELECT` and then drops the old
-table. Once every predecessor is gone the function is a no-op on
-subsequent calls.
-
-The v0 → v1 step is the one-shot **temporary** bootstrap from the
-pre-versioning schema (bare `files`, `tags`, ...). It is marked
-`TODO: DELETE after all devices migrated` in the code — the plan is to
-delete those bootstrap branches (the `if Self::table_exists("<old>")`
-blocks inside each `migrate_*_to_v1`, plus the dev-only `ALTER TABLE`
-pre-migration block at the top of `FileDatabase::initialize`) once every
-dev device has run them at least once. The `_v1` `CREATE TABLE IF NOT
-EXISTS` statements stay: they are the permanent v1 schema.
+- `migrate_files_to_v2`, `migrate_tags_to_v2`, `migrate_entries_to_v2`,
+  `migrate_file_versions_to_v2` (main DB).
+- `SyncDirectoryDatabase::migrate_files_to_v2` (sync-dir DB).
 
 ### Adding a new schema version
 
 When the schema needs to change again:
 
-1. Do NOT modify the existing `_vN` `CREATE TABLE` statements or any
-   existing `migrate_*_to_vN` function. They are frozen so that any
+1. Rename the `create_*_vN` function to the newer version and adjust the create statement inside.
+2. Don't modify any existing `migrate_*_to_vN` function. They are frozen so that any
    backup at version `N` can still be restored on a newer build and
    walked forward through every intermediate version.
-2. For each table whose schema changes, add a `migrate_<table>_to_v<N+1>`
+3. For each table whose schema changes, add a `migrate_<table>_to_v<N+1>`
    function alongside the existing one. It should:
-   - `CREATE TABLE IF NOT EXISTS <table>_v<N+1> (...)` with the new
-     schema.
-   - If `<table>_vN` still exists, `INSERT INTO <table>_v<N+1> SELECT ...
+   - If `<table>_vN` exists, create `<tabli>_vN+1` and `INSERT INTO <table>_v<N+1> SELECT ...
      FROM <table>_vN` (with whatever column translation the schema change
      requires), then `DROP TABLE <table>_vN`.
-   - Be a no-op on the second call.
-3. Call the new function in `initialize` **after** the corresponding
-   `_vN` migration, so a fresh install / vN-backup walks all the way up.
-4. Update every SQL literal that references the changed table from
+   - Not do anything if `<table>_vN` doesn't exist.
+4. Call the new function in `initialize` **after** the N-1 migration and **before** the `create_*_vN` calls.
+5. Update every SQL literal that references the changed table from
    `<table>_vN` to `<table>_v<N+1>`. Grep for the old suffix; it should
    only survive in the frozen `migrate_*_to_vN` function.
-5. Update the two `resolve_id_prefix` call sites in `database.rs` if the
+6. Update the two `resolve_id_prefix` call sites in `database.rs` if the
    `files` or `tags` table changed.
 
 This chain lets a restored v1 backup on a v3 build migrate v1 → v2 → v3
