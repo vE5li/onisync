@@ -98,6 +98,13 @@ pub mod state {
             /// The file's logical identity. Receivers store this in the main
             /// database and each derive their own on-disk placement from it.
             logical_path: LogicalPath,
+            /// The unix-millis wall-clock time `logical_path` was set, stamped
+            /// on the *originating* device and preserved verbatim across the
+            /// wire. Seeds the path's last-writer-wins clock on receivers (see
+            /// `Change::FileMoved::modified_at`) so a later move orders against
+            /// the true creation time rather than each receiver's local
+            /// receive time. Never restamp it when forwarding or applying.
+            logical_path_modified_at: i64,
             /// BLAKE3 hex digest of the file's content. `FileMetadataAdded` is
             /// a metadata-only announcement: it carries no bytes. A
             /// receiver that does not already hold this hash pulls
@@ -117,6 +124,15 @@ pub mod state {
             /// each receiving sync directory derives its own
             /// physical placement.
             logical_path: LogicalPath,
+            /// The unix-millis wall-clock time the move happened, stamped on the
+            /// *originating* device and preserved verbatim across the wire.
+            /// Drives last-writer-wins reconciliation of the logical path *only*
+            /// (content and deletes have their own clocks): a receiver adopts
+            /// this path solely when `modified_at` is strictly newer than its
+            /// own recorded path-change time. Never restamp it when forwarding
+            /// or applying a peer's move. This is what makes a move performed
+            /// while a peer was offline reconcile correctly on reconnect.
+            modified_at: i64,
         },
         FileMetadataChanged {
             file_id: FileId,
@@ -225,12 +241,20 @@ pub mod state {
     /// tiebreaker when histories have diverged (neither side's latest hash
     /// appears in the other's history).
     ///
-    /// `logical_path` carries the file's placement identity so the receiver
-    /// can *place* a file it has never seen before (the offline-creation
-    /// catch-up case). Without it, connect-time reconciliation would only
-    /// work for files both sides already know locally — a file created
-    /// while the two peers were disconnected would be stranded until its
-    /// metadata was re-announced via a live `Change::FileMetadataAdded`.
+    /// `logical_path` carries the file's placement identity, paired with
+    /// `logical_path_modified_at` as its last-writer-wins clock. It serves two
+    /// reconciliation cases:
+    ///   * a file the receiver has never seen (the offline-creation catch-up
+    ///     case): the path is used to *place* it. Without it, connect-time
+    ///     reconciliation would only work for files both sides already know
+    ///     locally — a file created while the peers were disconnected would be
+    ///     stranded until re-announced via a live `Change::FileMetadataAdded`.
+    ///   * a file the receiver already knows that was *moved* while offline:
+    ///     the receiver adopts this path when `logical_path_modified_at` beats
+    ///     its own recorded time. Without the timestamp there would be no safe
+    ///     way to tell a stale peer path from a newer one, so offline moves
+    ///     would never reconcile (they'd only propagate via a live
+    ///     `Change::FileMoved` while both peers were connected).
     ///
     /// Tags are deliberately **not** carried here: they are authoritatively
     /// reconciled via [`Sync::TagManifest`] / [`RelationshipManifestEntry`]
@@ -250,6 +274,15 @@ pub mod state {
         pub history: Vec<(i64, String, i64)>,
         pub latest_observed_at: i64,
         pub logical_path: LogicalPath,
+        /// The unix-millis time `logical_path` was last changed — the path's
+        /// last-writer-wins clock (see `Change::FileMoved::modified_at`). The
+        /// receiver adopts this entry's `logical_path` for a file it already
+        /// knows only when this timestamp is strictly newer than its own
+        /// recorded path-change time. For a file the receiver has never seen it
+        /// is simply carried through to the initial placement. This is separate
+        /// from content (`history` / `latest_observed_at`) and deletes
+        /// (`deleted_at`); a move and an edit reconcile independently.
+        pub logical_path_modified_at: i64,
         /// Soft-delete tombstone state. When `deleted` is true this entry
         /// advertises a deletion: the receiver applies it (removing/hiding the
         /// file) unless it holds a version whose `observed_at` beats

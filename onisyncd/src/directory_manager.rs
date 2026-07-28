@@ -441,6 +441,10 @@ impl SyncDirectoryManager {
             Change::FileMoved {
                 file_id,
                 logical_path,
+                // Stamp the move with our wall clock now: this is the path's
+                // last-writer-wins clock, preserved verbatim as the change
+                // propagates so an offline move reconciles on reconnect.
+                modified_at: crate::database::now_millis(),
             },
         )
     }

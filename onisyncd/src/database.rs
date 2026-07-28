@@ -16,10 +16,11 @@ pub type VersionHistory = Vec<(i64, String, i64)>;
 
 /// One row of [`FileDatabase::manifest_entries`]: a file id, its full
 /// [`VersionHistory`], the unix-millis timestamp of its latest version, the
-/// file's logical path, and its soft-delete tombstone state
-/// (`deleted`, `deleted_at`).
+/// file's logical path, the unix-millis time that path was last changed
+/// (`logical_path_modified_at`, the path's LWW clock), and its soft-delete
+/// tombstone state (`deleted`, `deleted_at`).
 /// Maps directly onto a `state::ManifestEntry`.
-pub type ManifestRow = (FileId, VersionHistory, i64, LogicalPath, bool, i64);
+pub type ManifestRow = (FileId, VersionHistory, i64, LogicalPath, i64, bool, i64);
 
 /// A single recorded version of a file's content.
 ///
@@ -293,11 +294,26 @@ impl FileDatabase {
                 // the file (last-writer-wins). All live reads filter
                 // `deleted = 0`; reconciliation deliberately considers
                 // tombstoned rows so a delete can win over a stale peer.
+                //
+                // `logical_path_modified_at` is the unix-millis wall-clock time
+                // the `logical_path` was last changed, stamped on the
+                // *originating* device and preserved across the wire. It is the
+                // last-writer-wins clock for the path *only* (content has its own
+                // clock via `file_versions.observed_at`; deletes use
+                // `deleted_at`; tags are reconciled separately with their own
+                // `modified_at`). It exists so a move made while a peer is
+                // offline reconciles on reconnect: the manifest advertises this
+                // timestamp and the receiver adopts the peer's path only when it
+                // is strictly newer. Never restamp it when applying a peer's
+                // move. Do NOT fold other metadata into this clock — a bare
+                // "modified" clock would let a content edit silently override a
+                // path (they are independently edited). See `Change::FileMoved`.
                 "CREATE TABLE IF NOT EXISTS files (
-            id              TEXT PRIMARY KEY,
-            logical_path    TEXT NOT NULL,
-            deleted         INTEGER NOT NULL,
-            deleted_at      INTEGER NOT NULL
+            id                        TEXT PRIMARY KEY,
+            logical_path              TEXT NOT NULL,
+            logical_path_modified_at  INTEGER NOT NULL,
+            deleted                   INTEGER NOT NULL,
+            deleted_at                INTEGER NOT NULL
         )",
                 (),
             )
@@ -449,6 +465,33 @@ impl FileDatabase {
             "deleted",
             "ALTER TABLE tags ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
         )?;
+
+        // DEV-ONLY, REMOVE LATER: not a real migration. Nobody but the dev is
+        // running this yet, so `logical_path_modified_at` doesn't need to be
+        // backfilled onto pre-existing DBs the careful way. This blind ALTER is
+        // just enough to keep an existing dev DB loadable; delete this block
+        // (and recreate the DB) once the schema settles.
+        //
+        // SQLite requires a *constant* default when adding a NOT NULL column, so
+        // the ADD backfills every existing row with 0. The follow-up UPDATE then
+        // stamps those rows with the current time (unix millis, matching
+        // `now_millis`). We only touch rows still at 0 so it stays idempotent
+        // across restarts (a later real move stamps a nonzero value we keep).
+        // The `Err` is ignored on the ALTER because the column already exists on
+        // second run.
+        if connection
+            .execute(
+                "ALTER TABLE files ADD COLUMN logical_path_modified_at INTEGER NOT NULL DEFAULT 0",
+                (),
+            )
+            .is_ok()
+        {
+            let _ = connection.execute(
+                "UPDATE files SET logical_path_modified_at = (unixepoch('now') * 1000) \
+                 WHERE logical_path_modified_at = 0",
+                (),
+            );
+        }
 
         Ok(Self { connection })
     }
@@ -668,16 +711,19 @@ impl FileDatabase {
         // is acceptable.
         let mut id_statement = self
             .connection
-            .prepare("SELECT id, logical_path, deleted, deleted_at FROM files")
+            .prepare(
+                "SELECT id, logical_path, logical_path_modified_at, deleted, deleted_at FROM files",
+            )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-        let file_rows: Vec<(FileId, LogicalPath, bool, i64)> = id_statement
+        let file_rows: Vec<(FileId, LogicalPath, i64, bool, i64)> = id_statement
             .query_map([], |row| {
-                let deleted: i64 = row.get(2)?;
+                let deleted: i64 = row.get(3)?;
                 Ok((
                     row.get::<_, FileId>(0)?,
                     row.get::<_, LogicalPath>(1)?,
+                    row.get::<_, i64>(2)?,
                     deleted != 0,
-                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
@@ -685,7 +731,7 @@ impl FileDatabase {
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let mut entries = Vec::with_capacity(file_rows.len());
-        for (file_id, logical_path, deleted, deleted_at) in file_rows {
+        for (file_id, logical_path, logical_path_modified_at, deleted, deleted_at) in file_rows {
             let history = self.version_history(file_id)?;
             // Files in `files` should always have at least one version
             // (every add/change path records one), but be defensive.
@@ -705,6 +751,7 @@ impl FileDatabase {
                 history,
                 latest_observed_at,
                 logical_path,
+                logical_path_modified_at,
                 deleted,
                 deleted_at,
             ));
@@ -1023,18 +1070,25 @@ impl FileDatabase {
     }
 
     /// Add a new file.
+    /// Insert a newly added file.
+    ///
+    /// `logical_path_modified_at` is the unix-millis wall-clock time the path
+    /// was set (creation time on the originating device, or the peer's stamped
+    /// time when materializing a file first seen over the wire). It seeds the
+    /// path's last-writer-wins clock so a later move can be ordered against it.
     pub fn add_file(
         &self,
         file_id: FileId,
         logical_path: &LogicalPath,
+        logical_path_modified_at: i64,
     ) -> Result<(), DatabaseError> {
         // A freshly added file is always live: `deleted = 0`, `deleted_at = 0`.
         // (No default on the columns, so they are set explicitly here.)
         self.connection
             .execute(
-                "INSERT INTO files (id, logical_path, deleted, deleted_at)
-                 VALUES (?1, ?2, 0, 0)",
-                (file_id, logical_path),
+                "INSERT INTO files (id, logical_path, logical_path_modified_at, deleted, deleted_at)
+                 VALUES (?1, ?2, ?3, 0, 0)",
+                (file_id, logical_path, logical_path_modified_at),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
@@ -1075,19 +1129,35 @@ impl FileDatabase {
             .map_err(|_| DatabaseError::FailedToExecuteCommand)
     }
 
+    /// Change a file's logical path, last-writer-wins.
+    ///
+    /// The move is applied only if `modified_at` is strictly newer than the
+    /// file's current `logical_path_modified_at`. This makes local moves and
+    /// peer moves (live or reconciled) commute regardless of delivery order:
+    /// the latest edit — by wall clock stamped on the originating device —
+    /// always wins, and re-applying an older or duplicate move is a no-op.
+    /// Never restamp `modified_at` when applying a peer's move; pass its
+    /// original value straight through.
+    ///
+    /// Returns `true` if the move was applied, `false` if it lost (an equal or
+    /// newer path change is already recorded, or the file is unknown).
     pub fn update_file_logical_path(
         &self,
         file_id: FileId,
         logical_path: &LogicalPath,
-    ) -> Result<(), DatabaseError> {
-        self.connection
+        modified_at: i64,
+    ) -> Result<bool, DatabaseError> {
+        let rows = self
+            .connection
             .execute(
-                "UPDATE files SET logical_path = ?2 WHERE id = ?1",
-                (file_id, logical_path),
+                "UPDATE files
+                 SET logical_path = ?2, logical_path_modified_at = ?3
+                 WHERE id = ?1 AND logical_path_modified_at < ?3",
+                (file_id, logical_path, modified_at),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        Ok(())
+        Ok(rows > 0)
     }
 
     /// Soft-delete a file: set its tombstone (`deleted = 1`, `deleted_at`)
@@ -1979,6 +2049,26 @@ impl FileDatabase {
         Ok(logical_path)
     }
 
+    /// The unix-millis time `file_id`'s `logical_path` was last changed — the
+    /// path's last-writer-wins clock — or `None` if the file is unknown.
+    /// Includes tombstoned rows (unlike [`Self::logical_path_for_file_id`]) so
+    /// reconciliation can order a peer's move against our recorded time
+    /// regardless of local delete state. Used to decide whether to adopt a
+    /// peer's moved path on reconnect.
+    pub fn logical_path_modified_at(
+        &self,
+        file_id: FileId,
+    ) -> Result<Option<i64>, DatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT logical_path_modified_at FROM files WHERE id = ?1",
+                [file_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)
+    }
+
     /// Get the [`FileInfo`] for a single `file_id` — the single-file
     /// counterpart of [`Self::get_all_files`].
     ///
@@ -2284,7 +2374,7 @@ mod tests {
         let database = memory_db();
         let file_id = FileId::new();
         database
-            .add_file(file_id, &LogicalPath::new("photos/cat.jpg"))
+            .add_file(file_id, &LogicalPath::new("photos/cat.jpg"), 0)
             .unwrap();
 
         assert_eq!(
@@ -2308,7 +2398,7 @@ mod tests {
         let mut database = memory_db();
         let file_id = FileId::new();
         database
-            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .add_file(file_id, &LogicalPath::new("a.txt"), 0)
             .unwrap();
 
         // Two versions; get_all_files must report the latest (higher
@@ -2341,7 +2431,7 @@ mod tests {
         let mut database = memory_db();
         let file_id = FileId::new();
         database
-            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .add_file(file_id, &LogicalPath::new("a.txt"), 0)
             .unwrap();
 
         database
@@ -2383,7 +2473,7 @@ mod tests {
         let database = memory_db();
         // A file row with no recorded version: the inner join drops it.
         database
-            .add_file(FileId::new(), &LogicalPath::new("orphan.txt"))
+            .add_file(FileId::new(), &LogicalPath::new("orphan.txt"), 0)
             .unwrap();
 
         assert!(database.get_all_files().unwrap().is_empty());
@@ -2405,7 +2495,7 @@ mod tests {
     fn shorten_file_id_single_file_needs_one_char() {
         let database = memory_db();
         let only = file_id_from_hex("00000000000000000000000000000001");
-        database.add_file(only, &LogicalPath::new("a")).unwrap();
+        database.add_file(only, &LogicalPath::new("a"), 0).unwrap();
 
         // No neighbours -> a single character already uniquely identifies it.
         assert_eq!(database.shorten_file_id(only).unwrap(), 1);
@@ -2419,7 +2509,7 @@ mod tests {
         let shared_b = file_id_from_hex("abcd000000000000000000000000000b");
         let far = file_id_from_hex("ffff000000000000000000000000000f");
         for (id, name) in [(shared_a, "a"), (shared_b, "b"), (far, "c")] {
-            database.add_file(id, &LogicalPath::new(name)).unwrap();
+            database.add_file(id, &LogicalPath::new(name), 0).unwrap();
         }
 
         // shared_a and shared_b agree on `abcd00...000` up to the final hex
@@ -2452,7 +2542,7 @@ mod tests {
         let shared_a = file_id_from_hex("abcd000000000000000000000000000a");
         let shared_b = file_id_from_hex("abcd000000000000000000000000000b");
         for (id, name) in [(shared_a, "a"), (shared_b, "b")] {
-            database.add_file(id, &LogicalPath::new(name)).unwrap();
+            database.add_file(id, &LogicalPath::new(name), 0).unwrap();
             database.record_version(id, "hash", "local", 1).unwrap();
         }
 
@@ -2470,8 +2560,8 @@ mod tests {
         let database = memory_db();
         let far_a = file_id_from_hex("aaaa000000000000000000000000000a");
         let far_b = file_id_from_hex("bbbb000000000000000000000000000b");
-        database.add_file(far_a, &LogicalPath::new("a")).unwrap();
-        database.add_file(far_b, &LogicalPath::new("b")).unwrap();
+        database.add_file(far_a, &LogicalPath::new("a"), 0).unwrap();
+        database.add_file(far_b, &LogicalPath::new("b"), 0).unwrap();
 
         // A single leading char is enough to pick each out.
         assert_eq!(database.resolve_file_id_prefix("a").unwrap(), far_a);
@@ -2482,7 +2572,7 @@ mod tests {
     fn resolve_file_id_prefix_accepts_full_and_hyphenated_forms() {
         let database = memory_db();
         let id = file_id_from_hex("7f3a1b2c4d5e6f708192a3b4c5d6e7f8");
-        database.add_file(id, &LogicalPath::new("a")).unwrap();
+        database.add_file(id, &LogicalPath::new("a"), 0).unwrap();
 
         // Full hex form.
         assert_eq!(
@@ -2505,8 +2595,8 @@ mod tests {
         let database = memory_db();
         let shared_a = file_id_from_hex("abcd000000000000000000000000000a");
         let shared_b = file_id_from_hex("abcd000000000000000000000000000b");
-        database.add_file(shared_a, &LogicalPath::new("a")).unwrap();
-        database.add_file(shared_b, &LogicalPath::new("b")).unwrap();
+        database.add_file(shared_a, &LogicalPath::new("a"), 0).unwrap();
+        database.add_file(shared_b, &LogicalPath::new("b"), 0).unwrap();
 
         // `abcd` matches both.
         assert!(matches!(
@@ -2522,6 +2612,7 @@ mod tests {
             .add_file(
                 file_id_from_hex("aaaa000000000000000000000000000a"),
                 &LogicalPath::new("a"),
+                0,
             )
             .unwrap();
 
@@ -2548,7 +2639,7 @@ mod tests {
         let shared_b = file_id_from_hex("abcd000000000000000000000000000b");
         let far = file_id_from_hex("ffff000000000000000000000000000f");
         for (id, name) in [(shared_a, "a"), (shared_b, "b"), (far, "c")] {
-            database.add_file(id, &LogicalPath::new(name)).unwrap();
+            database.add_file(id, &LogicalPath::new(name), 0).unwrap();
             database.record_version(id, "hash", "local", 1).unwrap();
         }
 
@@ -2774,7 +2865,7 @@ mod tests {
         let file_id = FileId::new();
         let tag_id = TagId::new();
         database
-            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .add_file(file_id, &LogicalPath::new("a.txt"), 0)
             .unwrap();
 
         database.tag_file(tag_id, file_id, 100).unwrap();
@@ -2807,7 +2898,7 @@ mod tests {
         let file_id = FileId::new();
         let tag_id = TagId::new();
         database
-            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .add_file(file_id, &LogicalPath::new("a.txt"), 0)
             .unwrap();
 
         // Tag at t=200, then a stale untag at t=100 arrives out of order.
@@ -2829,7 +2920,7 @@ mod tests {
         let file_id = FileId::new();
         let tag_id = TagId::new();
         database
-            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .add_file(file_id, &LogicalPath::new("a.txt"), 0)
             .unwrap();
 
         database.tag_file(tag_id, file_id, 100).unwrap();
@@ -2852,7 +2943,7 @@ mod tests {
         let file_id = FileId::new();
         let tag_id = TagId::new();
         database
-            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .add_file(file_id, &LogicalPath::new("a.txt"), 0)
             .unwrap();
 
         // Locally the file is tagged at t=100.
@@ -2959,7 +3050,7 @@ mod tests {
         let file_b = FileId::new();
         let file_c = FileId::new();
         for (id, path) in [(file_a, "a"), (file_b, "b"), (file_c, "c")] {
-            database.add_file(id, &LogicalPath::new(path)).unwrap();
+            database.add_file(id, &LogicalPath::new(path), 0).unwrap();
         }
         database.tag_file(foo, file_a, 1).unwrap();
         database.tag_file(foobar, file_b, 1).unwrap();
@@ -2979,7 +3070,7 @@ mod tests {
     fn file_ids_for_query_empty_positive_set_matches_nothing() {
         let database = memory_db();
         let file = FileId::new();
-        database.add_file(file, &LogicalPath::new("a")).unwrap();
+        database.add_file(file, &LogicalPath::new("a"), 0).unwrap();
 
         // A `$foo` term that matched no tag (empty set) matches no file.
         let terms = vec![QueryTerm::HasTag(vec![])];
@@ -3004,7 +3095,7 @@ mod tests {
         let file_b = FileId::new();
         let file_c = FileId::new();
         for (id, path) in [(file_a, "a"), (file_b, "b"), (file_c, "c")] {
-            database.add_file(id, &LogicalPath::new(path)).unwrap();
+            database.add_file(id, &LogicalPath::new(path), 0).unwrap();
             // A negative-only query seeds from all files, which requires each to
             // have a recorded version to appear in the listing.
             database.record_version(id, "hash", "test", 1).unwrap();
@@ -3028,7 +3119,7 @@ mod tests {
         let mut database = memory_db();
         let file_id = FileId::new();
         database
-            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .add_file(file_id, &LogicalPath::new("a.txt"), 0)
             .unwrap();
         database
             .record_version(file_id, "hash-1", "local", 42)
@@ -3051,7 +3142,7 @@ mod tests {
         let mut database = memory_db();
         let file_id = FileId::new();
         database
-            .add_file(file_id, &LogicalPath::new("empty.txt"))
+            .add_file(file_id, &LogicalPath::new("empty.txt"), 0)
             .unwrap();
         database
             .record_version(file_id, "hash-0", "local", 0)
@@ -3064,7 +3155,7 @@ mod tests {
         let mut database = memory_db();
         let file_id = FileId::new();
         database
-            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .add_file(file_id, &LogicalPath::new("a.txt"), 0)
             .unwrap();
         database.record_version(file_id, "h1", "local", 10).unwrap();
         database.record_version(file_id, "h2", "local", 20).unwrap();
@@ -3081,7 +3172,7 @@ mod tests {
         let mut database = memory_db();
         let file_id = FileId::new();
         database
-            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .add_file(file_id, &LogicalPath::new("a.txt"), 0)
             .unwrap();
         database.record_version(file_id, "h1", "local", 1).unwrap();
 
@@ -3110,7 +3201,7 @@ mod tests {
         let mut database = memory_db();
         let file_id = FileId::new();
         database
-            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .add_file(file_id, &LogicalPath::new("a.txt"), 0)
             .unwrap();
         // record_version stamps observed_at = now; a delete stamped in the
         // past must lose.
@@ -3131,7 +3222,7 @@ mod tests {
         let mut database = memory_db();
         let file_id = FileId::new();
         database
-            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .add_file(file_id, &LogicalPath::new("a.txt"), 0)
             .unwrap();
         database.record_version(file_id, "h1", "local", 1).unwrap();
         assert!(
@@ -3150,11 +3241,58 @@ mod tests {
     }
 
     #[test]
+    fn update_logical_path_applies_when_newer() {
+        let database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("old.txt"), 10)
+            .unwrap();
+
+        // A strictly-newer move wins.
+        let applied = database
+            .update_file_logical_path(file_id, &LogicalPath::new("new.txt"), 20)
+            .unwrap();
+        assert!(applied);
+        assert_eq!(
+            database.logical_path_for_file_id(file_id).unwrap(),
+            LogicalPath::new("new.txt")
+        );
+        assert_eq!(database.logical_path_modified_at(file_id).unwrap(), Some(20));
+    }
+
+    #[test]
+    fn update_logical_path_rejects_older_or_equal() {
+        let database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("current.txt"), 20)
+            .unwrap();
+
+        // An older move loses.
+        let older = database
+            .update_file_logical_path(file_id, &LogicalPath::new("stale.txt"), 10)
+            .unwrap();
+        assert!(!older);
+        // An equal-timestamp move also loses (strict >), making re-delivery a
+        // no-op.
+        let equal = database
+            .update_file_logical_path(file_id, &LogicalPath::new("dup.txt"), 20)
+            .unwrap();
+        assert!(!equal);
+
+        assert_eq!(
+            database.logical_path_for_file_id(file_id).unwrap(),
+            LogicalPath::new("current.txt")
+        );
+        assert_eq!(database.logical_path_modified_at(file_id).unwrap(), Some(20));
+    }
+
+    #[test]
     fn deleted_file_appears_in_manifest_with_tombstone() {
         let mut database = memory_db();
         let file_id = FileId::new();
         database
-            .add_file(file_id, &LogicalPath::new("a.txt"))
+            .add_file(file_id, &LogicalPath::new("a.txt"), 0)
             .unwrap();
         database.record_version(file_id, "h1", "local", 7).unwrap();
         let deleted_at = now_millis() + 10_000;
@@ -3162,7 +3300,8 @@ mod tests {
 
         let entries = database.manifest_entries().unwrap();
         assert_eq!(entries.len(), 1);
-        let (id, history, _observed, _path, deleted, got_deleted_at) = &entries[0];
+        let (id, history, _observed, _path, _path_modified, deleted, got_deleted_at) =
+            &entries[0];
         assert_eq!(*id, file_id);
         assert!(*deleted);
         assert_eq!(*got_deleted_at, deleted_at);

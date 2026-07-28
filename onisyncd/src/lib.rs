@@ -1259,7 +1259,7 @@ async fn run_peer_session<S>(
                         let reconciling = operations.begin(
                             operations::OperationKind::reconciling_manifest(peer_name),
                         );
-                        let (wanted, deletions) =
+                        let (wanted, deletions, moves) =
                             reconcile_peer_manifest(peer_name, entries, &database);
                         reconciling.complete();
 
@@ -1289,6 +1289,38 @@ async fn run_peer_session<S>(
                             }
                         }
 
+                        // Apply peer moves that won last-writer-wins by enqueuing
+                        // them as `Change::FileMoved` through the sole DB writer.
+                        // This reuses the live-move handler, which re-applies the
+                        // LWW guard, repositions the bytes in matching sync
+                        // directories, and forwards. This is the offline-move
+                        // catch-up: a rename made while we were disconnected.
+                        for WantedMove {
+                            file_id,
+                            logical_path,
+                            modified_at,
+                        } in moves
+                        {
+                            if let Err(error) =
+                                change_sender.send(DaemonMessage::Change(
+                                    Ingest::from_change(Change::FileMoved {
+                                        file_id,
+                                        logical_path,
+                                        modified_at,
+                                    }),
+                                    ChangeOrigin::Peer {
+                                        public_key: peer_public_key.to_owned(),
+                                    },
+                                ))
+                            {
+                                log::error!(
+                                    "Reconciliation: failed to enqueue move for {} \
+                                     announced by {peer_name}: {error}",
+                                    file_id.to_string()
+                                );
+                            }
+                        }
+
                         // Files we are pulling as a result of catalog reconciliation
                         // (below); excluded from the placement sweep so we do not
                         // double-fetch them.
@@ -1304,6 +1336,7 @@ async fn run_peer_session<S>(
                             file_id,
                             content_hash,
                             size,
+                            logical_path_modified_at,
                             placement,
                         } in wanted
                         {
@@ -1340,6 +1373,7 @@ async fn run_peer_session<S>(
                             if let Err(error) = change_sender.send(DaemonMessage::CatalogFile {
                                 file_id,
                                 logical_path,
+                                logical_path_modified_at,
                                 content_hash: content_hash.clone(),
                                 size: size as u64,
                                 origin: ChangeOrigin::Peer {
@@ -1797,12 +1831,21 @@ fn build_local_manifest(database: &FileDatabase) -> Result<Vec<ManifestEntry>, S
     Ok(rows
         .into_iter()
         .map(
-            |(file_id, history, latest_observed_at, logical_path, deleted, deleted_at)| {
+            |(
+                file_id,
+                history,
+                latest_observed_at,
+                logical_path,
+                logical_path_modified_at,
+                deleted,
+                deleted_at,
+            )| {
                 ManifestEntry {
                     file_id,
                     history,
                     latest_observed_at,
                     logical_path,
+                    logical_path_modified_at,
                     deleted,
                     deleted_at,
                 }
@@ -1824,6 +1867,11 @@ pub struct WantedFile {
     /// The peer's latest-version content size in bytes (from the manifest
     /// history), recorded alongside the hash when we catalog the version.
     pub size: i64,
+    /// The originating device's path-change time (from the manifest entry).
+    /// Seeds the path's LWW clock when this file is new to us; ignored when we
+    /// already know it (the row's path is reconciled separately via
+    /// `WantedMove`).
+    pub logical_path_modified_at: i64,
     pub placement: bus::MaterializePlacement,
 }
 
@@ -1834,6 +1882,20 @@ pub struct WantedFile {
 pub struct WantedDeletion {
     pub file_id: FileId,
     pub deleted_at: i64,
+}
+
+/// A logical-path change learned from a peer's manifest for a file we already
+/// know, whose `logical_path_modified_at` is newer than our own. Applied by
+/// enqueuing a `Change::FileMoved`, which reuses the live-move handler (LWW
+/// guard, byte repositioning, and forwarding). This is what lets a move made
+/// while we were offline reconcile on reconnect. Emitted only for known files:
+/// an unknown file adopts the peer's path through its initial `Create`
+/// placement, and a deletion tombstone suppresses any move.
+#[derive(Debug, Clone)]
+pub struct WantedMove {
+    pub file_id: FileId,
+    pub logical_path: LogicalPath,
+    pub modified_at: i64,
 }
 
 /// Compare the peer's manifest against our local `file_versions` table and
@@ -1868,7 +1930,7 @@ fn reconcile_peer_manifest(
     peer_name: &str,
     entries: Vec<ManifestEntry>,
     database: &FileDatabase,
-) -> (Vec<WantedFile>, Vec<WantedDeletion>) {
+) -> (Vec<WantedFile>, Vec<WantedDeletion>, Vec<WantedMove>) {
     log::info!(
         "Reconciling {} manifest entries from {peer_name}",
         entries.len()
@@ -1876,6 +1938,7 @@ fn reconcile_peer_manifest(
 
     let mut wanted = Vec::new();
     let mut deletions = Vec::new();
+    let mut moves = Vec::new();
     for entry in entries {
         // Deletion tombstones take precedence over content reconciliation. If
         // the peer advertises a delete, apply last-writer-wins against our
@@ -1925,6 +1988,39 @@ fn reconcile_peer_manifest(
         // unknown file must be materialized as `Create` (using the manifest's
         // `logical_path`) so the sync-directory dispatch can place it.
         let known = database.file_exists(entry.file_id).unwrap_or(false);
+
+        // Logical-path reconciliation, independent of the content decision
+        // below. A file can be moved without its bytes changing, so this must
+        // NOT be gated on `decide_request` (which compares only content). For a
+        // file we already know, adopt the peer's path when its
+        // `logical_path_modified_at` is strictly newer than ours (last-writer-
+        // wins). For an unknown file we do nothing here: it adopts the peer's
+        // path through its `Create` placement when the content pull materializes
+        // it. Deletion tombstones were already handled and `continue`d above, so
+        // a tombstoned entry never reaches this point.
+        if known {
+            match database.logical_path_modified_at(entry.file_id) {
+                Ok(Some(ours)) if entry.logical_path_modified_at > ours => {
+                    log::debug!(
+                        "Peer {peer_name} has a newer path for {} (theirs={} > ours={ours}); adopting",
+                        entry.file_id.to_string(),
+                        entry.logical_path_modified_at,
+                    );
+                    moves.push(WantedMove {
+                        file_id: entry.file_id,
+                        logical_path: entry.logical_path.clone(),
+                        modified_at: entry.logical_path_modified_at,
+                    });
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    log::error!(
+                        "Reconciliation: path-clock lookup failed for {}: {error:?}",
+                        entry.file_id.to_string()
+                    );
+                }
+            }
+        }
         let placement_for_request = |entry: &ManifestEntry| -> bus::MaterializePlacement {
             if known {
                 bus::MaterializePlacement::Change
@@ -1955,6 +2051,7 @@ fn reconcile_peer_manifest(
                         file_id: entry.file_id,
                         content_hash: hash,
                         size,
+                        logical_path_modified_at: entry.logical_path_modified_at,
                         placement,
                     });
                 }
@@ -1981,6 +2078,7 @@ fn reconcile_peer_manifest(
                         file_id: entry.file_id,
                         content_hash: hash,
                         size,
+                        logical_path_modified_at: entry.logical_path_modified_at,
                         placement,
                     });
                 }
@@ -1988,7 +2086,7 @@ fn reconcile_peer_manifest(
         }
     }
 
-    (wanted, deletions)
+    (wanted, deletions, moves)
 }
 
 enum ReconcileDecision {
@@ -2848,7 +2946,16 @@ async fn handle_changes(
                 });
 
                 if !already_exists {
-                    if let Err(error) = database.add_file(file_id, &logical_path) {
+                    // Seed the path's LWW clock with our wall clock now: this is
+                    // a genuinely local creation, so "now" is the true origin
+                    // time. We stamp the same value onto the outgoing
+                    // `FileMetadataAdded` (via `WireKind::Added`) so every peer
+                    // seeds an identical clock and a later move orders against
+                    // the real creation time, not each peer's receive time.
+                    let logical_path_modified_at = database::now_millis();
+                    if let Err(error) =
+                        database.add_file(file_id, &logical_path, logical_path_modified_at)
+                    {
                         // Do not panic: a single bad inbound change must not
                         // take down the sole DB writer.
                         log::error!(
@@ -2951,6 +3058,7 @@ async fn handle_changes(
                         WireKind::Added {
                             file_id,
                             logical_path,
+                            logical_path_modified_at,
                             content_hash,
                             size,
                             tags,
@@ -3140,6 +3248,7 @@ async fn handle_changes(
         Added {
             file_id: FileId,
             logical_path: LogicalPath,
+            logical_path_modified_at: i64,
             content_hash: String,
             size: u64,
             tags: Vec<TagId>,
@@ -3157,12 +3266,14 @@ async fn handle_changes(
                 WireKind::Added {
                     file_id,
                     logical_path,
+                    logical_path_modified_at,
                     content_hash,
                     size,
                     tags,
                 } => Change::FileMetadataAdded {
                     file_id,
                     logical_path,
+                    logical_path_modified_at,
                     content_hash,
                     size,
                     tags,
@@ -3303,6 +3414,7 @@ async fn handle_changes(
             DaemonMessage::CatalogFile {
                 file_id,
                 logical_path,
+                logical_path_modified_at,
                 content_hash,
                 size,
                 origin,
@@ -3311,9 +3423,11 @@ async fn handle_changes(
                 // this file/version. We are the sole main-DB writer, so the
                 // write happens here. Insert the `files` row if new, then append
                 // the version (byte-independent catalog; the bytes are pulled
-                // separately on the session link).
+                // separately on the session link). Seed the path clock from the
+                // manifest entry's originating stamp (not our receive time).
                 if !database.file_exists(file_id).unwrap_or(false)
-                    && let Err(error) = database.add_file(file_id, &logical_path)
+                    && let Err(error) =
+                        database.add_file(file_id, &logical_path, logical_path_modified_at)
                 {
                     log::error!(
                         "CatalogFile: failed to add file {} ({}): {:?}; skipping version record",
@@ -3462,7 +3576,13 @@ async fn handle_changes(
                 // already in a sync directory are synced without the CLI).
                 let change = match logical_path {
                     Some(logical_path) => {
-                        if let Err(error) = database.add_file(file_id, &logical_path) {
+                        // Genuinely local (CLI) creation: "now" is the true
+                        // origin time. Stamp the same value onto the outgoing
+                        // announcement so peers seed an identical path clock.
+                        let logical_path_modified_at = database::now_millis();
+                        if let Err(error) =
+                            database.add_file(file_id, &logical_path, logical_path_modified_at)
+                        {
                             log::error!(
                                 "AnnounceProvided: failed to add file {} ({}): {:?}",
                                 file_id.to_string(),
@@ -3474,6 +3594,7 @@ async fn handle_changes(
                         Change::FileMetadataAdded {
                             file_id,
                             logical_path,
+                            logical_path_modified_at,
                             content_hash: content_hash.clone(),
                             size,
                             tags,
@@ -3536,6 +3657,7 @@ async fn handle_changes(
             Change::FileMetadataAdded {
                 file_id,
                 logical_path,
+                logical_path_modified_at,
                 content_hash,
                 size,
                 tags,
@@ -3555,7 +3677,12 @@ async fn handle_changes(
                 });
 
                 if !already_exists {
-                    if let Err(error) = database.add_file(*file_id, logical_path) {
+                    // Seed the path clock from the *originating* device's stamp
+                    // carried on the announcement (not our receive time), so a
+                    // later `FileMoved` orders against the true creation time.
+                    if let Err(error) =
+                        database.add_file(*file_id, logical_path, *logical_path_modified_at)
+                    {
                         log::error!(
                             "Failed to add file {} ({}): {:?}; skipping change",
                             file_id.to_string(),
@@ -3729,6 +3856,7 @@ async fn handle_changes(
             Change::FileMoved {
                 file_id,
                 logical_path,
+                modified_at,
             } => {
                 // TODO: Don't unwrap.
                 // TODO: Should this be include? Currently this WILL NOT WORK since add file
@@ -3748,13 +3876,26 @@ async fn handle_changes(
                         }
                     };
 
-                if let Err(error) = database.update_file_logical_path(*file_id, logical_path) {
-                    log::error!(
-                        "Failed to update logical path for file {}: {:?}; skipping",
-                        file_id.to_string(),
-                        error
-                    );
-                    continue;
+                // Last-writer-wins on the path clock: apply only if this move is
+                // strictly newer than our recorded path change. If it lost, do
+                // not reposition bytes or forward it (mirrors FileDeleted).
+                match database.update_file_logical_path(*file_id, logical_path, *modified_at) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        log::debug!(
+                            "Ignoring FileMoved for {} (a newer path change supersedes it)",
+                            file_id.to_string()
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "Failed to update logical path for file {}: {:?}; skipping",
+                            file_id.to_string(),
+                            error
+                        );
+                        continue;
+                    }
                 }
 
                 for sync_directory in &configuration.sync_directories {
@@ -4178,11 +4319,12 @@ mod reconcile_tests {
             history: vec![(1, "aaaa".to_owned(), 1), (2, "bbbb".to_owned(), 1)],
             latest_observed_at: 100,
             logical_path: logical_path.clone(),
+            logical_path_modified_at: 0,
             deleted: false,
             deleted_at: 0,
         };
 
-        let (wanted, deletions) = reconcile_peer_manifest("peer", vec![entry], &database);
+        let (wanted, deletions, _moves) = reconcile_peer_manifest("peer", vec![entry], &database);
         assert!(deletions.is_empty());
         assert_eq!(wanted.len(), 1);
         assert_eq!(wanted[0].file_id, file_id);
@@ -4205,7 +4347,7 @@ mod reconcile_tests {
         let mut database = memory_db();
         let file_id = FileId::new();
         database
-            .add_file(file_id, &LogicalPath::new("f.txt"))
+            .add_file(file_id, &LogicalPath::new("f.txt"), 0)
             .unwrap();
         database
             .record_version(file_id, "bbbb", "local", 1)
@@ -4216,11 +4358,12 @@ mod reconcile_tests {
             history: vec![(1, "bbbb".to_owned(), 1)],
             latest_observed_at: 100,
             logical_path: LogicalPath::new("f.txt"),
+            logical_path_modified_at: 0,
             deleted: false,
             deleted_at: 0,
         };
 
-        let (wanted, deletions) = reconcile_peer_manifest("peer", vec![entry], &database);
+        let (wanted, deletions, _moves) = reconcile_peer_manifest("peer", vec![entry], &database);
         assert!(deletions.is_empty());
         assert!(wanted.is_empty());
     }
@@ -4233,7 +4376,7 @@ mod reconcile_tests {
         let mut database = memory_db();
         let file_id = FileId::new();
         database
-            .add_file(file_id, &LogicalPath::new("f.txt"))
+            .add_file(file_id, &LogicalPath::new("f.txt"), 0)
             .unwrap();
         database.record_version(file_id, "v1", "local", 1).unwrap();
 
@@ -4242,11 +4385,12 @@ mod reconcile_tests {
             history: vec![(1, "v1".to_owned(), 1), (2, "v2".to_owned(), 1)],
             latest_observed_at: 100,
             logical_path: LogicalPath::new("f.txt"),
+            logical_path_modified_at: 0,
             deleted: false,
             deleted_at: 0,
         };
 
-        let (wanted, deletions) = reconcile_peer_manifest("peer", vec![entry], &database);
+        let (wanted, deletions, _moves) = reconcile_peer_manifest("peer", vec![entry], &database);
         assert!(deletions.is_empty());
         assert_eq!(wanted.len(), 1);
         assert_eq!(wanted[0].file_id, file_id);
@@ -4255,6 +4399,93 @@ mod reconcile_tests {
             matches!(wanted[0].placement, bus::MaterializePlacement::Change),
             "known file placement must be Change, got {:?}",
             wanted[0].placement
+        );
+    }
+
+    /// A known file the peer moved while we were offline (its
+    /// `logical_path_modified_at` is newer than ours, content unchanged) is
+    /// reconciled as a `WantedMove` — NOT a content pull. This is the offline-
+    /// move catch-up: without it, an identical-content rename would compare
+    /// equal on hashes and be dropped.
+    #[test]
+    fn newer_peer_path_is_wanted_as_move() {
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        // We know the file at an old path stamped at t=10.
+        database
+            .add_file(file_id, &LogicalPath::new("old.txt"), 10)
+            .unwrap();
+        database.record_version(file_id, "v1", "local", 1).unwrap();
+
+        // The peer has identical content but a newer path (t=20).
+        let entry = ManifestEntry {
+            file_id,
+            history: vec![(1, "v1".to_owned(), 1)],
+            latest_observed_at: 100,
+            logical_path: LogicalPath::new("new.txt"),
+            logical_path_modified_at: 20,
+            deleted: false,
+            deleted_at: 0,
+        };
+
+        let (wanted, deletions, moves) = reconcile_peer_manifest("peer", vec![entry], &database);
+        assert!(deletions.is_empty());
+        assert!(
+            wanted.is_empty(),
+            "content is identical; the move must not trigger a byte pull"
+        );
+        assert_eq!(moves.len(), 1);
+        assert_eq!(moves[0].file_id, file_id);
+        assert_eq!(moves[0].logical_path, LogicalPath::new("new.txt"));
+        assert_eq!(moves[0].modified_at, 20);
+    }
+
+    /// A peer's path change that is older than (or equal to) ours loses
+    /// last-writer-wins: no move is emitted.
+    #[test]
+    fn stale_peer_path_is_not_wanted_as_move() {
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        // Our path is stamped newer (t=30) than the peer's (t=20).
+        database
+            .add_file(file_id, &LogicalPath::new("ours.txt"), 30)
+            .unwrap();
+        database.record_version(file_id, "v1", "local", 1).unwrap();
+
+        let entry = ManifestEntry {
+            file_id,
+            history: vec![(1, "v1".to_owned(), 1)],
+            latest_observed_at: 100,
+            logical_path: LogicalPath::new("theirs.txt"),
+            logical_path_modified_at: 20,
+            deleted: false,
+            deleted_at: 0,
+        };
+
+        let (_wanted, _deletions, moves) = reconcile_peer_manifest("peer", vec![entry], &database);
+        assert!(moves.is_empty(), "a stale peer path must not win LWW");
+    }
+
+    /// An unknown file is placed via `Create` (see `unknown_file_is_requested_
+    /// as_create`); it must NOT also emit a `WantedMove` (which only applies to
+    /// files we already know).
+    #[test]
+    fn unknown_file_does_not_emit_move() {
+        let database = memory_db();
+        let entry = ManifestEntry {
+            file_id: FileId::new(),
+            history: vec![(1, "aaaa".to_owned(), 1)],
+            latest_observed_at: 100,
+            logical_path: LogicalPath::new("new.txt"),
+            logical_path_modified_at: 999,
+            deleted: false,
+            deleted_at: 0,
+        };
+
+        let (_wanted, _deletions, moves) = reconcile_peer_manifest("peer", vec![entry], &database);
+        assert!(
+            moves.is_empty(),
+            "an unknown file adopts the path via Create, not a move"
         );
     }
 
@@ -4299,7 +4530,7 @@ mod reconcile_tests {
         let mut database = memory_db();
         let file_id = FileId::new();
         database
-            .add_file(file_id, &LogicalPath::new("f.txt"))
+            .add_file(file_id, &LogicalPath::new("f.txt"), 0)
             .unwrap();
         // Our latest version's observed_at is "now". A delete stamped far in
         // the future beats it.
@@ -4310,11 +4541,12 @@ mod reconcile_tests {
             history: vec![(1, "v1".to_owned(), 1)],
             latest_observed_at: 0,
             logical_path: LogicalPath::new("f.txt"),
+            logical_path_modified_at: 0,
             deleted: true,
             deleted_at: database::now_millis() + 10_000,
         };
 
-        let (wanted, deletions) = reconcile_peer_manifest("peer", vec![entry], &database);
+        let (wanted, deletions, _moves) = reconcile_peer_manifest("peer", vec![entry], &database);
         assert!(wanted.is_empty(), "a tombstoned file must not be pulled");
         assert_eq!(deletions.len(), 1);
         assert_eq!(deletions[0].file_id, file_id);
@@ -4327,7 +4559,7 @@ mod reconcile_tests {
         let mut database = memory_db();
         let file_id = FileId::new();
         database
-            .add_file(file_id, &LogicalPath::new("f.txt"))
+            .add_file(file_id, &LogicalPath::new("f.txt"), 0)
             .unwrap();
         // Our latest version's observed_at is "now"; a delete stamped in the
         // past loses.
@@ -4338,11 +4570,12 @@ mod reconcile_tests {
             history: vec![(1, "v1".to_owned(), 1)],
             latest_observed_at: 0,
             logical_path: LogicalPath::new("f.txt"),
+            logical_path_modified_at: 0,
             deleted: true,
             deleted_at: 1,
         };
 
-        let (wanted, deletions) = reconcile_peer_manifest("peer", vec![entry], &database);
+        let (wanted, deletions, _moves) = reconcile_peer_manifest("peer", vec![entry], &database);
         assert!(deletions.is_empty(), "stale delete must not win");
         // Equal latest hash means nothing to pull either.
         assert!(wanted.is_empty());

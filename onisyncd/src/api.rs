@@ -570,7 +570,8 @@ impl Api {
     }
 
     /// Move (rename) a file to a new logical path. Enqueues
-    /// `Change::FileMoved`; each receiving sync directory derives its own
+    /// `Change::FileMoved`, stamped with our wall clock now as the path's
+    /// last-writer-wins clock; each receiving sync directory derives its own
     /// physical placement.
     pub fn move_file(&self, file_id: FileId, logical_path: String) -> Result<(), ApiError> {
         if logical_path.trim().is_empty() {
@@ -579,6 +580,7 @@ impl Api {
         self.enqueue(Change::FileMoved {
             file_id,
             logical_path: LogicalPath::new(logical_path),
+            modified_at: crate::database::now_millis(),
         })
     }
 

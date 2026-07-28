@@ -149,6 +149,11 @@ pub enum DaemonMessage {
         /// The file's logical identity, used to insert the `files` row when the
         /// file is not yet known locally.
         logical_path: LogicalPath,
+        /// The originating device's path-change time (from the manifest entry),
+        /// used to seed the path's last-writer-wins clock when inserting the
+        /// `files` row. Only meaningful for a not-yet-known file; ignored when
+        /// the row already exists (its path is reconciled via `WantedMove`).
+        logical_path_modified_at: i64,
         content_hash: String,
         /// The version's content size in bytes (from the manifest history).
         size: u64,
