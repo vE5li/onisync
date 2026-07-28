@@ -275,166 +275,22 @@ impl FileDatabase {
         let connection =
             Connection::open(database_path).map_err(|_| DatabaseError::UnableToOpenOrCreate)?;
 
-        connection
-            .execute(
-                // `logical_path` is the file's logical identity: its
-                // human-readable path/name (possibly nested, e.g.
-                // `foo/bar/name.txt`), independent of where any individual sync
-                // directory stores the bytes on disk. Contrast with
-                // `SyncDirectoryDatabase.files.physical_path`, which is the
-                // on-disk location within a particular sync directory.
-                // `deleted` / `deleted_at` are the soft-delete tombstone.
-                // Unlike tags (which reuse their `modified_at` clock), a file
-                // has no single per-file timestamp — its "latest activity" time
-                // is the newest `file_versions.observed_at` — so the delete time
-                // needs its own column. `deleted_at` is the unix-millis wall
-                // clock stamped when the file was deleted, preserved across the
-                // wire. Reconciliation compares it against the peer's latest
-                // version `observed_at`: an edit newer than the delete resurrects
-                // the file (last-writer-wins). All live reads filter
-                // `deleted = 0`; reconciliation deliberately considers
-                // tombstoned rows so a delete can win over a stale peer.
-                //
-                // `logical_path_modified_at` is the unix-millis wall-clock time
-                // the `logical_path` was last changed, stamped on the
-                // *originating* device and preserved across the wire. It is the
-                // last-writer-wins clock for the path *only* (content has its own
-                // clock via `file_versions.observed_at`; deletes use
-                // `deleted_at`; tags are reconciled separately with their own
-                // `modified_at`). It exists so a move made while a peer is
-                // offline reconciles on reconnect: the manifest advertises this
-                // timestamp and the receiver adopts the peer's path only when it
-                // is strictly newer. Never restamp it when applying a peer's
-                // move. Do NOT fold other metadata into this clock — a bare
-                // "modified" clock would let a content edit silently override a
-                // path (they are independently edited). See `Change::FileMoved`.
-                "CREATE TABLE IF NOT EXISTS files (
-            id                        TEXT PRIMARY KEY,
-            logical_path              TEXT NOT NULL,
-            logical_path_modified_at  INTEGER NOT NULL,
-            deleted                   INTEGER NOT NULL,
-            deleted_at                INTEGER NOT NULL
-        )",
-                (),
-            )
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-
-        // `name` is intentionally NOT `UNIQUE`: two devices editing offline can
-        // each mint a tag with the same name but a different `TagId`. When they
-        // reconcile, both tags must be able to coexist rather than one insert
-        // failing a constraint and leaving the databases divergent. Tag identity
-        // is the `TagId`; names are display-only and may collide. (Disambiguation
-        // in the UI is handled by tag short-ids — see roadmap pass 2.)
-        //
-        // `modified_at` is the unix-millis wall-clock time, stamped on the
-        // *originating* device and preserved across the wire, that drives
-        // last-writer-wins reconciliation of tag definitions. Never restamp it
-        // when applying a peer's change.
-        connection
-            .execute(
-                // `deleted` is the soft-delete tombstone. Unlike files, a tag
-                // already carries `modified_at` as its single last-writer-wins
-                // clock, so a delete just sets `deleted = 1` and bumps
-                // `modified_at` (mirroring the relationship tombstones in
-                // `untag_entry`) — no separate `deleted_at` is needed. All live
-                // reads filter `deleted = 0`; reconciliation considers
-                // tombstoned rows so a delete can win LWW against a stale peer.
-                "CREATE TABLE IF NOT EXISTS tags (
-            id          TEXT PRIMARY KEY,
-            name        TEXT NOT NULL,
-            color       TEXT NOT NULL,
-            metadata    TEXT,
-            modified_at INTEGER NOT NULL DEFAULT 0,
-            deleted     INTEGER NOT NULL
-        )",
-                (),
-            )
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-
-        // `modified_at` drives last-writer-wins reconciliation of relationships,
-        // exactly as for `tags` above.
-        //
-        // `deleted` is a soft-delete flag (0 = live, 1 = tombstoned). Untagging
-        // sets `deleted = 1` and bumps `modified_at` instead of removing the row,
-        // so an "absent" relationship still carries a timestamp and can win LWW
-        // against a stale "present" from a peer. All *reads* of live
-        // relationships must filter `deleted = 0` (see the read helpers below);
-        // reconciliation deliberately considers tombstoned rows too. The
-        // `UNIQUE(tag_id, target_id, type)` constraint is retained: a
-        // relationship reappears by flipping `deleted` back to 0, never by
-        // inserting a duplicate row.
-        connection
-            .execute(
-                "CREATE TABLE IF NOT EXISTS entries (
-            id          TEXT PRIMARY KEY,
-            tag_id      TEXT NOT NULL,
-            target_id   TEXT NOT NULL,
-            type        INTEGER,
-            modified_at INTEGER NOT NULL DEFAULT 0,
-            deleted     INTEGER NOT NULL DEFAULT 0,
-            UNIQUE (tag_id, target_id, type)
-        )",
-                (),
-            )
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-
-        // Append-only log of content hashes per file. The latest row per
-        // `file_id` (highest `version_number`) is the current version.
-        //
-        // - `version_number` is a per-file monotonic counter starting at 1. It is what
-        //   we order by; do not order by `observed_at`.
-        // - `observed_at` is unix-millis wall-clock at insert time, kept for debugging
-        //   / UI.
-        // - `origin` is `'local'` for now. When cross-peer conflict resolution lands it
-        //   will hold the originating peer's public key.
-        //
-        // Intentionally no `FOREIGN KEY` on `file_id`: a version may be
-        // recorded by `SyncDirectoryManager` before the corresponding row in
-        // `files` exists (which is inserted later, asynchronously, by
-        // `handle_changes`). The same ordering will apply when peer-originated
-        // versions land. A FK here would fight the message-passing
-        // architecture.
-        //
-        // TODO: When a file is deleted (`FileDatabase::remove_file`), we
-        // currently leave its `file_versions` rows behind as a history audit
-        // trail. If/when that history grows unwieldy, add a cleanup pass or
-        // make `remove_file` cascade the delete here.
-        connection
-            .execute(
-                // `size` is the version's content size in bytes, read from disk
-                // (or the in-memory buffer) at the same time the content hash is
-                // computed. A 0-byte file stores `size = 0` — that is a real,
-                // known value, distinct from absence, which is why the column is
-                // `NOT NULL` with no default.
-                "CREATE TABLE IF NOT EXISTS file_versions (
-            file_id         TEXT    NOT NULL,
-            content_hash    TEXT    NOT NULL,
-            observed_at     INTEGER NOT NULL,
-            version_number  INTEGER NOT NULL,
-            origin          TEXT    NOT NULL,
-            size            INTEGER NOT NULL,
-            PRIMARY KEY (file_id, version_number)
-        )",
-                (),
-            )
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-
-        connection
-            .execute(
-                "CREATE INDEX IF NOT EXISTS idx_file_versions_latest
-                    ON file_versions(file_id, version_number DESC)",
-                (),
-            )
-            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-
         // TODO: DELETE after all devices migrated.
         //
-        // Temporary, hardcoded, idempotent migration. The `CREATE TABLE IF NOT
-        // EXISTS` statements above only create the new columns on a *fresh* DB;
-        // an already-existing DB predates them, so bring it up to date here with
-        // `ALTER TABLE ... ADD COLUMN`. These use `DEFAULT` purely to backfill
-        // existing rows (SQLite requires a default when adding a NOT NULL
-        // column) — the `CREATE TABLE` definitions above deliberately have no
+        // Temporary, hardcoded, idempotent pre-migration for dev DBs that
+        // still have the pre-versioning tables (`files`, `tags`, ...) but
+        // are missing columns added late in that unversioned era. Brings
+        // those legacy tables up to the *final* pre-versioning shape so the
+        // `migrate_*_to_v1` functions below can copy them column-for-column
+        // without special cases. `add_column_if_missing` no-ops when the
+        // pre-versioning table doesn't exist, so this whole block is a
+        // no-op on a fresh install and on any dev DB that has already
+        // migrated to v1 (the old `files` / `tags` / `file_versions` tables
+        // are dropped by the v1 migration below).
+        //
+        // These use `DEFAULT` purely to backfill existing rows (SQLite
+        // requires a default when adding a NOT NULL column). The v1 `CREATE
+        // TABLE` statements in the migration functions deliberately have no
         // default so that omitting a value in normal operation is an error.
         //
         // - `file_versions.size`: backfill to 1 byte; files get their true size the
@@ -466,19 +322,23 @@ impl FileDatabase {
             "ALTER TABLE tags ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
         )?;
 
+        // TODO: DELETE after all devices migrated.
+        //
         // DEV-ONLY, REMOVE LATER: not a real migration. Nobody but the dev is
         // running this yet, so `logical_path_modified_at` doesn't need to be
-        // backfilled onto pre-existing DBs the careful way. This blind ALTER is
-        // just enough to keep an existing dev DB loadable; delete this block
-        // (and recreate the DB) once the schema settles.
+        // backfilled onto pre-existing DBs the careful way. This blind ALTER
+        // is just enough to keep an existing dev DB loadable so the v1
+        // migration below can then copy it; delete this block (and recreate
+        // the DB) once the schema settles.
         //
-        // SQLite requires a *constant* default when adding a NOT NULL column, so
-        // the ADD backfills every existing row with 0. The follow-up UPDATE then
-        // stamps those rows with the current time (unix millis, matching
-        // `now_millis`). We only touch rows still at 0 so it stays idempotent
-        // across restarts (a later real move stamps a nonzero value we keep).
-        // The `Err` is ignored on the ALTER because the column already exists on
-        // second run.
+        // SQLite requires a *constant* default when adding a NOT NULL column,
+        // so the ADD backfills every existing row with 0. The follow-up
+        // UPDATE then stamps those rows with the current time (unix millis,
+        // matching `now_millis`). We only touch rows still at 0 so it stays
+        // idempotent across restarts (a later real move stamps a nonzero
+        // value we keep). The `Err` is ignored on the ALTER because the
+        // column already exists on second run — or the whole `files` table is
+        // gone (already migrated to `files_v1`), which is fine.
         if connection
             .execute(
                 "ALTER TABLE files ADD COLUMN logical_path_modified_at INTEGER NOT NULL DEFAULT 0",
@@ -492,21 +352,303 @@ impl FileDatabase {
             );
         }
 
+        // Bring each table up to its v1 shape. On a fresh DB these create the
+        // empty `_v1` tables. On a dev DB with the pre-versioning tables
+        // still present, they copy every row across and drop the old table.
+        // Each function is idempotent (no-op if already at v1) and self-
+        // contained (creates its own transaction), so they compose cleanly
+        // and can be called in any order — but we run them in the order the
+        // rest of the schema tends to reference them.
+        Self::migrate_files_to_v1(&connection)?;
+        Self::migrate_tags_to_v1(&connection)?;
+        Self::migrate_entries_to_v1(&connection)?;
+        Self::migrate_file_versions_to_v1(&connection)?;
+
         Ok(Self { connection })
+    }
+
+    /// Ensure `files_v1` exists. If the pre-versioning `files` table still
+    /// exists, copy every row into `files_v1` and drop `files`.
+    ///
+    /// Idempotent: safe to call on every startup. On a fresh install this
+    /// just creates the empty `files_v1` table. On a dev DB that ran the
+    /// pre-versioning code, the temporary `ALTER TABLE` block in
+    /// [`Self::initialize`] has already brought `files` up to the final
+    /// pre-versioning shape, so a straight column-listed `INSERT SELECT`
+    /// is safe. Once `files_v1` is populated and `files` is dropped, later
+    /// calls short-circuit at the `table_exists` check.
+    ///
+    /// The temporary `files` → `files_v1` bootstrap will need to be removed
+    /// once all dev devices are migrated (see the top-level TODOs).
+    fn migrate_files_to_v1(connection: &Connection) -> Result<(), DatabaseError> {
+        // `logical_path` is the file's logical identity: its human-readable
+        // path/name (possibly nested, e.g. `foo/bar/name.txt`), independent
+        // of where any individual sync directory stores the bytes on disk.
+        // Contrast with `SyncDirectoryDatabase.files_v1.physical_path`, which
+        // is the on-disk location within a particular sync directory.
+        //
+        // `deleted` / `deleted_at` are the soft-delete tombstone. Unlike tags
+        // (which reuse their `modified_at` clock), a file has no single
+        // per-file timestamp — its "latest activity" time is the newest
+        // `file_versions_v1.observed_at` — so the delete time needs its own
+        // column. `deleted_at` is the unix-millis wall clock stamped when the
+        // file was deleted, preserved across the wire. Reconciliation
+        // compares it against the peer's latest version `observed_at`: an
+        // edit newer than the delete resurrects the file (last-writer-wins).
+        // All live reads filter `deleted = 0`; reconciliation deliberately
+        // considers tombstoned rows so a delete can win over a stale peer.
+        //
+        // `logical_path_modified_at` is the unix-millis wall-clock time the
+        // `logical_path` was last changed, stamped on the *originating*
+        // device and preserved across the wire. It is the last-writer-wins
+        // clock for the path *only* (content has its own clock via
+        // `file_versions_v1.observed_at`; deletes use `deleted_at`; tags are
+        // reconciled separately with their own `modified_at`). It exists so
+        // a move made while a peer is offline reconciles on reconnect: the
+        // manifest advertises this timestamp and the receiver adopts the
+        // peer's path only when it is strictly newer. Never restamp it when
+        // applying a peer's move. Do NOT fold other metadata into this clock
+        // — a bare "modified" clock would let a content edit silently
+        // override a path (they are independently edited). See
+        // `Change::FileMoved`.
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS files_v1 (
+                    id                        TEXT PRIMARY KEY,
+                    logical_path              TEXT NOT NULL,
+                    logical_path_modified_at  INTEGER NOT NULL,
+                    deleted                   INTEGER NOT NULL,
+                    deleted_at                INTEGER NOT NULL
+                )",
+                (),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        // TODO: DELETE after all devices migrated. Bootstrap from the
+        // pre-versioning `files` table.
+        if Self::table_exists(connection, "files")? {
+            connection
+                .execute(
+                    "INSERT INTO files_v1 (id, logical_path, logical_path_modified_at, deleted, deleted_at)
+                     SELECT id, logical_path, logical_path_modified_at, deleted, deleted_at FROM files",
+                    (),
+                )
+                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+            connection
+                .execute("DROP TABLE files", ())
+                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        }
+
+        Ok(())
+    }
+
+    /// Ensure `tags_v1` exists. If the pre-versioning `tags` table still
+    /// exists, copy every row into `tags_v1` and drop `tags`. See
+    /// [`Self::migrate_files_to_v1`] for the general shape.
+    fn migrate_tags_to_v1(connection: &Connection) -> Result<(), DatabaseError> {
+        // `name` is intentionally NOT `UNIQUE`: two devices editing offline
+        // can each mint a tag with the same name but a different `TagId`.
+        // When they reconcile, both tags must be able to coexist rather than
+        // one insert failing a constraint and leaving the databases
+        // divergent. Tag identity is the `TagId`; names are display-only and
+        // may collide. (Disambiguation in the UI is handled by tag short-ids
+        // — see roadmap pass 2.)
+        //
+        // `modified_at` is the unix-millis wall-clock time, stamped on the
+        // *originating* device and preserved across the wire, that drives
+        // last-writer-wins reconciliation of tag definitions. Never restamp
+        // it when applying a peer's change.
+        //
+        // `deleted` is the soft-delete tombstone. Unlike files, a tag
+        // already carries `modified_at` as its single last-writer-wins
+        // clock, so a delete just sets `deleted = 1` and bumps `modified_at`
+        // (mirroring the relationship tombstones in `untag_entry`) — no
+        // separate `deleted_at` is needed. All live reads filter
+        // `deleted = 0`; reconciliation considers tombstoned rows so a
+        // delete can win LWW against a stale peer.
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS tags_v1 (
+                    id          TEXT PRIMARY KEY,
+                    name        TEXT NOT NULL,
+                    color       TEXT NOT NULL,
+                    metadata    TEXT,
+                    modified_at INTEGER NOT NULL DEFAULT 0,
+                    deleted     INTEGER NOT NULL
+                )",
+                (),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        // TODO: DELETE after all devices migrated. Bootstrap from the
+        // pre-versioning `tags` table.
+        if Self::table_exists(connection, "tags")? {
+            connection
+                .execute(
+                    "INSERT INTO tags_v1 (id, name, color, metadata, modified_at, deleted)
+                     SELECT id, name, color, metadata, modified_at, deleted FROM tags",
+                    (),
+                )
+                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+            connection
+                .execute("DROP TABLE tags", ())
+                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        }
+
+        Ok(())
+    }
+
+    /// Ensure `entries_v1` exists. If the pre-versioning `entries` table
+    /// still exists, copy every row into `entries_v1` and drop `entries`.
+    /// See [`Self::migrate_files_to_v1`] for the general shape.
+    fn migrate_entries_to_v1(connection: &Connection) -> Result<(), DatabaseError> {
+        // `modified_at` drives last-writer-wins reconciliation of
+        // relationships, exactly as for `tags_v1` above.
+        //
+        // `deleted` is a soft-delete flag (0 = live, 1 = tombstoned).
+        // Untagging sets `deleted = 1` and bumps `modified_at` instead of
+        // removing the row, so an "absent" relationship still carries a
+        // timestamp and can win LWW against a stale "present" from a peer.
+        // All *reads* of live relationships must filter `deleted = 0` (see
+        // the read helpers below); reconciliation deliberately considers
+        // tombstoned rows too. The `UNIQUE(tag_id, target_id, type)`
+        // constraint is retained: a relationship reappears by flipping
+        // `deleted` back to 0, never by inserting a duplicate row.
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS entries_v1 (
+                    id          TEXT PRIMARY KEY,
+                    tag_id      TEXT NOT NULL,
+                    target_id   TEXT NOT NULL,
+                    type        INTEGER,
+                    modified_at INTEGER NOT NULL DEFAULT 0,
+                    deleted     INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE (tag_id, target_id, type)
+                )",
+                (),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        // TODO: DELETE after all devices migrated. Bootstrap from the
+        // pre-versioning `entries` table.
+        if Self::table_exists(connection, "entries")? {
+            connection
+                .execute(
+                    "INSERT INTO entries_v1 (id, tag_id, target_id, type, modified_at, deleted)
+                     SELECT id, tag_id, target_id, type, modified_at, deleted FROM entries",
+                    (),
+                )
+                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+            connection
+                .execute("DROP TABLE entries", ())
+                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        }
+
+        Ok(())
+    }
+
+    /// Ensure `file_versions_v1` (and its index) exist. If the
+    /// pre-versioning `file_versions` table still exists, copy every row
+    /// into `file_versions_v1` and drop `file_versions`. See
+    /// [`Self::migrate_files_to_v1`] for the general shape.
+    fn migrate_file_versions_to_v1(connection: &Connection) -> Result<(), DatabaseError> {
+        // Append-only log of content hashes per file. The latest row per
+        // `file_id` (highest `version_number`) is the current version.
+        //
+        // - `version_number` is a per-file monotonic counter starting at 1. It is what
+        //   we order by; do not order by `observed_at`.
+        // - `observed_at` is unix-millis wall-clock at insert time, kept for debugging
+        //   / UI.
+        // - `origin` is `'local'` for now. When cross-peer conflict resolution lands it
+        //   will hold the originating peer's public key.
+        // - `size` is the version's content size in bytes, read from disk (or the
+        //   in-memory buffer) at the same time the content hash is computed. A 0-byte
+        //   file stores `size = 0` — that is a real, known value, distinct from
+        //   absence, which is why the column is `NOT NULL` with no default.
+        //
+        // Intentionally no `FOREIGN KEY` on `file_id`: a version may be
+        // recorded by `SyncDirectoryManager` before the corresponding row in
+        // `files_v1` exists (which is inserted later, asynchronously, by
+        // `handle_changes`). The same ordering will apply when peer-
+        // originated versions land. A FK here would fight the message-
+        // passing architecture.
+        //
+        // TODO: When a file is deleted (`FileDatabase::remove_file`), we
+        // currently leave its `file_versions_v1` rows behind as a history
+        // audit trail. If/when that history grows unwieldy, add a cleanup
+        // pass or make `remove_file` cascade the delete here.
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS file_versions_v1 (
+                    file_id         TEXT    NOT NULL,
+                    content_hash    TEXT    NOT NULL,
+                    observed_at     INTEGER NOT NULL,
+                    version_number  INTEGER NOT NULL,
+                    origin          TEXT    NOT NULL,
+                    size            INTEGER NOT NULL,
+                    PRIMARY KEY (file_id, version_number)
+                )",
+                (),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        connection
+            .execute(
+                "CREATE INDEX IF NOT EXISTS idx_file_versions_v1_latest
+                    ON file_versions_v1(file_id, version_number DESC)",
+                (),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        // TODO: DELETE after all devices migrated. Bootstrap from the
+        // pre-versioning `file_versions` table.
+        if Self::table_exists(connection, "file_versions")? {
+            connection
+                .execute(
+                    "INSERT INTO file_versions_v1 (file_id, content_hash, observed_at, version_number, origin, size)
+                     SELECT file_id, content_hash, observed_at, version_number, origin, size FROM file_versions",
+                    (),
+                )
+                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+            connection
+                .execute("DROP TABLE file_versions", ())
+                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        }
+
+        Ok(())
+    }
+
+    /// Whether a table with exactly `name` exists in this database.
+    fn table_exists(connection: &Connection, name: &str) -> Result<bool, DatabaseError> {
+        let mut statement = connection
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        let exists = statement
+            .query_map([name], |_| Ok(()))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .next()
+            .is_some();
+        Ok(exists)
     }
 
     /// TODO: DELETE after all devices migrated.
     ///
-    /// Run `alter_sql` (an `ALTER TABLE ... ADD COLUMN`) only if `table` does
-    /// not already have `column`. Idempotent: safe to call on every startup.
-    /// Used solely by the temporary hardcoded migration in
-    /// [`Self::initialize`].
+    /// Run `alter_sql` (an `ALTER TABLE ... ADD COLUMN`) only if `table`
+    /// exists and does not already have `column`. Idempotent: safe to call
+    /// on every startup. Used solely by the temporary pre-v1 patch-up in
+    /// [`Self::initialize`], where the target `table` is a pre-versioning
+    /// name (`files`, `tags`, `file_versions`) that will not exist on a
+    /// fresh install or on a dev DB that has already been migrated to v1 —
+    /// hence the up-front existence check.
     fn add_column_if_missing(
         connection: &Connection,
         table: &str,
         column: &str,
         alter_sql: &str,
     ) -> Result<(), DatabaseError> {
+        if !Self::table_exists(connection, table)? {
+            return Ok(());
+        }
         let mut statement = connection
             .prepare(&format!("PRAGMA table_info({table})"))
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
@@ -557,7 +699,7 @@ impl FileDatabase {
         // Pull it as `Option<i64>` and default to 0 here instead.
         let current_max: Option<i64> = transaction
             .query_row(
-                "SELECT MAX(version_number) FROM file_versions WHERE file_id = ?1",
+                "SELECT MAX(version_number) FROM file_versions_v1 WHERE file_id = ?1",
                 [file_id],
                 |row| row.get(0),
             )
@@ -566,7 +708,7 @@ impl FileDatabase {
 
         transaction
             .execute(
-                "INSERT INTO file_versions
+                "INSERT INTO file_versions_v1
                     (file_id, content_hash, observed_at, version_number, origin, size)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 (
@@ -604,10 +746,10 @@ impl FileDatabase {
             .connection
             .prepare(
                 "SELECT file_id, content_hash
-                 FROM file_versions AS outer
+                 FROM file_versions_v1 AS outer
                  WHERE version_number = (
                      SELECT MAX(version_number)
-                     FROM file_versions AS inner
+                     FROM file_versions_v1 AS inner
                      WHERE inner.file_id = outer.file_id
                  )",
             )
@@ -637,7 +779,7 @@ impl FileDatabase {
             .connection
             .prepare(
                 "SELECT content_hash, observed_at, version_number, origin, size
-                 FROM file_versions
+                 FROM file_versions_v1
                  WHERE file_id = ?1
                  ORDER BY version_number DESC
                  LIMIT 1",
@@ -674,7 +816,7 @@ impl FileDatabase {
             .connection
             .prepare(
                 "SELECT version_number, content_hash, size
-                 FROM file_versions
+                 FROM file_versions_v1
                  WHERE file_id = ?1
                  ORDER BY version_number ASC",
             )
@@ -710,9 +852,7 @@ impl FileDatabase {
         // is acceptable.
         let mut id_statement = self
             .connection
-            .prepare(
-                "SELECT id, logical_path, logical_path_modified_at, deleted, deleted_at FROM files",
-            )
+            .prepare("SELECT id, logical_path, logical_path_modified_at, deleted, deleted_at FROM files_v1")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
         let file_rows: Vec<(FileId, LogicalPath, i64, bool, i64)> = id_statement
             .query_map([], |row| {
@@ -768,7 +908,7 @@ impl FileDatabase {
     pub fn tag_manifest_entries(&self) -> Result<Vec<TagManifestEntry>, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, modified_at, deleted FROM tags")
+            .prepare("SELECT id, modified_at, deleted FROM tags_v1")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
         let entries = statement
             .query_map([], |row| {
@@ -796,7 +936,7 @@ impl FileDatabase {
     ) -> Result<Vec<RelationshipManifestEntry>, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT tag_id, target_id, type, modified_at, deleted FROM entries")
+            .prepare("SELECT tag_id, target_id, type, modified_at, deleted FROM entries_v1")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
         let entries = statement
             .query_map([], |row| {
@@ -827,7 +967,7 @@ impl FileDatabase {
     ) -> Result<Option<i64>, DatabaseError> {
         self.connection
             .query_row(
-                "SELECT modified_at FROM entries
+                "SELECT modified_at FROM entries_v1
                  WHERE tag_id = ?1 AND target_id = ?2 AND type = ?3",
                 (&tag_id, &target_id, kind),
                 |row| row.get(0),
@@ -842,7 +982,7 @@ impl FileDatabase {
     pub fn tag_modified_at(&self, tag_id: TagId) -> Result<Option<i64>, DatabaseError> {
         self.connection
             .query_row(
-                "SELECT modified_at FROM tags WHERE id = ?1",
+                "SELECT modified_at FROM tags_v1 WHERE id = ?1",
                 [tag_id],
                 |row| row.get(0),
             )
@@ -859,7 +999,7 @@ impl FileDatabase {
     ) -> Result<Option<(String, String, i64)>, DatabaseError> {
         self.connection
             .query_row(
-                "SELECT name, color, modified_at FROM tags WHERE id = ?1",
+                "SELECT name, color, modified_at FROM tags_v1 WHERE id = ?1",
                 [tag_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -878,12 +1018,12 @@ impl FileDatabase {
         let kind: EntryType = entry.kind.into();
         self.connection
             .execute(
-                "INSERT INTO entries (id, tag_id, target_id, type, modified_at, deleted)
+                "INSERT INTO entries_v1 (id, tag_id, target_id, type, modified_at, deleted)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(tag_id, target_id, type) DO UPDATE SET
                      modified_at = excluded.modified_at,
                      deleted = excluded.deleted
-                 WHERE excluded.modified_at > entries.modified_at",
+                 WHERE excluded.modified_at > entries_v1.modified_at",
                 (
                     TagId::new(),
                     &entry.tag_id,
@@ -904,7 +1044,7 @@ impl FileDatabase {
         let count: i64 = self
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM files WHERE id = ?1",
+                "SELECT COUNT(*) FROM files_v1 WHERE id = ?1",
                 [file_id],
                 |row| row.get(0),
             )
@@ -946,7 +1086,7 @@ impl FileDatabase {
         let predecessor: Option<String> = self
             .connection
             .query_row(
-                "SELECT id FROM files WHERE id < ?1 ORDER BY id DESC LIMIT 1",
+                "SELECT id FROM files_v1 WHERE id < ?1 ORDER BY id DESC LIMIT 1",
                 [&full],
                 |row| row.get(0),
             )
@@ -957,7 +1097,7 @@ impl FileDatabase {
         let successor: Option<String> = self
             .connection
             .query_row(
-                "SELECT id FROM files WHERE id > ?1 ORDER BY id ASC LIMIT 1",
+                "SELECT id FROM files_v1 WHERE id > ?1 ORDER BY id ASC LIMIT 1",
                 [&full],
                 |row| row.get(0),
             )
@@ -987,7 +1127,7 @@ impl FileDatabase {
     ///   (e.g. a colliding file was added since the short id was displayed).
     pub fn resolve_file_id_prefix(&self, prefix: &str) -> Result<FileId, DatabaseError> {
         let normalised = normalise_id_prefix(prefix).ok_or(DatabaseError::MissingFile)?;
-        match resolve_id_prefix(&self.connection, "files", "id", &normalised)? {
+        match resolve_id_prefix(&self.connection, "files_v1", "id", &normalised)? {
             PrefixResolution::Unique(id) => {
                 FileId::from_string(&id).ok_or(DatabaseError::MissingFile)
             }
@@ -1001,9 +1141,11 @@ impl FileDatabase {
     pub fn tag_exists(&self, tag_id: TagId) -> Result<bool, DatabaseError> {
         let count: i64 = self
             .connection
-            .query_row("SELECT COUNT(*) FROM tags WHERE id = ?1", [tag_id], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM tags_v1 WHERE id = ?1",
+                [tag_id],
+                |row| row.get(0),
+            )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
         Ok(count > 0)
     }
@@ -1025,7 +1167,7 @@ impl FileDatabase {
         let predecessor: Option<String> = self
             .connection
             .query_row(
-                "SELECT id FROM tags WHERE id < ?1 ORDER BY id DESC LIMIT 1",
+                "SELECT id FROM tags_v1 WHERE id < ?1 ORDER BY id DESC LIMIT 1",
                 [&full],
                 |row| row.get(0),
             )
@@ -1035,7 +1177,7 @@ impl FileDatabase {
         let successor: Option<String> = self
             .connection
             .query_row(
-                "SELECT id FROM tags WHERE id > ?1 ORDER BY id ASC LIMIT 1",
+                "SELECT id FROM tags_v1 WHERE id > ?1 ORDER BY id ASC LIMIT 1",
                 [&full],
                 |row| row.get(0),
             )
@@ -1059,7 +1201,7 @@ impl FileDatabase {
     /// - [`DatabaseError::AmbiguousIdPrefix`] if more than one tag matches.
     pub fn resolve_tag_id_prefix(&self, prefix: &str) -> Result<TagId, DatabaseError> {
         let normalised = normalise_id_prefix(prefix).ok_or(DatabaseError::MissingTag)?;
-        match resolve_id_prefix(&self.connection, "tags", "id", &normalised)? {
+        match resolve_id_prefix(&self.connection, "tags_v1", "id", &normalised)? {
             PrefixResolution::Unique(id) => {
                 TagId::from_string(&id).ok_or(DatabaseError::MissingTag)
             }
@@ -1085,7 +1227,7 @@ impl FileDatabase {
         // (No default on the columns, so they are set explicitly here.)
         self.connection
             .execute(
-                "INSERT INTO files (id, logical_path, logical_path_modified_at, deleted, deleted_at)
+                "INSERT INTO files_v1 (id, logical_path, logical_path_modified_at, deleted, deleted_at)
                  VALUES (?1, ?2, ?3, 0, 0)",
                 (file_id, logical_path, logical_path_modified_at),
             )
@@ -1100,7 +1242,7 @@ impl FileDatabase {
     pub fn restore_file(&self, file_id: FileId) -> Result<(), DatabaseError> {
         self.connection
             .execute(
-                "UPDATE files SET deleted = 0, deleted_at = 0 WHERE id = ?1",
+                "UPDATE files_v1 SET deleted = 0, deleted_at = 0 WHERE id = ?1",
                 [file_id],
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
@@ -1117,7 +1259,7 @@ impl FileDatabase {
     ) -> Result<Option<(bool, i64)>, DatabaseError> {
         self.connection
             .query_row(
-                "SELECT deleted, deleted_at FROM files WHERE id = ?1",
+                "SELECT deleted, deleted_at FROM files_v1 WHERE id = ?1",
                 [file_id],
                 |row| {
                     let deleted: i64 = row.get(0)?;
@@ -1149,7 +1291,7 @@ impl FileDatabase {
         let rows = self
             .connection
             .execute(
-                "UPDATE files
+                "UPDATE files_v1
                  SET logical_path = ?2, logical_path_modified_at = ?3
                  WHERE id = ?1 AND logical_path_modified_at < ?3",
                 (file_id, logical_path, modified_at),
@@ -1186,7 +1328,7 @@ impl FileDatabase {
         let affected = self
             .connection
             .execute(
-                "UPDATE files SET deleted = 1, deleted_at = ?2 WHERE id = ?1",
+                "UPDATE files_v1 SET deleted = 1, deleted_at = ?2 WHERE id = ?1",
                 (file_id, deleted_at),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
@@ -1230,14 +1372,14 @@ impl FileDatabase {
         // values we tried to insert.
         self.connection
             .execute(
-                "INSERT INTO tags (id, name, color, modified_at, deleted)
+                "INSERT INTO tags_v1 (id, name, color, modified_at, deleted)
                  VALUES (?1, ?2, ?3, ?4, 0)
                  ON CONFLICT(id) DO UPDATE SET
                      name = excluded.name,
                      color = excluded.color,
                      modified_at = excluded.modified_at,
                      deleted = 0
-                 WHERE excluded.modified_at > tags.modified_at",
+                 WHERE excluded.modified_at > tags_v1.modified_at",
                 (tag_id, &name, &color, modified_at),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
@@ -1263,7 +1405,7 @@ impl FileDatabase {
 
         self.connection
             .execute(
-                "UPDATE tags SET name = ?2, modified_at = ?3
+                "UPDATE tags_v1 SET name = ?2, modified_at = ?3
                  WHERE id = ?1 AND ?3 > modified_at",
                 (tag_id, name, modified_at),
             )
@@ -1289,7 +1431,7 @@ impl FileDatabase {
 
         self.connection
             .execute(
-                "UPDATE tags SET color = ?2, modified_at = ?3
+                "UPDATE tags_v1 SET color = ?2, modified_at = ?3
                  WHERE id = ?1 AND ?3 > modified_at",
                 (tag_id, color, modified_at),
             )
@@ -1314,7 +1456,7 @@ impl FileDatabase {
         let affected = self
             .connection
             .execute(
-                "UPDATE tags SET deleted = 1, modified_at = ?2
+                "UPDATE tags_v1 SET deleted = 1, modified_at = ?2
                  WHERE id = ?1 AND ?2 > modified_at",
                 (&tag_id, deleted_at),
             )
@@ -1389,12 +1531,12 @@ impl FileDatabase {
     ) -> Result<(), DatabaseError> {
         self.connection
             .execute(
-                "INSERT INTO entries (id, tag_id, target_id, type, modified_at, deleted)
+                "INSERT INTO entries_v1 (id, tag_id, target_id, type, modified_at, deleted)
                  VALUES (?1, ?2, ?3, ?4, ?5, 0)
                  ON CONFLICT(tag_id, target_id, type) DO UPDATE SET
                      modified_at = excluded.modified_at,
                      deleted = 0
-                 WHERE excluded.modified_at > entries.modified_at",
+                 WHERE excluded.modified_at > entries_v1.modified_at",
                 (TagId::new(), &tag_id, &target_id, entry_type, modified_at),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
@@ -1421,7 +1563,7 @@ impl FileDatabase {
     ) -> Result<(), DatabaseError> {
         self.connection
             .execute(
-                "UPDATE entries SET deleted = 1, modified_at = ?4
+                "UPDATE entries_v1 SET deleted = 1, modified_at = ?4
                  WHERE tag_id = ?1 AND target_id = ?2 AND type = ?3
                    AND ?4 > modified_at",
                 (&tag_id, &target_id, entry_type, modified_at),
@@ -1445,7 +1587,7 @@ impl FileDatabase {
 
         let mut statement = self
             .connection
-            .prepare("SELECT target_id, type FROM entries WHERE tag_id = ?1 AND deleted = 0")
+            .prepare("SELECT target_id, type FROM entries_v1 WHERE tag_id = ?1 AND deleted = 0")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let iterator = statement
@@ -1778,7 +1920,9 @@ impl FileDatabase {
     ) -> Result<impl IntoIterator<Item = TagId>, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT tag_id FROM entries WHERE target_id = ?1 AND type = 0 AND deleted = 0")
+            .prepare(
+                "SELECT tag_id FROM entries_v1 WHERE target_id = ?1 AND type = 0 AND deleted = 0",
+            )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let mut tag_ids = statement
@@ -1812,7 +1956,9 @@ impl FileDatabase {
     ) -> Result<(), DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT target_id FROM entries WHERE tag_id = ?1 AND type = 1 AND deleted = 0")
+            .prepare(
+                "SELECT target_id FROM entries_v1 WHERE tag_id = ?1 AND type = 1 AND deleted = 0",
+            )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let iterator = statement
@@ -1856,7 +2002,9 @@ impl FileDatabase {
     ) -> Result<(), DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT tag_id FROM entries WHERE target_id = ?1 AND type = 1 AND deleted = 0")
+            .prepare(
+                "SELECT tag_id FROM entries_v1 WHERE target_id = ?1 AND type = 1 AND deleted = 0",
+            )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let iterator = statement
@@ -1895,7 +2043,7 @@ impl FileDatabase {
     pub fn get_all_tags(&self) -> Result<impl IntoIterator<Item = Tag>, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, name, color FROM tags WHERE deleted = 0")
+            .prepare("SELECT id, name, color FROM tags_v1 WHERE deleted = 0")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let tag_list = statement
@@ -1919,7 +2067,7 @@ impl FileDatabase {
     pub fn tag_from_id(&self, tag_id: TagId) -> Result<Tag, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT name, color FROM tags WHERE id = ?1 AND deleted = 0")
+            .prepare("SELECT name, color FROM tags_v1 WHERE id = ?1 AND deleted = 0")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let tag = statement
@@ -1946,7 +2094,7 @@ impl FileDatabase {
     ) -> Result<FileId, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id FROM files WHERE logical_path = ?1 AND deleted = 0")
+            .prepare("SELECT id FROM files_v1 WHERE logical_path = ?1 AND deleted = 0")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let file_id = statement
@@ -1983,7 +2131,7 @@ impl FileDatabase {
         let pattern = format!("%{escaped}%");
         let mut statement = self
             .connection
-            .prepare("SELECT id FROM tags WHERE name LIKE ?1 ESCAPE '\\' AND deleted = 0")
+            .prepare("SELECT id FROM tags_v1 WHERE name LIKE ?1 ESCAPE '\\' AND deleted = 0")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
         let name_matches = statement
             .query_map([&pattern], |row| row.get::<_, TagId>(0))
@@ -1997,7 +2145,7 @@ impl FileDatabase {
             let id_pattern = format!("{prefix}%");
             let mut statement = self
                 .connection
-                .prepare("SELECT id FROM tags WHERE id LIKE ?1 AND deleted = 0")
+                .prepare("SELECT id FROM tags_v1 WHERE id LIKE ?1 AND deleted = 0")
                 .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
             let id_matches = statement
                 .query_map([&id_pattern], |row| row.get::<_, TagId>(0))
@@ -2015,7 +2163,7 @@ impl FileDatabase {
     pub fn tag_id_from_name(&self, name: &str) -> Result<TagId, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id FROM tags WHERE name = ?1 AND deleted = 0")
+            .prepare("SELECT id FROM tags_v1 WHERE name = ?1 AND deleted = 0")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let tag_id = statement
@@ -2035,7 +2183,7 @@ impl FileDatabase {
     pub fn logical_path_for_file_id(&self, file_id: FileId) -> Result<LogicalPath, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT logical_path FROM files WHERE id = ?1 AND deleted = 0")
+            .prepare("SELECT logical_path FROM files_v1 WHERE id = ?1 AND deleted = 0")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let logical_path = statement
@@ -2057,7 +2205,7 @@ impl FileDatabase {
     pub fn logical_path_modified_at(&self, file_id: FileId) -> Result<Option<i64>, DatabaseError> {
         self.connection
             .query_row(
-                "SELECT logical_path_modified_at FROM files WHERE id = ?1",
+                "SELECT logical_path_modified_at FROM files_v1 WHERE id = ?1",
                 [file_id],
                 |row| row.get::<_, i64>(0),
             )
@@ -2077,12 +2225,12 @@ impl FileDatabase {
             .connection
             .prepare(
                 "SELECT f.logical_path, v.content_hash, v.version_number, v.size
-                 FROM files AS f
-                 JOIN file_versions AS v
+                 FROM files_v1 AS f
+                 JOIN file_versions_v1 AS v
                    ON v.file_id = f.id
                   AND v.version_number = (
                       SELECT MAX(version_number)
-                      FROM file_versions AS inner
+                      FROM file_versions_v1 AS inner
                       WHERE inner.file_id = f.id
                   )
                  WHERE f.id = ?1 AND f.deleted = 0",
@@ -2124,12 +2272,12 @@ impl FileDatabase {
             .connection
             .prepare(
                 "SELECT f.id, f.logical_path, v.content_hash, v.version_number, v.size
-                 FROM files AS f
-                 JOIN file_versions AS v
+                 FROM files_v1 AS f
+                 JOIN file_versions_v1 AS v
                    ON v.file_id = f.id
                   AND v.version_number = (
                       SELECT MAX(version_number)
-                      FROM file_versions AS inner
+                      FROM file_versions_v1 AS inner
                       WHERE inner.file_id = f.id
                   )
                  WHERE f.deleted = 0",
@@ -2208,22 +2356,62 @@ impl SyncDirectoryDatabase {
         let connection =
             Connection::open(database_path).map_err(|_| DatabaseError::UnableToOpenOrCreate)?;
 
+        Self::migrate_files_to_v1(&connection)?;
+
+        Ok(Self { connection })
+    }
+
+    /// Ensure `files_v1` exists. If the pre-versioning `files` table still
+    /// exists, copy every row into `files_v1` and drop `files`.
+    ///
+    /// Idempotent — see `FileDatabase::migrate_files_to_v1` for the general
+    /// shape. Note that this is a *different* `files` table than
+    /// `FileDatabase`'s, in a different DB file, with a different schema.
+    fn migrate_files_to_v1(connection: &Connection) -> Result<(), DatabaseError> {
+        // `physical_path` is where the bytes live on disk relative to this
+        // sync directory's root, and doubles as the reverse index for
+        // filesystem events (path -> file_id). For TagBased it equals the
+        // logical path; for Universal it is the `file_id`. The logical/human
+        // name lives in `FileDatabase.files_v1`.
         connection
             .execute(
-                // `physical_path` is where the bytes live on disk relative to
-                // this sync directory's root, and doubles as the reverse index
-                // for filesystem events (path -> file_id). For TagBased it
-                // equals the logical path; for Universal it is the `file_id`.
-                // The logical/human name lives in `FileDatabase.files`.
-                "CREATE TABLE IF NOT EXISTS files (
-            id              TEXT PRIMARY KEY,
-            physical_path   TEXT NOT NULL
-        )",
+                "CREATE TABLE IF NOT EXISTS files_v1 (
+                    id              TEXT PRIMARY KEY,
+                    physical_path   TEXT NOT NULL
+                )",
                 (),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
-        Ok(Self { connection })
+        // TODO: DELETE after all devices migrated. Bootstrap from the
+        // pre-versioning `files` table.
+        if Self::table_exists(connection, "files")? {
+            connection
+                .execute(
+                    "INSERT INTO files_v1 (id, physical_path)
+                     SELECT id, physical_path FROM files",
+                    (),
+                )
+                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+            connection
+                .execute("DROP TABLE files", ())
+                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        }
+
+        Ok(())
+    }
+
+    /// Whether a table with exactly `name` exists in this database.
+    fn table_exists(connection: &Connection, name: &str) -> Result<bool, DatabaseError> {
+        let mut statement = connection
+            .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        let exists = statement
+            .query_map([name], |_| Ok(()))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .next()
+            .is_some();
+        Ok(exists)
     }
 
     /// Add a new file.
@@ -2238,7 +2426,7 @@ impl SyncDirectoryDatabase {
     ) -> Result<(), DatabaseError> {
         self.connection
             .execute(
-                "INSERT INTO files (id, physical_path) VALUES (?1, ?2)",
+                "INSERT INTO files_v1 (id, physical_path) VALUES (?1, ?2)",
                 (file_id, physical_path),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
@@ -2253,7 +2441,7 @@ impl SyncDirectoryDatabase {
     ) -> Result<(), DatabaseError> {
         self.connection
             .execute(
-                "UPDATE files SET physical_path = ?2 WHERE id = ?1",
+                "UPDATE files_v1 SET physical_path = ?2 WHERE id = ?1",
                 (file_id, physical_path),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
@@ -2263,7 +2451,7 @@ impl SyncDirectoryDatabase {
 
     pub fn remove_file_by_id(&self, file_id: FileId) -> Result<(), DatabaseError> {
         self.connection
-            .execute("DELETE FROM files WHERE id = ?1", [file_id])
+            .execute("DELETE FROM files_v1 WHERE id = ?1", [file_id])
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         Ok(())
@@ -2271,7 +2459,7 @@ impl SyncDirectoryDatabase {
 
     // pub fn remove_file_by_physical_path(&self, physical_path: impl AsRef<str>) ->
     // Result<(), DatabaseError> {     self.connection
-    //         .execute("DELETE FROM files WHERE physical_path = ?1",
+    //         .execute("DELETE FROM files_v1 WHERE physical_path = ?1",
     // [physical_path.as_ref()])         .map_err(|_|
     // DatabaseError::FailedToExecuteCommand)?;
     //
@@ -2281,7 +2469,7 @@ impl SyncDirectoryDatabase {
     pub fn get_file(&self, file_id: FileId) -> Result<SyncDirectoryFile, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT physical_path FROM files WHERE id = ?1")
+            .prepare("SELECT physical_path FROM files_v1 WHERE id = ?1")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let file = statement
@@ -2313,7 +2501,7 @@ impl SyncDirectoryDatabase {
     ) -> Result<bool, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT 1 FROM files WHERE physical_path = ?1 AND id != ?2")
+            .prepare("SELECT 1 FROM files_v1 WHERE physical_path = ?1 AND id != ?2")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let in_use = statement
@@ -2328,7 +2516,7 @@ impl SyncDirectoryDatabase {
     pub fn get_file_id(&self, physical_path: &PhysicalPath) -> Result<FileId, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id FROM files WHERE physical_path = ?1")
+            .prepare("SELECT id FROM files_v1 WHERE physical_path = ?1")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let id = statement
@@ -2344,7 +2532,7 @@ impl SyncDirectoryDatabase {
     pub fn get_all_files(&self) -> Result<Vec<SyncDirectoryFile>, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, physical_path FROM files")
+            .prepare("SELECT id, physical_path FROM files_v1")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         Ok(statement
@@ -2365,7 +2553,7 @@ impl SyncDirectoryDatabase {
     ) -> Result<Vec<SyncDirectoryFile>, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, physical_path FROM files WHERE physical_path LIKE ?1")
+            .prepare("SELECT id, physical_path FROM files_v1 WHERE physical_path LIKE ?1")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let matcher = format!("{}%", physical_path.as_str());

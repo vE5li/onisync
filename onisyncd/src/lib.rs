@@ -2232,6 +2232,7 @@ async fn request_pull_from_origin(
         .peers
         .get(public_key)
         .and_then(|runtime_peer| runtime_peer.commands.clone());
+
     match commands {
         Some(commands) => {
             if commands
