@@ -2303,6 +2303,31 @@ impl SyncDirectoryDatabase {
         Ok(file)
     }
 
+    /// Whether some *other* file (any `file_id` except `except_file_id`) already
+    /// occupies `physical_path` in this sync directory. Used to resolve on-disk
+    /// naming collisions: two files may share a logical path, but their bytes
+    /// must live at distinct physical paths, so placement appends a suffix until
+    /// this returns `false`. Self-exclusion keeps re-placement/no-op moves of an
+    /// already-placed file from being treated as a collision with themselves.
+    pub fn physical_path_in_use_by_other(
+        &self,
+        physical_path: &PhysicalPath,
+        except_file_id: FileId,
+    ) -> Result<bool, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT 1 FROM files WHERE physical_path = ?1 AND id != ?2")
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        let in_use = statement
+            .query_map((physical_path, except_file_id), |_row| Ok(()))
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .next()
+            .is_some();
+
+        Ok(in_use)
+    }
+
     pub fn get_file_id(&self, physical_path: &PhysicalPath) -> Result<FileId, DatabaseError> {
         let mut statement = self
             .connection

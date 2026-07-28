@@ -540,6 +540,90 @@ impl SyncDirectoryManager {
             .map_err(|_| SyncDirectoryError::MissingTrackedFile)
     }
 
+    /// Resolve a collision-free physical path for placing `file_id` at `base`
+    /// within `sync_directory`.
+    ///
+    /// Two files may legitimately share a logical path (even within one
+    /// TagBased directory), but their bytes must live at distinct on-disk
+    /// locations. If `base` is already taken — by another file's DB row *or* by
+    /// an untracked file on disk — a ` (N)` suffix is inserted before the file
+    /// extension (`name.txt` -> `name (1).txt` -> `name (2).txt`, …) using the
+    /// lowest free integer. The returned `PhysicalPath` is the exact name that
+    /// must be used for *both* the on-disk write and the DB row, so the
+    /// path -> file_id reverse index (`get_file_id`) stays consistent.
+    ///
+    /// `file_id` is self-excluded from the DB check so re-placing or no-op
+    /// moving an already-placed file returns its own name rather than a new
+    /// suffix. Returns `base` unchanged when there is no collision.
+    fn resolve_unique_physical(
+        &self,
+        sync_directory: &RichSyncDirectory,
+        base: &PhysicalPath,
+        file_id: FileId,
+    ) -> PhysicalPath {
+        let is_free = |candidate: &PhysicalPath| -> bool {
+            // A different file_id already claiming this path in the DB is
+            // always a collision.
+            if sync_directory
+                .database
+                .physical_path_in_use_by_other(candidate, file_id)
+                .unwrap_or(false)
+            {
+                return false;
+            }
+            // If nothing exists on disk at the candidate path, we're free.
+            if !sync_directory.path.join(candidate.as_str()).exists() {
+                return true;
+            }
+            // Something is on disk. It's only a collision if it belongs to a
+            // *different* tracked file, or is untracked entirely — placing on
+            // top of either would clobber data. If the on-disk file is *this
+            // very file* (its own DB row points here) the path is already
+            // correctly ours and must not be treated as taken; that would
+            // otherwise cause replayed `MoveFile`s / re-placements to
+            // pointlessly rename an already-correctly-placed file to
+            // `name (1).ext`.
+            matches!(sync_directory.database.get_file_id(candidate), Ok(owner) if owner == file_id)
+        };
+
+        if is_free(base) {
+            return base.clone();
+        }
+
+        // Suffix the *final path component* only, before its extension, letting
+        // `std::path` do the parsing: `file_stem`/`extension` peel just the last
+        // extension (`bar.tar.gz` -> `bar.tar` + `gz`) and treat a dotfile as a
+        // stem with no extension (`.env` -> `.env` + none), which is exactly the
+        // behaviour we want. The parent directory is preserved verbatim.
+        let base_path = Path::new(base.as_str());
+        let parent = base_path.parent();
+        let stem = base_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let extension = base_path.extension().map(|ext| ext.to_string_lossy());
+
+        // Lowest free integer. Bounded loop guards against a pathological
+        // directory; u32::MAX collisions is not a realistic state.
+        for counter in 1..=u32::MAX {
+            let file_name = match &extension {
+                Some(ext) => format!("{stem} ({counter}).{ext}"),
+                None => format!("{stem} ({counter})"),
+            };
+            let candidate_path = match parent {
+                Some(parent) if !parent.as_os_str().is_empty() => parent.join(&file_name),
+                _ => PathBuf::from(&file_name),
+            };
+            let candidate = PhysicalPath::new(candidate_path.to_string_lossy());
+            if is_free(&candidate) {
+                return candidate;
+            }
+        }
+
+        // Unreachable in practice; fall back to the base rather than panic.
+        base.clone()
+    }
+
     async fn intial_sync_universal(
         &self,
         sync_directory: &RichSyncDirectory,
@@ -870,8 +954,18 @@ impl SyncDirectoryManager {
                         continue;
                     };
 
-                    let physical_path =
+                    // Resolve on-disk naming collisions: another file may
+                    // already occupy this logical path here. We reach this arm
+                    // only when the directory does not yet hold `file_id`, so
+                    // any clash is genuinely with a *different* file and must be
+                    // disambiguated with a suffix.
+                    let base_physical_path =
                         sync_directory.sync_type.physical_for(logical_path, file_id);
+                    let physical_path = self.resolve_unique_physical(
+                        sync_directory,
+                        &base_physical_path,
+                        file_id,
+                    );
                     let file_path = sync_directory.path.join(physical_path.as_str());
 
                     log::info!(
@@ -905,7 +999,9 @@ impl SyncDirectoryManager {
                         SyncDirectoryError::FailedAddingFile
                     })?;
 
-                    // TODO: Handle naming collisions. Should append some suffix perhaps (?)
+                    // `physical_path` is the suffix-resolved name, so the DB row
+                    // matches the actual on-disk name (preserving the
+                    // path -> file_id reverse index).
                     sync_directory
                         .database
                         .add_file(file_id, &physical_path)
@@ -990,28 +1086,36 @@ impl SyncDirectoryManager {
                 // for the same file (each `FileTagged` relationship reconcile,
                 // plus the connect-time placement sweep), each potentially
                 // fetching the bytes and emitting a `Materialize` -> `CreateFile`.
-                // If this directory already tracks the file at the same physical
-                // path, the bytes are already correctly placed; treat the repeat
-                // as a no-op success rather than letting the duplicate insert hit
-                // the per-directory DB primary key (which surfaced as
-                // `FailedAddingFile` and dropped the file).
-                if let Ok(existing) = sync_directory.database.get_file(file_id)
-                    && existing.physical_path == physical_path
-                {
+                // If this directory already tracks the file, the bytes are
+                // already correctly placed; treat the repeat as a no-op success
+                // rather than letting the duplicate insert hit the per-directory
+                // DB primary key (which surfaced as `FailedAddingFile` and
+                // dropped the file).
+                //
+                // We key idempotency on the *file_id* being present, not on the
+                // physical path matching: the incoming `physical_path` is the
+                // un-suffixed base derived by the caller from the logical path,
+                // whereas the stored path may carry a collision suffix (` (N)`).
+                // A file_id has exactly one row (and one on-disk copy) per
+                // directory, so its mere presence means placement is done.
+                if let Ok(existing) = sync_directory.database.get_file(file_id) {
                     log::debug!(
                         "CreateFile: {} already present in {} at {}; skipping (idempotent)",
                         file_id.to_string(),
                         sync_directory.path.to_string_lossy(),
-                        physical_path.as_str()
+                        existing.physical_path.as_str()
                     );
                     return Ok(());
                 }
 
-                // `physical_path` was already resolved from the file's logical
-                // path via `SyncType::physical_for` by the caller, so it is the
-                // correct on-disk name for this directory type (the file_id for
-                // Universal, the logical path for TagBased). Store the bytes and
-                // record the physical path verbatim.
+                // The caller resolved `physical_path` from the file's logical
+                // path via `SyncType::physical_for` (the file_id for Universal,
+                // the logical path for TagBased). A TagBased directory may
+                // already hold a *different* file at that logical path, so
+                // resolve any on-disk naming collision before writing; the
+                // resolved name is used for both the write and the DB row.
+                let physical_path =
+                    self.resolve_unique_physical(sync_directory, &physical_path, file_id);
                 let file_path = sync_directory.path.join(physical_path.as_str());
 
                 log::info!("Adding file at {}", file_path.to_string_lossy());
@@ -1121,6 +1225,29 @@ impl SyncDirectoryManager {
                             .database
                             .get_file(file_id)
                             .map_err(|_| SyncDirectoryError::FailedMovingFile)?;
+
+                        // The new logical path may collide with a *different*
+                        // file already held here; resolve a suffix (self-excluded
+                        // so keeping the same name is a no-op). The resolved name
+                        // drives both the rename and the DB update.
+                        let physical_path =
+                            self.resolve_unique_physical(sync_directory, &physical_path, file_id);
+
+                        // No-op move: `FileMoved` replay (at startup, or from a
+                        // peer reconnect) can fire `MoveFile` for a file that is
+                        // already correctly placed. Skipping here avoids a
+                        // needless DB write, a `rename(P, P)` syscall, and
+                        // stray `record_self_write` entries that would never
+                        // be consumed (there is no watcher event for a no-op
+                        // rename).
+                        if file.physical_path == physical_path {
+                            log::debug!(
+                                "MoveFile: {} already at {}; skipping (no-op)",
+                                file_id.to_string(),
+                                physical_path.as_str()
+                            );
+                            return Ok(());
+                        }
 
                         let old_file_path = sync_directory.path.join(file.physical_path.as_str());
                         let new_file_path = sync_directory.path.join(physical_path.as_str());
