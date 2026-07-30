@@ -31,3 +31,9 @@ notify = "8.2"
 env_logger = "0.11"
 log = "0.4"
 walkdir = "2.5"
+
+[dev-dependencies]
+# `test-util` (not part of tokio's `full`) enables paused-time tests
+# (`#[tokio::test(start_paused = true)]`) used to exercise the receiver's
+# per-chunk liveness timeout without waiting the real `HOP_TIMEOUT`.
+tokio = { version = "1.48", features = ["full", "test-util"] }

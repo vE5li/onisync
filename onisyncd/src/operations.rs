@@ -78,17 +78,6 @@ pub enum Direction {
     Inbound,
 }
 
-/// Where a file being served to a peer is read from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ServeSource {
-    /// A configured sync directory on disk.
-    SyncDirectory,
-    /// A local provider (an in-flight upload/edit served on demand).
-    Provider,
-    /// The on-demand fetch cache.
-    FetchCache,
-}
-
 /// The kind of work an [`Operation`] represents, plus its descriptive payload.
 ///
 /// One variant per user-meaningful sync activity. Ids are carried as their
@@ -105,19 +94,15 @@ pub enum OperationKind {
         public_key: String,
         direction: Direction,
     },
-    /// Serving a file a peer requested. "peer A requested file 123, serving
-    /// it".
-    SendingFile {
-        file_id: String,
-        peer_name: String,
-        source: ServeSource,
-    },
     /// Receiving a file's bytes from a peer. "fetching 123 from peer B".
+    ///
+    /// Note: there is no sender-side counterpart. In the content-addressed
+    /// chunk model a holder answers each `ChunkRequest` statelessly (no transfer
+    /// session), so there is nothing to anchor a "serving file" operation to —
+    /// serving is invisible to the operations UI by design.
     ReceivingFile { file_id: String, peer_name: String },
-    /// An on-demand fetch traversal originated locally (flooded to peers).
+    /// An on-demand fetch originated locally (flooded to peers via the relay).
     Fetching { file_id: String },
-    /// Relaying another peer's fetch request onward (this daemon as a hop).
-    RelayingFetch { file_id: String, from_peer: String },
     /// Reconciling a peer's file manifest against our catalog.
     ReconcilingManifest { peer_name: String },
     /// Reconciling a peer's tag definitions and relationships.
@@ -409,18 +394,6 @@ impl OperationKind {
         }
     }
 
-    pub fn sending_file(
-        file_id: FileId,
-        peer_name: impl Into<String>,
-        source: ServeSource,
-    ) -> Self {
-        OperationKind::SendingFile {
-            file_id: file_id.to_string(),
-            peer_name: peer_name.into(),
-            source,
-        }
-    }
-
     pub fn receiving_file(file_id: FileId, peer_name: impl Into<String>) -> Self {
         OperationKind::ReceivingFile {
             file_id: file_id.to_string(),
@@ -431,13 +404,6 @@ impl OperationKind {
     pub fn fetching(file_id: FileId) -> Self {
         OperationKind::Fetching {
             file_id: file_id.to_string(),
-        }
-    }
-
-    pub fn relaying_fetch(file_id: FileId, from_peer: impl Into<String>) -> Self {
-        OperationKind::RelayingFetch {
-            file_id: file_id.to_string(),
-            from_peer: from_peer.into(),
         }
     }
 

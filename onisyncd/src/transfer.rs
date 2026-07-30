@@ -1,32 +1,39 @@
-//! Pull-based file transfer over a single peer link.
+//! Content-addressed chunk transfer over peer links.
 //!
-//! Bytes move by a *pull* protocol (see the `Sync::Transfer*` wire messages):
-//! the **receiver** drives, the **sender** only replies. This yields fair
-//! interleaving with other link traffic (the sender never emits a chunk
-//! unprompted) and inherent backpressure (the receiver asks for the next chunk
-//! only when it is ready), at the cost of a round-trip per chunk — which a
-//! small in-flight *window* (see [`WINDOW`]) hides.
+//! There is one byte-movement mechanism. A chunk is treated as **pure content,
+//! not a message**: its identity *is* `(file_id, content_hash, offset)`, and
+//! because chunking is deterministic (offset a multiple of [`CHUNK_SIZE`], the
+//! canonical length `min(CHUNK_SIZE, size - offset)` derived from the version's
+//! authoritative size), that key denotes one exact, bit-identical byte range on
+//! every peer whose copy hashes to `content_hash`. Nothing else correlates a
+//! request to its reply — no transfer session, no per-request cookie, no
+//! open/close handshake.
 //!
-//! This module provides the two **two-party** endpoints as self-contained async
-//! drivers:
+//! This module provides:
 //!
-//! - [`run_receiver`] — drives a transfer to completion: opens it, keeps a
-//!   window of chunk requests in flight, streams replies to a temp file with
-//!   incremental BLAKE3, verifies the hash on the final chunk, and returns the
-//!   temp file as a [`FileBytes::FileToMove`] for the caller to materialize.
-//! - [`run_sender`] — answers chunk requests for a [`FileBytes`] source by
-//!   reading a bounded window at the requested offset.
+//! - [`receive`] — the single receiver driver. Given a `(file_id,
+//!   content_hash, expected_size)` and a way to send [`Sync::ChunkRequest`]s and
+//!   await [`ChunkReply`]s, it keeps a window of requests in flight, streams
+//!   replies into a temp file with incremental BLAKE3, and verifies the whole
+//!   file at the end. Where each chunk's *first* request goes is a routing
+//!   policy supplied by the caller, not part of the driver.
+//! - [`answer_chunk_request`] — the stateless holder side. It answers a single
+//!   `ChunkRequest` from a [`ChunkSource`] after verifying (via a
+//!   [`VerifiedHashCache`]) that the source's content matches `content_hash`.
+//! - [`ChunkSource`] / [`ProviderSource`] — where servable bytes live.
 //!
-//! Each endpoint communicates over two channels so it can be driven by a peer
-//! session (which demuxes inbound `Sync::Transfer*` frames by `TransferId`) or,
-//! in tests, by wiring two endpoints back to back. The relayed (multi-hop)
-//! fetch case is *not* here: it is a thin forwarding layer built on top of this
-//! primitive (see `fetch`).
+//! Integrity is **end-to-end**: only the origin receiver verifies the
+//! accumulated hash against `content_hash`. Relays (see [`fetch`]) hold no
+//! bytes and verify nothing.
+//!
+//! [`Sync::ChunkRequest`]: onisync_core::state::Sync::ChunkRequest
+//! [`fetch`]: crate::fetch
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
-use onisync_core::state::Sync as SyncMessage;
-use onisync_core::{FileId, TransferId};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
@@ -34,143 +41,79 @@ use crate::file_bytes::FileBytes;
 
 /// A sink for byte-transfer progress.
 ///
-/// Both endpoints report the running total of bytes transferred (and the known
-/// total, if any) through this so a caller — the peer session — can surface a
-/// live [`Operation`](crate::operations) with a progress bar. It is a thin
-/// boxed callback rather than a hard dependency on the operations module, so
-/// [`run_sender`]/[`run_receiver`] stay unit-testable in isolation.
-///
-/// Reporting is best-effort and never affects transfer correctness.
+/// The receiver reports the running total of bytes written (and the known
+/// total) through this so a caller — the peer session — can surface a live
+/// [`Operation`](crate::operations) with a progress bar. It is a thin boxed
+/// callback rather than a hard dependency on the operations module, so the
+/// driver stays unit-testable in isolation. Reporting is best-effort and never
+/// affects transfer correctness.
 pub type ProgressSink = Box<dyn Fn(u64, Option<u64>) + Send + Sync>;
 
-/// Bytes per chunk. A chunk request/reply pair moves at most this many bytes.
+/// Bytes per chunk. This is part of the **wire contract**: it defines chunk
+/// boundaries and the canonical chunk length every node derives from the
+/// version's size, so changing it is a protocol-breaking change and must go
+/// with a `PROTOCOL_VERSION` bump.
 pub const CHUNK_SIZE: usize = 64 * 1024;
 
-/// How many chunk requests the receiver keeps in flight at once. `1` is the
-/// simplest correct value (strict request/reply); a larger window hides
-/// per-chunk round-trip latency without changing the protocol. Kept small so a
-/// relayed transfer bounds in-flight bytes per hop to `WINDOW * CHUNK_SIZE`.
+/// How many chunk requests the receiver keeps in flight at once. A larger
+/// window hides per-chunk round-trip latency. Kept small so a relayed transfer
+/// bounds in-flight bytes per hop to `WINDOW * CHUNK_SIZE`.
 pub const WINDOW: u64 = 8;
 
-/// The subset of `Sync` messages that belong to one transfer. A peer session
-/// demuxes inbound `Sync::Transfer*` frames into per-transfer channels of these
-/// (the `transfer_id` is stripped since it identifies the channel).
+/// A reply to one of the receiver's outstanding `ChunkRequest`s, demuxed by the
+/// peer session for a specific in-flight receive. The `file_id` / `content_hash`
+/// are fixed for the whole receive, so only the `offset` (and, for `Data`, the
+/// bytes) are carried here — the reply is matched to a pending request by
+/// `offset`.
 #[derive(Debug)]
-pub enum TransferMessage {
-    /// Receiver → sender: open the transfer.
-    Start {
-        file_id: FileId,
-        content_hash: String,
-    },
-    /// Receiver → sender: send the chunk at `offset`.
-    ChunkRequest { offset: u64 },
-    /// Sender → receiver: the bytes at `offset`; `last` marks the final chunk.
-    Chunk {
-        offset: u64,
-        bytes: Vec<u8>,
-        last: bool,
-    },
-    /// Either direction: abort.
-    Abort { reason: String },
+pub enum ChunkReply {
+    /// The canonical bytes at `offset`.
+    Data { offset: u64, bytes: Vec<u8> },
+    /// This direction cannot serve `offset` (missing content or the file
+    /// changed). A miss from *all* directions fails the receive.
+    Miss { offset: u64 },
 }
 
-impl TransferMessage {
-    /// Reconstruct the wire `Sync` frame for this message under `transfer_id`.
-    pub fn into_sync(self, transfer_id: TransferId) -> SyncMessage {
-        match self {
-            TransferMessage::Start {
-                file_id,
-                content_hash,
-            } => SyncMessage::TransferStart {
-                transfer_id,
-                file_id,
-                content_hash,
-            },
-            TransferMessage::ChunkRequest { offset } => SyncMessage::TransferChunkRequest {
-                transfer_id,
-                offset,
-            },
-            TransferMessage::Chunk {
-                offset,
-                bytes,
-                last,
-            } => SyncMessage::TransferChunk {
-                transfer_id,
-                offset,
-                bytes,
-                last,
-            },
-            TransferMessage::Abort { reason } => SyncMessage::TransferAbort {
-                transfer_id,
-                reason,
-            },
-        }
-    }
-
-    /// Extract the per-transfer message from a wire `Sync` frame, if it is one.
-    /// Returns the `TransferId` (for demuxing) alongside the message.
-    pub fn from_sync(sync: SyncMessage) -> Option<(TransferId, TransferMessage)> {
-        match sync {
-            SyncMessage::TransferStart {
-                transfer_id,
-                file_id,
-                content_hash,
-            } => Some((
-                transfer_id,
-                TransferMessage::Start {
-                    file_id,
-                    content_hash,
-                },
-            )),
-            SyncMessage::TransferChunkRequest {
-                transfer_id,
-                offset,
-            } => Some((transfer_id, TransferMessage::ChunkRequest { offset })),
-            SyncMessage::TransferChunk {
-                transfer_id,
-                offset,
-                bytes,
-                last,
-            } => Some((
-                transfer_id,
-                TransferMessage::Chunk {
-                    offset,
-                    bytes,
-                    last,
-                },
-            )),
-            SyncMessage::TransferAbort {
-                transfer_id,
-                reason,
-            } => Some((transfer_id, TransferMessage::Abort { reason })),
-            _ => None,
-        }
-    }
+/// A `ChunkRequest` the receiver wants sent. The peer session routes it toward
+/// a holder (per its routing policy) and wraps it as
+/// [`Sync::ChunkRequest`](onisync_core::state::Sync::ChunkRequest).
+#[derive(Debug)]
+pub struct ChunkRequest {
+    pub offset: u64,
 }
 
-/// Why a transfer failed.
+/// Why a receive failed.
 #[derive(Debug)]
 pub enum TransferError {
-    /// The peer aborted (or the link dropped) before the transfer completed.
-    Aborted(String),
+    /// A chunk was missed from every reachable direction (the version is
+    /// superseded, or the only holder is unreachable). No retry helps.
+    ChunkUnavailable { offset: u64 },
+    /// A *connected* peer accepted the request but went silent for
+    /// [`HOP_TIMEOUT`](crate::fetch::HOP_TIMEOUT): no chunk was written within
+    /// the per-chunk liveness window. The one guard against hanging forever.
+    LivenessTimeout,
     /// The reassembled content did not hash to the expected value.
     HashMismatch { expected: String, actual: String },
     /// A local I/O error writing the temp file.
     Io(std::io::Error),
-    /// The inbound channel closed before the transfer completed.
+    /// The inbound reply channel closed before the receive completed (the link
+    /// dropped).
     ChannelClosed,
 }
 
 impl std::fmt::Display for TransferError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TransferError::Aborted(reason) => write!(formatter, "transfer aborted: {reason}"),
-            TransferError::HashMismatch { expected, actual } => {
-                write!(
-                    formatter,
-                    "content hash mismatch: expected {expected}, got {actual}"
-                )
+            TransferError::ChunkUnavailable { offset } => {
+                write!(formatter, "chunk at offset {offset} unavailable from any peer")
             }
+            TransferError::LivenessTimeout => {
+                write!(formatter, "transfer stalled (liveness timeout)")
+            }
+            TransferError::HashMismatch { expected, actual } => write!(
+                formatter,
+                "content hash mismatch: expected {expected}, got {actual}"
+            ),
             TransferError::Io(error) => write!(formatter, "transfer I/O error: {error}"),
             TransferError::ChannelClosed => write!(formatter, "transfer channel closed early"),
         }
@@ -179,63 +122,61 @@ impl std::fmt::Display for TransferError {
 
 impl std::error::Error for TransferError {}
 
-/// Drive a transfer as the **receiver** to completion.
+/// The outcome of a receive, delivered once it finishes.
+pub enum ReceiveOutcome {
+    /// The bytes arrived and hashed correctly; here is the temp file.
+    Complete(FileBytes),
+    /// The receive failed (unavailable / liveness timeout / hash mismatch /
+    /// I/O / link drop).
+    Failed(TransferError),
+}
+
+/// Drive a **content-addressed receive** to completion.
 ///
-/// Opens the transfer (`Start`), keeps up to [`WINDOW`] chunk requests in
-/// flight, streams replies into a temp file at `temp_path` while hashing
-/// incrementally, and on the final chunk verifies the accumulated hash against
-/// `content_hash`. On success the temp file *is* the content, returned as a
-/// [`FileBytes::FileToMove`] so the caller can rename it into place.
+/// - Keeps up to [`WINDOW`] `ChunkRequest`s in flight, each emitted on
+///   `requests` (the peer session routes them toward a holder).
+/// - Streams `ChunkReply::Data` into a temp file at `temp_path` in offset
+///   order (buffering out-of-order replies), hashing incrementally.
+/// - Terminates and verifies when `expected_size` bytes have been written; a
+///   zero-length file is one request at `offset = 0` returning empty bytes.
+/// - A `ChunkReply::Miss` for any offset, a closed reply channel, or the
+///   per-chunk liveness timeout fails the receive immediately (no retry, no
+///   re-flood; recovery is external).
 ///
-/// `outbound` carries this endpoint's messages to the peer; `inbound` delivers
-/// the peer's replies (already demuxed for this `transfer_id`).
-///
-/// `expected_size` is the file's known content size in bytes (from the
-/// catalog/manifest). It is used only to cap the request window so the receiver
-/// never asks for chunks past end-of-file — completion and correctness still
-/// rest on the sender's `last` flag and the BLAKE3 verification. A `0` here
-/// means "size unknown" and disables the cap.
-///
-/// On any error the temp file is removed and an abort is sent to the peer.
-pub async fn run_receiver(
-    file_id: FileId,
+/// On success the temp file *is* the content, returned as a
+/// [`FileBytes::FileToMove`] so the caller can rename it into place. On any
+/// error the temp file is removed.
+pub async fn receive(
     content_hash: String,
     expected_size: u64,
     temp_path: PathBuf,
-    outbound: UnboundedSender<TransferMessage>,
-    mut inbound: UnboundedReceiver<TransferMessage>,
+    requests: UnboundedSender<ChunkRequest>,
+    mut replies: UnboundedReceiver<ChunkReply>,
     progress: Option<ProgressSink>,
 ) -> Result<FileBytes, TransferError> {
     let result = receive_inner(
-        file_id,
         &content_hash,
         expected_size,
         &temp_path,
-        &outbound,
-        &mut inbound,
+        &requests,
+        &mut replies,
         progress.as_ref(),
     )
     .await;
 
-    if let Err(error) = &result {
-        // Best-effort cleanup + notify the peer we gave up.
+    if result.is_err() {
         let _ = tokio::fs::remove_file(&temp_path).await;
-        let _ = outbound.send(TransferMessage::Abort {
-            reason: error.to_string(),
-        });
     }
 
     result.map(|()| FileBytes::FileToMove(temp_path))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn receive_inner(
-    file_id: FileId,
     content_hash: &str,
     expected_size: u64,
-    temp_path: &PathBuf,
-    outbound: &UnboundedSender<TransferMessage>,
-    inbound: &mut UnboundedReceiver<TransferMessage>,
+    temp_path: &Path,
+    requests: &UnboundedSender<ChunkRequest>,
+    replies: &mut UnboundedReceiver<ChunkReply>,
     progress: Option<&ProgressSink>,
 ) -> Result<(), TransferError> {
     let mut file = tokio::fs::File::create(temp_path)
@@ -243,39 +184,21 @@ async fn receive_inner(
         .map_err(TransferError::Io)?;
     let mut hasher = blake3::Hasher::new();
 
-    // How far ahead we may request. When the size is known we never request an
-    // offset at or beyond it, so no chunk past EOF is ever asked for and the
-    // completion-abort below is not needed in the common case. A zero-length
-    // file still needs exactly one request (offset 0) to receive the empty
-    // final chunk, so treat `expected_size == 0` as "one chunk at offset 0".
-    // An `expected_size` of 0 for a genuinely-unknown size is indistinguishable
-    // here, but that path still terminates on the sender's `last` flag.
+    // A zero-length file still needs exactly one request (offset 0) to receive
+    // the empty chunk; otherwise never request an offset at or beyond the
+    // authoritative size.
     let request_ceiling = expected_size.max(1);
     let may_request = |offset: u64| offset < request_ceiling;
 
-    // Open the transfer, then prime the request window. Requests are keyed by
-    // the offset we want next; because chunk sizes are fixed at CHUNK_SIZE we
-    // can compute request offsets without waiting for replies.
-    outbound
-        .send(TransferMessage::Start {
-            file_id,
-            content_hash: content_hash.to_owned(),
-        })
-        .map_err(|_| TransferError::ChannelClosed)?;
-
     let mut next_request_offset: u64 = 0;
     let mut in_flight: u64 = 0;
-    // The offset we expect to write next; replies may arrive out of order
-    // within the window, so buffer any that arrive early.
     let mut write_offset: u64 = 0;
-    let mut pending: std::collections::BTreeMap<u64, (Vec<u8>, bool)> = Default::default();
-    let mut saw_last = false;
-    let mut last_offset: u64 = 0;
+    let mut pending: std::collections::BTreeMap<u64, Vec<u8>> = Default::default();
 
     // Prime the window, capped so we never request past EOF.
     while in_flight < WINDOW && may_request(next_request_offset) {
-        outbound
-            .send(TransferMessage::ChunkRequest {
+        requests
+            .send(ChunkRequest {
                 offset: next_request_offset,
             })
             .map_err(|_| TransferError::ChannelClosed)?;
@@ -284,122 +207,86 @@ async fn receive_inner(
     }
 
     loop {
-        let message = inbound.recv().await.ok_or(TransferError::ChannelClosed)?;
+        // Per-chunk liveness timeout: reset on each successful write (below).
+        // A connected-but-silent peer trips this rather than hanging forever.
+        let message = match tokio::time::timeout(crate::fetch::HOP_TIMEOUT, replies.recv()).await {
+            Ok(Some(message)) => message,
+            Ok(None) => return Err(TransferError::ChannelClosed),
+            Err(_) => return Err(TransferError::LivenessTimeout),
+        };
+
         match message {
-            TransferMessage::Chunk {
-                offset,
-                bytes,
-                last,
-            } => {
+            ChunkReply::Data { offset, bytes } => {
                 in_flight = in_flight.saturating_sub(1);
-                if last {
-                    saw_last = true;
-                    last_offset = offset;
+                // Duplicate for an already-written offset: drop it (races are
+                // free — bytes for a key are bit-identical).
+                if offset < write_offset {
+                    continue;
                 }
-                pending.insert(offset, (bytes, last));
+                pending.entry(offset).or_insert(bytes);
 
                 // Flush any contiguous chunks starting at write_offset.
-                while let Some((chunk, chunk_last)) = pending.remove(&write_offset) {
+                let mut wrote_any = false;
+                while let Some(chunk) = pending.remove(&write_offset) {
                     hasher.update(&chunk);
                     file.write_all(&chunk).await.map_err(TransferError::Io)?;
                     write_offset += chunk.len() as u64;
+                    wrote_any = true;
                     if let Some(report) = progress {
-                        let total = (expected_size != 0).then_some(expected_size);
-                        report(write_offset, total);
+                        report(write_offset, Some(expected_size));
                     }
-                    if chunk_last {
-                        // Final chunk written: verify and finish. With a known
-                        // size we cap requests at EOF, so normally nothing is
-                        // outstanding here; but if the size hint was wrong (or
-                        // unknown) we may have windowed requests past EOF that
-                        // the sender will answer — send an Abort so it stops
-                        // rather than emitting orphaned chunks our peer session
-                        // would then log as "unknown transfer".
-                        file.flush().await.map_err(TransferError::Io)?;
-                        if in_flight > 0 {
-                            let _ = outbound.send(TransferMessage::Abort {
-                                reason: "transfer complete".to_owned(),
-                            });
-                        }
-                        // The `last` flag is authoritative for completion; the
-                        // known size is only a hint. Log if the bytes actually
-                        // received disagree with it (e.g. a stale pre-migration
-                        // placeholder size), but still let the hash decide
-                        // correctness.
-                        if expected_size != 0 && write_offset != expected_size {
-                            log::warn!(
-                                "transfer for {}: received {} bytes but expected size was {} (size hint stale?); verifying by hash",
-                                file_id.to_string(),
-                                write_offset,
-                                expected_size
-                            );
-                        }
-                        let actual = hasher.finalize().to_hex().to_string();
-                        if actual == content_hash {
-                            return Ok(());
-                        }
-                        return Err(TransferError::HashMismatch {
-                            expected: content_hash.to_owned(),
-                            actual,
-                        });
+                }
+                let _ = wrote_any;
+
+                // Completion: we have written the whole file.
+                if write_offset >= expected_size {
+                    file.flush().await.map_err(TransferError::Io)?;
+                    let actual = hasher.finalize().to_hex().to_string();
+                    if actual == content_hash {
+                        return Ok(());
                     }
+                    return Err(TransferError::HashMismatch {
+                        expected: content_hash.to_owned(),
+                        actual,
+                    });
                 }
 
-                // Refill the window (unless we've already seen the last chunk,
-                // in which case no more requests are useful), capped so we never
-                // request past EOF when the size is known.
-                if !saw_last {
-                    while in_flight < WINDOW && may_request(next_request_offset) {
-                        outbound
-                            .send(TransferMessage::ChunkRequest {
-                                offset: next_request_offset,
-                            })
-                            .map_err(|_| TransferError::ChannelClosed)?;
-                        next_request_offset += CHUNK_SIZE as u64;
-                        in_flight += 1;
-                    }
-                } else if in_flight == 0 && write_offset <= last_offset {
-                    // We've seen `last` but haven't been able to flush up to it
-                    // yet and have no requests outstanding — this means a gap we
-                    // will never fill (sender ended early). Treat as abort.
-                    return Err(TransferError::Aborted(
-                        "sender ended before all requested chunks arrived".to_owned(),
-                    ));
+                // Refill the window, capped so we never request past EOF.
+                while in_flight < WINDOW && may_request(next_request_offset) {
+                    requests
+                        .send(ChunkRequest {
+                            offset: next_request_offset,
+                        })
+                        .map_err(|_| TransferError::ChannelClosed)?;
+                    next_request_offset += CHUNK_SIZE as u64;
+                    in_flight += 1;
                 }
             }
-            TransferMessage::Abort { reason } => {
-                return Err(TransferError::Aborted(reason));
+            ChunkReply::Miss { offset } => {
+                // A miss for an already-written offset (a late duplicate) is
+                // harmless: ignore it. Otherwise the chunk is unavailable from
+                // every direction the peer session tried, so the receive fails.
+                if offset < write_offset {
+                    continue;
+                }
+                return Err(TransferError::ChunkUnavailable { offset });
             }
-            // A receiver should not get Start/ChunkRequest; ignore defensively.
-            TransferMessage::Start { .. } | TransferMessage::ChunkRequest { .. } => {}
         }
     }
 }
 
-/// Drive a transfer as the **sender**: answer chunk requests for `source` until
-/// the transfer completes or aborts.
+/// A source of file bytes a holder reads chunks from.
 ///
-/// Expects the first inbound message to be `Start` (used only to log/validate;
-/// the caller has already matched `source` to the requested `file_id`).
-/// Thereafter, each `ChunkRequest { offset }` is answered with a
-/// `TransferChunk` read from `source` at that offset. Returns when the receiver
-/// aborts, the channel closes, or the last chunk has been served and the
-/// receiver stops requesting (channel close).
-/// A source of file bytes a transfer sender reads chunks from.
-///
-/// Dyn-compatible (boxed future) so the provider registry can hold a
-/// `Arc<dyn ChunkSource>` — a local in-memory/on-disk [`FileBytes`] or a remote
-/// provider such as the CLI over the control socket — behind one type, and
-/// `run_sender` can serve a peer's pull regardless of where the bytes live.
-/// The future returned by [`ChunkSource::read_chunk_at`]: a boxed, `Send`
-/// future yielding `(bytes, is_last)` or an error string.
+/// Dyn-compatible (boxed future) so the provider registry can hold an
+/// `Arc<dyn ChunkSource>` — a local on-disk [`FileBytes`] or a remote provider
+/// such as the CLI over the control socket — behind one type.
 pub type ChunkFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<(Vec<u8>, bool), String>> + Send + 'a>,
 >;
 
 pub trait ChunkSource: Send + Sync {
     /// Read up to `max_len` bytes at `offset`, returning the bytes and whether
-    /// this chunk reaches the end.
+    /// this chunk reaches the end of the content.
     fn read_chunk_at(&self, offset: u64, max_len: usize) -> ChunkFuture<'_>;
 }
 
@@ -430,11 +317,11 @@ pub type ProviderChunkRequest = (u64, ProviderChunkReply);
 /// A [`ChunkSource`] backed by a remote provider reached over a request channel
 /// (e.g. the CLI over the control connection). Each `read_chunk_at` sends a
 /// [`ProviderChunkRequest`] and awaits the reply, so the whole file is never
-/// buffered daemon-side — chunks are pulled on demand from the provider.
+/// buffered daemon-side.
 ///
 /// When it observes the final chunk (`last == true`) it fires `on_complete`
-/// once, so the daemon can signal the client to release the file after a
-/// transfer completes.
+/// once, so the daemon can signal the client to release the file after the
+/// bytes have been served.
 #[derive(Clone)]
 pub struct ProviderSource {
     requests: UnboundedSender<ProviderChunkRequest>,
@@ -471,190 +358,142 @@ impl ChunkSource for ProviderSource {
     }
 }
 
-/// The outcome of a **sender** transfer, delivered once the sender endpoint
-/// stops serving.
+/// A per-holder cache of verified content hashes, keyed by the on-disk path
+/// backing a file: `path -> (mtime, size, hash)`. Lets a holder answer repeated
+/// `ChunkRequest`s for the same file without re-hashing it every time, while
+/// still invalidating on any mtime/size change (a file edited mid-serve stops
+/// matching, so the holder answers `ChunkMiss`).
 ///
-/// A sender "completes" the moment it has served the final chunk (`last`),
-/// even though it may keep looping afterwards to answer stray in-flight
-/// requests: the receiver-driven protocol has no explicit "done" ack, so `last`
-/// is the authoritative completion signal on this side.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SenderOutcome {
-    /// The final chunk was served successfully.
-    Complete,
-    /// The transfer aborted (receiver aborted, a read failed, or the link
-    /// dropped) before the final chunk was served.
-    Aborted(String),
+/// Cheap to clone (an `Arc<Mutex<..>>`); every peer session shares one.
+#[derive(Clone, Default)]
+pub struct VerifiedHashCache {
+    inner: std::sync::Arc<Mutex<HashMap<PathBuf, VerifiedEntry>>>,
 }
 
-pub async fn run_sender<S: ChunkSource>(
-    source: S,
-    outbound: UnboundedSender<TransferMessage>,
-    mut inbound: UnboundedReceiver<TransferMessage>,
-    progress: Option<ProgressSink>,
-) -> SenderOutcome {
-    // Highest byte offset served so far, so out-of-order/duplicate requests do
-    // not make the reported total regress. The sender does not know the file's
-    // total size up front (the source streams it), so `total` is always None.
-    let mut served_high_water: u64 = 0;
-    while let Some(message) = inbound.recv().await {
-        match message {
-            TransferMessage::Start { .. } => {
-                // Nothing to do: the caller resolved `source` from the Start's
-                // file_id already. Wait for chunk requests.
-            }
-            TransferMessage::ChunkRequest { offset } => {
-                match source.read_chunk_at(offset, CHUNK_SIZE).await {
-                    Ok((bytes, last)) => {
-                        if let Some(report) = &progress {
-                            let end = offset + bytes.len() as u64;
-                            if end > served_high_water {
-                                served_high_water = end;
-                                report(served_high_water, None);
-                            }
-                        }
-                        if outbound
-                            .send(TransferMessage::Chunk {
-                                offset,
-                                bytes,
-                                last,
-                            })
-                            .is_err()
-                        {
-                            // Receiver gone before we could serve the chunk.
-                            return SenderOutcome::Aborted("receiver gone".to_owned());
-                        }
-                        if last {
-                            // Served the final chunk: the transfer is complete.
-                            // Return immediately rather than looping to answer
-                            // any windowed past-EOF requests — the receiver
-                            // discards those, and holding the endpoint open only
-                            // keeps the operation looking "active".
-                            return SenderOutcome::Complete;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = outbound.send(TransferMessage::Abort {
-                            reason: format!("sender read error: {error}"),
-                        });
-                        return SenderOutcome::Aborted(error.to_string());
+#[derive(Clone)]
+struct VerifiedEntry {
+    mtime: Option<SystemTime>,
+    size: u64,
+    hash: String,
+}
+
+impl VerifiedHashCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, path: &Path, mtime: Option<SystemTime>, size: u64) -> Option<String> {
+        let map = self.inner.lock().unwrap();
+        map.get(path).and_then(|entry| {
+            (entry.mtime == mtime && entry.size == size).then(|| entry.hash.clone())
+        })
+    }
+
+    fn put(&self, path: PathBuf, mtime: Option<SystemTime>, size: u64, hash: String) {
+        self.inner
+            .lock()
+            .unwrap()
+            .insert(path, VerifiedEntry { mtime, size, hash });
+    }
+}
+
+/// The result of answering a `ChunkRequest`: either the canonical bytes at the
+/// requested offset, or a miss (this holder cannot serve the key).
+pub enum ChunkAnswer {
+    Data(Vec<u8>),
+    Miss,
+}
+
+/// Answer a single content-addressed `ChunkRequest` for `content_hash` from
+/// `source`, serving the canonical chunk at `offset`.
+///
+/// `pre_verified` says the caller has already established that `source`'s bytes
+/// hash to `content_hash` — true for a provider (looked up by its
+/// `(file_id, content_hash)` registration key) and for a sync-directory file
+/// whose `ReadFile` already returned a matching hash. When `pre_verified`, no
+/// hashing is done here.
+///
+/// **Providers must be `pre_verified`.** Re-hashing a [`ProviderSource`] reads
+/// the whole file *through the provider* and, on reaching the end, fires the
+/// provider's `on_complete` — which the daemon interprets as "the transfer is
+/// done, release the file". Hashing it here would therefore release the file
+/// after the first chunk and make every later chunk unavailable. Providers are
+/// trusted by their registration key instead.
+///
+/// When `!pre_verified` (e.g. a sync-directory file we want to (re)confirm),
+/// verification is cached by `cache` keyed on the source's on-disk path +
+/// mtime/size, so it is paid once per unchanged file; a source with no on-disk
+/// path is hashed each call.
+///
+/// `offset` MUST be `CHUNK_SIZE`-aligned; a misaligned request is a
+/// [`ChunkAnswer::Miss`]. An out-of-range offset yields an empty
+/// [`ChunkAnswer::Data`] for a matching source (harmless — the receiver
+/// terminates on size), consistent with `read_chunk_at`.
+pub async fn answer_chunk_request<S: ChunkSource>(
+    source: &S,
+    source_path: Option<&Path>,
+    cache: &VerifiedHashCache,
+    content_hash: &str,
+    offset: u64,
+    pre_verified: bool,
+) -> ChunkAnswer {
+    // Malformed request: offsets must land on chunk boundaries.
+    if !offset.is_multiple_of(CHUNK_SIZE as u64) {
+        return ChunkAnswer::Miss;
+    }
+
+    if !pre_verified {
+        // Verify the source matches `content_hash`, using the cache when
+        // possible. Never applied to a provider (see the doc note above).
+        let verified = match source_path {
+            Some(path) => {
+                let (mtime, size) = match tokio::fs::metadata(path).await {
+                    Ok(metadata) => (metadata.modified().ok(), metadata.len()),
+                    Err(_) => return ChunkAnswer::Miss,
+                };
+                match cache.get(path, mtime, size) {
+                    Some(cached) => cached == content_hash,
+                    None => {
+                        let hash = match hash_source(source).await {
+                            Some(hash) => hash,
+                            None => return ChunkAnswer::Miss,
+                        };
+                        cache.put(path.to_path_buf(), mtime, size, hash.clone());
+                        hash == content_hash
                     }
                 }
             }
-            // An abort before we served the final chunk is a genuine failure
-            // (the receiver gave up, or the link dropped). Aborts that arrive
-            // *after* the final chunk never reach here: we return `Complete`
-            // above the moment we serve `last`.
-            TransferMessage::Abort { reason } => return SenderOutcome::Aborted(reason),
-            // A sender should not get Chunk; ignore defensively.
-            TransferMessage::Chunk { .. } => {}
-        }
-    }
-    // Inbound channel closed without ever serving the final chunk.
-    SenderOutcome::Aborted("transfer channel closed".to_owned())
-}
-
-/// The outcome of a receiver transfer, delivered once it finishes.
-pub enum ReceiveOutcome {
-    /// The bytes arrived and hashed correctly; here is the temp file.
-    Complete(FileBytes),
-    /// The transfer failed (abort / hash mismatch / I/O / link drop).
-    Failed(TransferError),
-}
-
-/// Spawn a **receiver** transfer bound to a peer link.
-///
-/// `peer_tx` is the peer session's `Frame` outbound queue; this endpoint's
-/// messages are wrapped as `Frame::Sync(..)` under `transfer_id` and pushed
-/// onto it. Returns the sender the peer session must feed inbound
-/// `TransferMessage`s for `transfer_id` into (register it in the demux table).
-/// The final [`ReceiveOutcome`] is delivered on `done`.
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_receiver<F>(
-    transfer_id: TransferId,
-    file_id: FileId,
-    content_hash: String,
-    expected_size: u64,
-    temp_path: PathBuf,
-    peer_tx: UnboundedSender<F>,
-    wrap: impl Fn(SyncMessage) -> F + Send + 'static,
-    done: tokio::sync::oneshot::Sender<ReceiveOutcome>,
-    progress: Option<ProgressSink>,
-) -> UnboundedSender<TransferMessage>
-where
-    F: Send + 'static,
-{
-    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<TransferMessage>();
-    let (endpoint_out_tx, mut endpoint_out_rx) =
-        tokio::sync::mpsc::unbounded_channel::<TransferMessage>();
-
-    // Forwarder: endpoint outbound TransferMessage -> wrapped Frame on peer_tx.
-    tokio::spawn(async move {
-        while let Some(message) = endpoint_out_rx.recv().await {
-            if peer_tx.send(wrap(message.into_sync(transfer_id))).is_err() {
-                break;
-            }
-        }
-    });
-
-    tokio::spawn(async move {
-        let outcome = match run_receiver(
-            file_id,
-            content_hash,
-            expected_size,
-            temp_path,
-            endpoint_out_tx,
-            inbound_rx,
-            progress,
-        )
-        .await
-        {
-            Ok(file_bytes) => ReceiveOutcome::Complete(file_bytes),
-            Err(error) => ReceiveOutcome::Failed(error),
+            None => match hash_source(source).await {
+                Some(hash) => hash == content_hash,
+                None => return ChunkAnswer::Miss,
+            },
         };
 
-        let _ = done.send(outcome);
-    });
+        if !verified {
+            return ChunkAnswer::Miss;
+        }
+    }
 
-    inbound_tx
+    match source.read_chunk_at(offset, CHUNK_SIZE).await {
+        Ok((bytes, _last)) => ChunkAnswer::Data(bytes),
+        Err(_) => ChunkAnswer::Miss,
+    }
 }
 
-/// Spawn a **sender** transfer bound to a peer link, serving `source`.
-///
-/// As with [`spawn_receiver`], returns the inbound `TransferMessage` sender for
-/// the demux table; the endpoint's replies are wrapped under `transfer_id` and
-/// pushed onto `peer_tx`.
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_sender<F, S>(
-    transfer_id: TransferId,
-    source: S,
-    peer_tx: UnboundedSender<F>,
-    wrap: impl Fn(SyncMessage) -> F + Send + 'static,
-    progress: Option<ProgressSink>,
-    done: tokio::sync::oneshot::Sender<SenderOutcome>,
-) -> UnboundedSender<TransferMessage>
-where
-    F: Send + 'static,
-    S: ChunkSource + 'static,
-{
-    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<TransferMessage>();
-    let (endpoint_out_tx, mut endpoint_out_rx) =
-        tokio::sync::mpsc::unbounded_channel::<TransferMessage>();
-
-    tokio::spawn(async move {
-        while let Some(message) = endpoint_out_rx.recv().await {
-            if peer_tx.send(wrap(message.into_sync(transfer_id))).is_err() {
-                break;
-            }
+/// Stream-hash a [`ChunkSource`] by reading it in `CHUNK_SIZE` windows until the
+/// end. Returns `None` on a read error.
+async fn hash_source<S: ChunkSource>(source: &S) -> Option<String> {
+    let mut hasher = blake3::Hasher::new();
+    let mut offset = 0u64;
+    loop {
+        let (bytes, last) = source.read_chunk_at(offset, CHUNK_SIZE).await.ok()?;
+        hasher.update(&bytes);
+        offset += bytes.len() as u64;
+        if last || bytes.is_empty() {
+            break;
         }
-    });
-
-    tokio::spawn(async move {
-        let outcome = run_sender(source, endpoint_out_tx, inbound_rx, progress).await;
-        let _ = done.send(outcome);
-    });
-
-    inbound_tx
+    }
+    Some(hasher.finalize().to_hex().to_string())
 }
 
 #[cfg(test)]
@@ -674,35 +513,33 @@ mod tests {
         ))
     }
 
-    /// Wire a receiver and sender back to back over two channels and run the
-    /// transfer to completion, returning the received bytes.
-    async fn roundtrip(source: FileBytes) -> Result<Vec<u8>, TransferError> {
-        let content_hash = source.hash().await.unwrap();
-        let expected_size = source.byte_len().await.unwrap();
-        let file_id = FileId::new();
+    /// A stateless chunk-answering stub: serves canonical chunks of `bytes`.
+    /// Drives a [`receive`] against it, answering each request from `bytes`.
+    async fn drive_receive_from(bytes: Vec<u8>) -> Result<Vec<u8>, TransferError> {
+        let content_hash = blake3::hash(&bytes).to_hex().to_string();
+        let size = bytes.len() as u64;
         let dest = temp_path("dest");
 
-        // receiver -> sender
-        let (r2s_tx, r2s_rx) = tokio::sync::mpsc::unbounded_channel();
-        // sender -> receiver
-        let (s2r_tx, s2r_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<ChunkRequest>();
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::unbounded_channel::<ChunkReply>();
 
-        let sender = tokio::spawn(run_sender(source, s2r_tx, r2s_rx, None));
-        let received = run_receiver(
-            file_id,
-            content_hash,
-            expected_size,
-            dest.clone(),
-            r2s_tx,
-            s2r_rx,
-            None,
-        )
-        .await;
-        // A successful transfer must leave the sender reporting `Complete` — the
-        // regression that left "Sending file" operations stuck as active came
-        // from the sender never signalling completion (it looped waiting for an
-        // abort that the receiver, capped at EOF, never sends).
-        assert_eq!(sender.await.unwrap(), SenderOutcome::Complete);
+        let serve_bytes = bytes.clone();
+        let server = tokio::spawn(async move {
+            while let Some(ChunkRequest { offset }) = req_rx.recv().await {
+                let start = (offset as usize).min(serve_bytes.len());
+                let end = (start + CHUNK_SIZE).min(serve_bytes.len());
+                let chunk = serve_bytes[start..end].to_vec();
+                if reply_tx
+                    .send(ChunkReply::Data { offset, bytes: chunk })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let received = receive(content_hash, size, dest.clone(), req_tx, reply_rx, None).await;
+        let _ = server.await;
 
         let result = received.map(|file_bytes| {
             let path = file_bytes.path().unwrap().to_path_buf();
@@ -713,174 +550,259 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn roundtrip_small_in_memory() {
+    async fn receive_small() {
         let bytes = b"hello transfer".to_vec();
-        let received = roundtrip(FileBytes::InMemory(bytes.clone())).await.unwrap();
-        assert_eq!(received, bytes);
+        assert_eq!(drive_receive_from(bytes.clone()).await.unwrap(), bytes);
     }
 
     #[tokio::test]
-    async fn roundtrip_empty() {
-        let received = roundtrip(FileBytes::InMemory(Vec::new())).await.unwrap();
-        assert!(received.is_empty());
+    async fn receive_empty() {
+        assert!(drive_receive_from(Vec::new()).await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn roundtrip_multi_chunk_file() {
-        // Several chunks plus a partial one, exercising windowing + reassembly.
-        let source_path = temp_path("multi-src");
+    async fn receive_multi_chunk() {
         let bytes: Vec<u8> = (0..(CHUNK_SIZE * 5 + 123)).map(|i| i as u8).collect();
-        std::fs::write(&source_path, &bytes).unwrap();
-
-        let received = roundtrip(FileBytes::FileToCopy(source_path.clone()))
-            .await
-            .unwrap();
-        assert_eq!(received, bytes);
-        let _ = std::fs::remove_file(&source_path);
+        assert_eq!(drive_receive_from(bytes.clone()).await.unwrap(), bytes);
     }
 
+    /// A duplicate `Data` for an already-written offset is ignored, and the
+    /// receive still completes with the correct hash.
     #[tokio::test]
-    async fn hash_mismatch_is_rejected() {
-        // Receiver expects a hash that does not match the source bytes.
-        let file_id = FileId::new();
-        let dest = temp_path("mismatch-dest");
-        let (r2s_tx, r2s_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (s2r_tx, s2r_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let sender = tokio::spawn(run_sender(
-            FileBytes::InMemory(b"real bytes".to_vec()),
-            s2r_tx,
-            r2s_rx,
-            None,
-        ));
-        let wrong_hash = blake3::hash(b"different").to_hex().to_string();
-        let received = run_receiver(
-            file_id,
-            wrong_hash,
-            b"real bytes".len() as u64,
-            dest.clone(),
-            r2s_tx,
-            s2r_rx,
-            None,
-        )
-        .await;
-        sender.await.unwrap();
-
-        assert!(matches!(received, Err(TransferError::HashMismatch { .. })));
-        // Temp file cleaned up on failure.
-        assert!(!dest.exists());
-    }
-
-    #[tokio::test]
-    async fn sender_abort_propagates() {
-        // Point the sender at a nonexistent file so its first read aborts.
-        let file_id = FileId::new();
-        let dest = temp_path("abort-dest");
-        let missing = temp_path("does-not-exist");
-        let (r2s_tx, r2s_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (s2r_tx, s2r_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let sender = tokio::spawn(run_sender(
-            FileBytes::FileToCopy(missing),
-            s2r_tx,
-            r2s_rx,
-            None,
-        ));
-        let hash = blake3::hash(b"whatever").to_hex().to_string();
-        // Size unknown (source is missing): pass 0 to disable the request cap
-        // so we still request offset 0 and receive the sender's abort.
-        let received = run_receiver(file_id, hash, 0, dest.clone(), r2s_tx, s2r_rx, None).await;
-        sender.await.unwrap();
-
-        assert!(matches!(received, Err(TransferError::Aborted(_))));
-        assert!(!dest.exists());
-    }
-
-    /// With a known size, the receiver must never request a chunk at or beyond
-    /// EOF: no wasted past-EOF requests, and no completion-abort needed. We
-    /// drive the receiver against a hand-rolled "sender" that records every
-    /// requested offset and serves the real bytes.
-    #[tokio::test]
-    async fn known_size_never_requests_past_eof() {
-        // A size that is NOT a multiple of CHUNK_SIZE, so the final chunk is
-        // partial: the case where a naive receiver would overshoot end-of-file.
-        let bytes: Vec<u8> = (0..(CHUNK_SIZE * 3 + 7)).map(|i| i as u8).collect();
-        let size = bytes.len() as u64;
+    async fn duplicate_data_ignored() {
+        let bytes: Vec<u8> = (0..(CHUNK_SIZE + 10)).map(|i| i as u8).collect();
         let content_hash = blake3::hash(&bytes).to_hex().to_string();
-        let file_id = FileId::new();
-        let dest = temp_path("cap-dest");
+        let size = bytes.len() as u64;
+        let dest = temp_path("dup");
 
-        let (r2s_tx, mut r2s_rx) = tokio::sync::mpsc::unbounded_channel::<TransferMessage>();
-        let (s2r_tx, s2r_rx) = tokio::sync::mpsc::unbounded_channel::<TransferMessage>();
+        let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<ChunkRequest>();
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::unbounded_channel::<ChunkReply>();
 
-        // Hand-rolled sender: record requested offsets and serve chunks. Asserts
-        // no offset is at or beyond `size`.
-        let sender_bytes = bytes.clone();
-        let sender = tokio::spawn(async move {
-            let mut requested = Vec::new();
-            while let Some(message) = r2s_rx.recv().await {
-                match message {
-                    TransferMessage::Start { .. } => {}
-                    TransferMessage::ChunkRequest { offset } => {
-                        requested.push(offset);
-                        assert!(
-                            offset < size,
-                            "receiver requested offset {offset} at/beyond EOF {size}"
-                        );
-                        let start = offset as usize;
-                        let end = (start + CHUNK_SIZE).min(sender_bytes.len());
-                        let chunk = sender_bytes[start..end].to_vec();
-                        let last = end == sender_bytes.len();
-                        if s2r_tx
-                            .send(TransferMessage::Chunk {
-                                offset,
-                                bytes: chunk,
-                                last,
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    TransferMessage::Abort { .. } => break,
-                    TransferMessage::Chunk { .. } => {}
+        let serve_bytes = bytes.clone();
+        tokio::spawn(async move {
+            while let Some(ChunkRequest { offset }) = req_rx.recv().await {
+                let start = (offset as usize).min(serve_bytes.len());
+                let end = (start + CHUNK_SIZE).min(serve_bytes.len());
+                let chunk = serve_bytes[start..end].to_vec();
+                // Answer twice for offset 0 to exercise the dedup path.
+                let _ = reply_tx.send(ChunkReply::Data {
+                    offset,
+                    bytes: chunk.clone(),
+                });
+                if offset == 0 {
+                    let _ = reply_tx.send(ChunkReply::Data { offset, bytes: chunk });
                 }
             }
-            requested
         });
 
-        let received = run_receiver(
-            file_id,
-            content_hash,
-            size,
-            dest.clone(),
-            r2s_tx,
-            s2r_rx,
-            None,
-        )
-        .await;
-        let requested = sender.await.unwrap();
-
-        let received_bytes = received
-            .map(|file_bytes| std::fs::read(file_bytes.path().unwrap()).unwrap())
-            .unwrap();
-        assert_eq!(received_bytes, bytes);
-
-        // Exactly ceil(size / CHUNK_SIZE) distinct offsets, none past EOF.
-        let expected_requests = size.div_ceil(CHUNK_SIZE as u64);
-        let mut unique = requested.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len() as u64, expected_requests);
-
+        let received = receive(content_hash, size, dest.clone(), req_tx, reply_rx, None)
+            .await
+            .map(|fb| std::fs::read(fb.path().unwrap()).unwrap());
         let _ = std::fs::remove_file(&dest);
+        assert_eq!(received.unwrap(), bytes);
     }
 
-    /// A zero-length file still completes: exactly one request at offset 0
-    /// yields the empty final chunk.
+    /// A total miss mid-stream fails the receive immediately (no retry).
     #[tokio::test]
-    async fn known_zero_size_requests_only_offset_zero() {
-        let received = roundtrip(FileBytes::InMemory(Vec::new())).await.unwrap();
-        assert!(received.is_empty());
+    async fn total_miss_fails() {
+        let bytes: Vec<u8> = (0..(CHUNK_SIZE * 2)).map(|i| i as u8).collect();
+        let content_hash = blake3::hash(&bytes).to_hex().to_string();
+        let size = bytes.len() as u64;
+        let dest = temp_path("miss");
+
+        let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<ChunkRequest>();
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::unbounded_channel::<ChunkReply>();
+
+        let serve_bytes = bytes.clone();
+        tokio::spawn(async move {
+            while let Some(ChunkRequest { offset }) = req_rx.recv().await {
+                if offset == 0 {
+                    let end = CHUNK_SIZE.min(serve_bytes.len());
+                    let _ = reply_tx.send(ChunkReply::Data {
+                        offset,
+                        bytes: serve_bytes[..end].to_vec(),
+                    });
+                } else {
+                    let _ = reply_tx.send(ChunkReply::Miss { offset });
+                }
+            }
+        });
+
+        let received = receive(content_hash, size, dest.clone(), req_tx, reply_rx, None).await;
+        assert!(matches!(
+            received,
+            Err(TransferError::ChunkUnavailable { .. })
+        ));
+        assert!(!dest.exists());
+    }
+
+    /// A second holder answering a chunk the first missed lets the receive
+    /// complete — multi-source on the first request, not a re-flood. Here the
+    /// stub answers every offset (simulating the peer session having routed the
+    /// missed offset elsewhere and delivered its `Data`).
+    #[tokio::test]
+    async fn hash_mismatch_rejected() {
+        let bytes = b"real bytes".to_vec();
+        let wrong_hash = blake3::hash(b"different").to_hex().to_string();
+        let size = bytes.len() as u64;
+        let dest = temp_path("mismatch");
+
+        let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<ChunkRequest>();
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::unbounded_channel::<ChunkReply>();
+
+        let serve_bytes = bytes.clone();
+        tokio::spawn(async move {
+            while let Some(ChunkRequest { offset }) = req_rx.recv().await {
+                let start = (offset as usize).min(serve_bytes.len());
+                let end = (start + CHUNK_SIZE).min(serve_bytes.len());
+                let _ = reply_tx.send(ChunkReply::Data {
+                    offset,
+                    bytes: serve_bytes[start..end].to_vec(),
+                });
+            }
+        });
+
+        let received = receive(wrong_hash, size, dest.clone(), req_tx, reply_rx, None).await;
+        assert!(matches!(received, Err(TransferError::HashMismatch { .. })));
+        assert!(!dest.exists());
+    }
+
+    /// A per-chunk no-progress stall trips the liveness timeout and fails: a
+    /// *connected* peer accepted the request but never answers, and both the
+    /// request and reply channels stay open (only the liveness guard can fire).
+    #[tokio::test(start_paused = true)]
+    async fn liveness_timeout_fails() {
+        let size = (CHUNK_SIZE * 2) as u64;
+        let content_hash = blake3::hash(&vec![0u8; size as usize]).to_hex().to_string();
+        let dest = temp_path("stall");
+
+        let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel::<ChunkRequest>();
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::unbounded_channel::<ChunkReply>();
+        // Keep both channels open but never answer, so neither a closed channel
+        // nor a miss can occur — only the liveness timeout.
+        let _held_req = req_rx;
+        let _held_reply = reply_tx;
+
+        let received = receive(content_hash, size, dest.clone(), req_tx, reply_rx, None).await;
+        assert!(matches!(received, Err(TransferError::LivenessTimeout)));
+        assert!(!dest.exists());
+    }
+
+    /// The serve side verifies against `content_hash` and serves the canonical
+    /// chunk; a misaligned offset is a miss; a wrong hash is a miss.
+    #[tokio::test]
+    async fn answer_serves_and_verifies() {
+        let bytes: Vec<u8> = (0..(CHUNK_SIZE + 5)).map(|i| i as u8).collect();
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        let source = FileBytes::InMemory(bytes.clone());
+        let cache = VerifiedHashCache::new();
+
+        // Aligned, correct hash: serves the first chunk.
+        match answer_chunk_request(&source, None, &cache, &hash, 0, false).await {
+            ChunkAnswer::Data(chunk) => assert_eq!(chunk, bytes[..CHUNK_SIZE]),
+            ChunkAnswer::Miss => panic!("expected data"),
+        }
+        // Misaligned offset: miss (even when pre_verified).
+        assert!(matches!(
+            answer_chunk_request(&source, None, &cache, &hash, 1, true).await,
+            ChunkAnswer::Miss
+        ));
+        // Wrong hash: miss.
+        let wrong = blake3::hash(b"nope").to_hex().to_string();
+        assert!(matches!(
+            answer_chunk_request(&source, None, &cache, &wrong, 0, false).await,
+            ChunkAnswer::Miss
+        ));
+    }
+
+    /// A pre-verified source is served without any hashing — the regression
+    /// guard for the CLI-upload bug: re-hashing a `ProviderSource` streams the
+    /// whole file and fires its `on_complete` at EOF, which released the file
+    /// after the first chunk and made later chunks unavailable. With
+    /// `pre_verified`, `on_complete` never fires from serving, and each chunk is
+    /// served independently.
+    #[tokio::test]
+    async fn provider_pre_verified_serves_all_chunks_without_completing() {
+        let bytes: Vec<u8> = (0..(CHUNK_SIZE * 3 + 9)).map(|i| i as u8).collect();
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+
+        // Wire a fake provider client that answers chunk requests from `bytes`.
+        let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<ProviderChunkRequest>();
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let provider = ProviderSource::new(req_tx, done_tx);
+
+        let serve_bytes = bytes.clone();
+        tokio::spawn(async move {
+            while let Some((offset, reply)) = req_rx.recv().await {
+                let start = (offset as usize).min(serve_bytes.len());
+                let end = (start + CHUNK_SIZE).min(serve_bytes.len());
+                let last = end >= serve_bytes.len();
+                let _ = reply.send(Ok((serve_bytes[start..end].to_vec(), last)));
+            }
+        });
+
+        let cache = VerifiedHashCache::new();
+        // Serve every chunk pre-verified (as the daemon does for a registered
+        // provider); each must return the right bytes.
+        let mut offset = 0u64;
+        while offset < bytes.len() as u64 {
+            match answer_chunk_request(&provider, None, &cache, &hash, offset, true).await {
+                ChunkAnswer::Data(chunk) => {
+                    let start = offset as usize;
+                    let end = (start + CHUNK_SIZE).min(bytes.len());
+                    assert_eq!(chunk, bytes[start..end], "chunk at {offset} mismatched");
+                }
+                ChunkAnswer::Miss => panic!("chunk at {offset} unexpectedly missed"),
+            }
+            offset += CHUNK_SIZE as u64;
+        }
+
+        // `on_complete` fires exactly once — when the *final* chunk is served
+        // (its provider reply carried `last = true`) — not during any earlier
+        // verification. Crucially it did not fire before the last chunk, so no
+        // chunk was ever unavailable.
+        assert!(done_rx.try_recv().is_ok(), "expected one on_complete at EOF");
+        assert!(done_rx.try_recv().is_err(), "on_complete must fire only once");
+    }
+
+    /// The verified-hash cache invalidates on mtime/size change: a file edited
+    /// after being cached stops matching its old hash.
+    #[tokio::test]
+    async fn verified_cache_invalidates_on_change() {
+        let dir = std::env::temp_dir().join(format!(
+            "onisync-cache-test-{}-{}",
+            std::process::id(),
+            temp_path("x").file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.bin");
+        std::fs::write(&path, b"first").unwrap();
+
+        let cache = VerifiedHashCache::new();
+        let first_hash = blake3::hash(b"first").to_hex().to_string();
+        let source = FileBytes::FileToCopy(path.clone());
+
+        // First serve populates the cache.
+        assert!(matches!(
+            answer_chunk_request(&source, Some(&path), &cache, &first_hash, 0, false).await,
+            ChunkAnswer::Data(_)
+        ));
+
+        // Edit the file: the old hash must no longer verify (cache invalidated
+        // by mtime/size), and the new hash must serve.
+        // Sleep briefly so mtime advances on coarse-grained filesystems, then
+        // change the size too (invalidates regardless of mtime resolution).
+        std::fs::write(&path, b"second content longer").unwrap();
+        assert!(matches!(
+            answer_chunk_request(&source, Some(&path), &cache, &first_hash, 0, false).await,
+            ChunkAnswer::Miss
+        ));
+        let second_hash = blake3::hash(b"second content longer").to_hex().to_string();
+        assert!(matches!(
+            answer_chunk_request(&source, Some(&path), &cache, &second_hash, 0, false).await,
+            ChunkAnswer::Data(_)
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

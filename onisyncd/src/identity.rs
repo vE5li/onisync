@@ -11,10 +11,19 @@ use serde::{Deserialize, Serialize};
 /// The handshake each peer sends to prove it controls the private key behind
 /// its advertised public key. The signature is made over the *other* peer's
 /// public key, so it cannot be replayed against a third party.
+///
+/// `protocol_version` is advisory metadata verified *after* the signature (it
+/// is not covered by the signature, which pins only the public key). It gates
+/// the wire protocol: a peer whose version differs from ours is rejected with
+/// [`HandshakeError::IncompatibleProtocol`]. Adding this field also changes the
+/// handshake wire shape, so an old peer (which never sent it) fails to
+/// deserialize a new peer's handshake at all — the desired fail-closed
+/// behaviour for the very first version gate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeMessage {
     pub public_key: String,
     pub signature: String,
+    pub protocol_version: u32,
 }
 
 /// Anything that can go wrong while building or verifying a handshake. Kept
@@ -28,6 +37,10 @@ pub enum HandshakeError {
     WrongSignatureLength { expected: usize, found: usize },
     InvalidPublicKey(ed25519_dalek::SignatureError),
     SignatureVerificationFailed,
+    /// The peer advertised a wire-protocol version different from ours. Since
+    /// all devices are updated together there is no compatibility range; a
+    /// mismatch is fail-closed.
+    IncompatibleProtocol { ours: u32, theirs: u32 },
 }
 
 impl std::fmt::Display for HandshakeError {
@@ -53,6 +66,10 @@ impl std::fmt::Display for HandshakeError {
             HandshakeError::SignatureVerificationFailed => {
                 write!(formatter, "signature verification failed")
             }
+            HandshakeError::IncompatibleProtocol { ours, theirs } => write!(
+                formatter,
+                "incompatible protocol version: ours is {ours}, peer's is {theirs}"
+            ),
         }
     }
 }
@@ -138,13 +155,17 @@ impl Identity {
         Ok(HandshakeMessage {
             public_key: self.public_key(),
             signature: BASE64.encode(signature.to_bytes()),
+            protocol_version: onisync_core::PROTOCOL_VERSION,
         })
     }
 
     /// Verify a handshake received from a peer. Confirms the peer signed *our*
-    /// public key with the private key matching their advertised public key.
+    /// public key with the private key matching their advertised public key,
+    /// and that its advertised `protocol_version` matches ours exactly.
     ///
-    /// On success returns the peer's verified public key (base64). Never
+    /// The version is checked *after* signature verification: it is advisory
+    /// metadata, not part of the signed payload, so it never weakens the auth
+    /// proof. On success returns the peer's verified public key (base64). Never
     /// panics on malformed input; every failure mode is a [`HandshakeError`].
     pub fn verify_handshake(&self, message: &HandshakeMessage) -> Result<String, HandshakeError> {
         let peer_public_key_bytes = BASE64
@@ -175,6 +196,14 @@ impl Identity {
         peer_verifying_key
             .verify(&our_public_key_bytes, &signature)
             .map_err(|_| HandshakeError::SignatureVerificationFailed)?;
+
+        // Version gate, after the auth proof: require exact equality.
+        if message.protocol_version != onisync_core::PROTOCOL_VERSION {
+            return Err(HandshakeError::IncompatibleProtocol {
+                ours: onisync_core::PROTOCOL_VERSION,
+                theirs: message.protocol_version,
+            });
+        }
 
         Ok(message.public_key.clone())
     }

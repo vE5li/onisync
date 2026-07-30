@@ -275,17 +275,8 @@ fn operation_kind_label(kind: &OperationKind) -> String {
             onisyncd::operations::Direction::Outbound => "Connected (outbound)".to_owned(),
             onisyncd::operations::Direction::Inbound => "Connected (inbound)".to_owned(),
         },
-        OperationKind::SendingFile { source, .. } => {
-            let source = match source {
-                onisyncd::operations::ServeSource::SyncDirectory => "sync dir",
-                onisyncd::operations::ServeSource::Provider => "provider",
-                onisyncd::operations::ServeSource::FetchCache => "fetch cache",
-            };
-            format!("Sending ({source})")
-        }
         OperationKind::ReceivingFile { .. } => "Receiving".to_owned(),
         OperationKind::Fetching { .. } => "Fetching".to_owned(),
-        OperationKind::RelayingFetch { .. } => "Relaying fetch".to_owned(),
         OperationKind::ReconcilingManifest { .. } => "Reconciling manifest".to_owned(),
         OperationKind::ReconcilingTags { .. } => "Reconciling tags".to_owned(),
         OperationKind::PlacingFile { .. } => "Placing file".to_owned(),
@@ -297,11 +288,9 @@ fn operation_peer(kind: &OperationKind) -> Option<&str> {
     match kind {
         OperationKind::ConnectingToPeer { peer_name, .. }
         | OperationKind::PeerConnected { peer_name, .. }
-        | OperationKind::SendingFile { peer_name, .. }
         | OperationKind::ReceivingFile { peer_name, .. }
         | OperationKind::ReconcilingManifest { peer_name }
         | OperationKind::ReconcilingTags { peer_name } => Some(peer_name),
-        OperationKind::RelayingFetch { from_peer, .. } => Some(from_peer),
         OperationKind::Fetching { .. } | OperationKind::PlacingFile { .. } => None,
     }
 }
@@ -309,10 +298,8 @@ fn operation_peer(kind: &OperationKind) -> Option<&str> {
 /// The file an operation concerns, if any (its id string).
 fn operation_file(kind: &OperationKind) -> Option<&str> {
     match kind {
-        OperationKind::SendingFile { file_id, .. }
-        | OperationKind::ReceivingFile { file_id, .. }
+        OperationKind::ReceivingFile { file_id, .. }
         | OperationKind::Fetching { file_id }
-        | OperationKind::RelayingFetch { file_id, .. }
         | OperationKind::PlacingFile { file_id } => Some(file_id),
         OperationKind::ConnectingToPeer { .. }
         | OperationKind::PeerConnected { .. }

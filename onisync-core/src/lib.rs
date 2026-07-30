@@ -3,6 +3,17 @@ use rusqlite::types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// The peer wire-protocol version. Exchanged in the handshake
+/// (`identity::HandshakeMessage::protocol_version`) and required to match
+/// **exactly** between two peers before a session is established.
+///
+/// Bump this on any breaking change to the `Frame`/`Sync`/`Change` wire types
+/// **or** to the chunk-transfer contract (chunk boundaries / `CHUNK_SIZE`,
+/// which every node derives identically). Since all devices are operated by the
+/// same user and updated together, there is no compatibility range — a mismatch
+/// is fail-closed.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 pub mod tag {
     use std::collections::HashMap;
 
@@ -73,7 +84,7 @@ pub mod state {
     use serde::{Deserialize, Serialize};
 
     use crate::tag::{MetadataFormat, MetadataValues};
-    use crate::{FileId, LogicalPath, RequestId, TagId, TransferId};
+    use crate::{FileId, LogicalPath, TagId};
 
     pub enum ChangeOrigin {
         Local { directory_path: PathBuf },
@@ -92,7 +103,8 @@ pub mod state {
     pub enum Change {
         /// `FileMetadataAdded` / `FileMetadataChanged` are named to make it
         /// explicit that they are **metadata-only announcements** carrying no
-        /// file bytes — a receiver pulls the content over a separate transfer.
+        /// file bytes — a receiver pulls the content over a content-addressed
+        /// chunk receive.
         FileMetadataAdded {
             file_id: FileId,
             /// The file's logical identity. Receivers store this in the main
@@ -382,98 +394,80 @@ pub mod state {
     ///    unprompted.
     /// 2. The receiver compares each entry against its local `file_versions`
     ///    table. For entries where it determines the peer has bytes it doesn't,
-    ///    it opens a pull transfer (`TransferStart`, keyed by a fresh
-    ///    `TransferId`) against that peer to fetch the bytes. There is no
-    ///    request/response step: bytes always move over the pull transfer
-    ///    protocol below, and `Change::FileMetadataAdded`/`FileMetadataChanged`
-    ///    are metadata-only announcements that carry no content.
+    ///    it opens a **content-addressed receive** for `(file_id,
+    ///    content_hash)` and pulls each chunk with a [`Sync::ChunkRequest`].
+    ///    There is no request/response session: bytes always move over the
+    ///    content-addressed chunk protocol below, and
+    ///    `Change::FileMetadataAdded`/`FileMetadataChanged` are metadata-only
+    ///    announcements that carry no content.
     ///
-    /// The `Fetch*` variants are a distinct, on-demand mechanism (used by
-    /// `onisync edit`): a recursive request for a *specific* file's bytes
-    /// that floods across an assumed-acyclic tree of live peer connections.
-    /// Each node forwards a `FetchRequest` to all neighbours except the one it
-    /// arrived from; the first `FetchFound` (whose hash matches
-    /// `expected_hash`) unwinds back along the request path to the origin. A
-    /// node reports `FetchMissing` only once every child it forwarded to has
-    /// reported `FetchMissing` (or timed out). The `request_id` correlates
-    /// replies with the pending request at each hop.
+    /// # Content-addressed chunk transfer
+    ///
+    /// There is one byte-movement mechanism. A chunk is treated as **pure
+    /// content, not a message**: its identity *is* `(file_id, content_hash,
+    /// offset)`, and because chunking is deterministic (offset a multiple of
+    /// `CHUNK_SIZE`, canonical length `min(CHUNK_SIZE, size - offset)` derived
+    /// from the version's authoritative size) that key denotes one exact,
+    /// bit-identical byte range on every peer whose copy hashes to
+    /// `content_hash`.
+    ///
+    /// Consequences:
+    /// - **No correlation id on the wire.** A [`Sync::ChunkData`] reply is
+    ///   matched to a pending request purely by `(file_id, content_hash,
+    ///   offset)`. Duplicate replies for the same key are bit-identical; take
+    ///   the first, drop the rest.
+    /// - **Relays coalesce and multicast.** A relay keeps a content-keyed
+    ///   waiter set and forwards a single upstream fetch out to all downstream
+    ///   waiters for that key, holding no bytes itself.
+    /// - **Discovery folds in.** A `ChunkRequest` *is* the probe: the first
+    ///   chunk floods across neighbours; whichever direction returns
+    ///   [`Sync::ChunkData`] establishes the route. Even the restore
+    ///   availability probe is an offset-0 `ChunkRequest` whose bytes are
+    ///   discarded.
+    ///
+    /// Integrity is **end-to-end**: only the origin receiver verifies the
+    /// accumulated BLAKE3 against `content_hash` once the whole file has
+    /// arrived. Relays verify nothing (they hold none of the bytes).
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub enum Sync {
         Manifest {
             entries: Vec<ManifestEntry>,
         },
 
-        /// Ask peers for the bytes of `file_id` whose content hashes to
-        /// `expected_hash`. Flooded across the live-connection tree.
-        FetchRequest {
-            request_id: RequestId,
-            file_id: FileId,
-            expected_hash: String,
-        },
-        /// A peer holds bytes for `file_id` matching the request's
-        /// `expected_hash`. Content-less control signal: it announces "I have
-        /// it, the hash matches" and unwinds back toward the origin. The bytes
-        /// themselves are then pulled over a separate transfer (each hop opens
-        /// a transfer against the child that answered).
-        FetchFound {
-            request_id: RequestId,
+        /// Ask any holder for the canonical chunk of `file_id`/`content_hash`
+        /// beginning at `offset`. `offset` MUST be a multiple of the wire-fixed
+        /// `CHUNK_SIZE`. There is no `request_id`: the tuple `(file_id,
+        /// content_hash, offset)` is both the request's identity and the
+        /// reply's routing key. A holder answers [`Sync::ChunkData`] if its
+        /// local copy verifies against `content_hash`, else [`Sync::ChunkMiss`];
+        /// a relay forwards it to neighbours and fans the reply back to all
+        /// waiters for the key.
+        ChunkRequest {
             file_id: FileId,
             content_hash: String,
-            /// The file's content size in bytes (from the answering node's
-            /// catalog). Lets the eventual pull cap its request window at EOF.
-            size: u64,
-        },
-        /// This subtree does not have the requested content (all children
-        /// exhausted or timed out).
-        FetchMissing {
-            request_id: RequestId,
-        },
-
-        // Bytes are moved over a link by a *pull* protocol: the **receiver**
-        // drives, the **sender** only ever replies. This gives fair
-        // interleaving with other traffic for free (the sender never emits a
-        // chunk unprompted) and inherent backpressure (the receiver asks for the
-        // next chunk only when ready). All four messages are correlated by a
-        // fresh per-link [`TransferId`].
-        //
-        // Flow:
-        // 1. Receiver → `TransferStart { transfer_id, file_id, content_hash }`.
-        // 2. Receiver → `TransferChunkRequest { transfer_id, offset }` for each chunk it wants (it may keep a small window of these in
-        //    flight).
-        // 3. Sender  → `TransferChunk { transfer_id, offset, bytes, last }` in reply to each request; `last` marks the final chunk.
-        // 4. Either side → `TransferAbort { transfer_id, reason }` to cancel (sender: file gone / read error; receiver: hash mismatch /
-        //    timeout / no longer wanted).
-        //
-        // The receiver verifies the accumulated BLAKE3 against `content_hash`
-        // when it sees `last`; a mismatch is an abort, never a commit.
-        /// Receiver opens a transfer: "I want `file_id` whose content hashes to
-        /// `content_hash`." The sender resolves the file and either begins
-        /// answering chunk requests or replies `TransferAbort` if it cannot
-        /// serve it.
-        TransferStart {
-            transfer_id: TransferId,
-            file_id: FileId,
-            content_hash: String,
-        },
-        /// Receiver asks for the chunk beginning at `offset`. The chunk length
-        /// is chosen by the sender (bounded).
-        TransferChunkRequest {
-            transfer_id: TransferId,
             offset: u64,
         },
-        /// Sender's reply to a `TransferChunkRequest`: the bytes at `offset`.
-        /// `last` is true for the final chunk of the file (which may be empty
-        /// for a zero-length file).
-        TransferChunk {
-            transfer_id: TransferId,
+        /// The canonical bytes at `offset` for `file_id`/`content_hash`. Length
+        /// is `min(CHUNK_SIZE, size - offset)`, derivable identically by every
+        /// node, so it is not carried on the wire. The receiver terminates when
+        /// it has written the version's authoritative size; there is no
+        /// per-chunk EOF flag (a zero-length file is one request at `offset = 0`
+        /// returning empty `bytes`).
+        ChunkData {
+            file_id: FileId,
+            content_hash: String,
             offset: u64,
             bytes: Vec<u8>,
-            last: bool,
         },
-        /// Abort an in-flight transfer from either side.
-        TransferAbort {
-            transfer_id: TransferId,
-            reason: String,
+        /// This direction cannot (any longer) serve `(file_id, content_hash,
+        /// offset)`: the node lacks the content and every upstream it forwarded
+        /// to also missed, or it once held it but the file changed. Carries no
+        /// reason; the receiver reacts structurally (a chunk missing from *all*
+        /// directions fails the receive).
+        ChunkMiss {
+            file_id: FileId,
+            content_hash: String,
+            offset: u64,
         },
 
         /// Tag reconciliation, sent unprompted right after `Manifest` at
@@ -618,64 +612,6 @@ macro_rules! make_id_type {
 make_id_type!(FileId);
 make_id_type!(PreviewId);
 make_id_type!(TagId);
-
-/// A transient identifier for a single on-demand fetch traversal
-/// (`Sync::Fetch*`). Unlike [`FileId`]/[`TagId`] it is never persisted to the
-/// database — it exists only to correlate a `FetchFound`/`FetchMissing` reply
-/// with the pending request it answers, across relaying peers ("call stack
-/// across machines"). It therefore deliberately omits the SQL trait impls that
-/// [`make_id_type!`] provides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
-#[serde(transparent)]
-pub struct RequestId(Uuid);
-
-impl RequestId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl std::fmt::Display for RequestId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, formatter)
-    }
-}
-
-impl Default for RequestId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// A transient identifier for a single **file transfer over one peer link**
-/// (`Sync::Transfer*`). Like [`RequestId`] it is never persisted; it exists
-/// only to correlate the messages of one pull-driven transfer (start, chunk
-/// requests, chunk replies, abort) on a single link.
-///
-/// It is deliberately *per-hop*: in a relayed fetch each hop runs its own
-/// transfer with its own `TransferId`, so a relay node maps the parent-side id
-/// to the child-side id rather than reusing one id end-to-end.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
-#[serde(transparent)]
-pub struct TransferId(Uuid);
-
-impl TransferId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl std::fmt::Display for TransferId {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, formatter)
-    }
-}
-
-impl Default for TransferId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// A file's **logical** path: its human-readable identity within onisync's
 /// namespace (possibly nested, e.g. `foo/bar/name.txt`). This is what is shown

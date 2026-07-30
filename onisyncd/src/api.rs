@@ -706,8 +706,8 @@ impl Api {
     ///
     /// Enqueues a [`DaemonMessage::Fetch`] onto the ingest bus;
     /// `handle_changes` checks the local sync directories first
-    /// (hash-gated) and, failing that, floods a recursive
-    /// `Sync::FetchRequest` across the live peer tree. Awaits
+    /// (hash-gated) and, failing that, drives a content-addressed receive that
+    /// floods `Sync::ChunkRequest`s across the live peer tree. Awaits
     /// the reply with an overall timeout. `expected_hash` gates which content
     /// is accepted; the caller obtains it from the file's known metadata
     /// (`FileInfo::content_hash`).

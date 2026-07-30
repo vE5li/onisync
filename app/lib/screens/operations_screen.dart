@@ -157,14 +157,10 @@ class _OperationRow extends StatelessWidget {
       case 'peer_connected_outbound':
       case 'peer_connected_inbound':
         return Icons.link;
-      case 'sending_file':
-        return Icons.upload;
       case 'receiving_file':
         return Icons.download;
       case 'fetching':
         return Icons.cloud_download;
-      case 'relaying_fetch':
-        return Icons.alt_route;
       case 'reconciling_manifest':
       case 'reconciling_tags':
         return Icons.compare_arrows;
@@ -184,14 +180,10 @@ class _OperationRow extends StatelessWidget {
         return 'Connected (outbound)';
       case 'peer_connected_inbound':
         return 'Connected (inbound)';
-      case 'sending_file':
-        return 'Sending file';
       case 'receiving_file':
         return 'Receiving file';
       case 'fetching':
         return 'Fetching file';
-      case 'relaying_fetch':
-        return 'Relaying fetch';
       case 'reconciling_manifest':
         return 'Reconciling manifest';
       case 'reconciling_tags':
@@ -213,9 +205,6 @@ class _OperationRow extends StatelessWidget {
       final id = operation.fileId!;
       final short = id.length > 12 ? id.substring(0, 12) : id;
       parts.add('file: $short');
-    }
-    if (operation.serveSource != null) {
-      parts.add('from: ${operation.serveSource}');
     }
     parts.add(_statusLabel(operation.status));
     return parts.join('  ·  ');

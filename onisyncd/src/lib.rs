@@ -24,7 +24,7 @@ use onisync_core::state::{
     Change, ChangeOrigin, Frame, ManifestEntry, RelationshipManifestEntry, Sync as SyncMessage,
     TagManifestEntry,
 };
-use onisync_core::{FileId, LogicalPath, PhysicalPath, TagId, TransferId};
+use onisync_core::{FileId, LogicalPath, PhysicalPath, TagId};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -40,7 +40,7 @@ use crate::fetch::PendingFetches;
 use crate::file_bytes::FileBytes;
 use crate::identity::{HandshakeMessage, Identity};
 use crate::paths::Paths;
-use crate::transfer::{ReceiveOutcome, TransferMessage, spawn_receiver, spawn_sender};
+use crate::transfer::{ChunkAnswer, ChunkReply, ChunkRequest, ReceiveOutcome, VerifiedHashCache};
 
 pub mod api;
 pub mod bus;
@@ -74,21 +74,19 @@ enum ContentTarget {
     },
 }
 
-/// Why the peer session started a receiver transfer, and what to do with the
-/// received bytes on completion. Carried alongside a transfer's outcome so the
-/// session's completion handler can dispatch correctly.
-enum ReceiverPurpose {
-    /// Reconciliation / live-change pull: materialize the received bytes into
-    /// our sync directories and record the version, placing per `placement`.
-    Materialize {
-        file_id: FileId,
-        content_hash: String,
-        origin: ChangeOrigin,
-        placement: bus::MaterializePlacement,
-    },
-    /// On-demand fetch (`onisync edit`): follow-up action from the fetch engine
-    /// (deliver to the local waiter, or relay upward).
-    Fetch { then: fetch::FoundThen },
+/// What a peer-session receive materializes on completion: the received bytes
+/// are written into our sync directories and the version recorded, placing per
+/// `placement`. Carried alongside the receive's outcome so the session's
+/// completion handler can dispatch.
+///
+/// (On-demand fetches — `onisync edit`, deferred placement — do not go through a
+/// peer session; they drive a receive directly via [`fetch_via_relay`] and
+/// return the temp file to their waiter.)
+struct ReceiverPurpose {
+    file_id: FileId,
+    content_hash: String,
+    origin: ChangeOrigin,
+    placement: bus::MaterializePlacement,
 }
 
 impl ContentTarget {
@@ -130,6 +128,10 @@ struct PeerContext {
     pending_fetches: PendingFetches,
     change_sender: UnboundedSender<DaemonMessage>,
     command_sender: UnboundedSender<SyncDirectoryCommand>,
+    /// Node-wide cache of verified content hashes (`path -> (mtime, size,
+    /// hash)`), so a holder answering repeated `ChunkRequest`s for the same
+    /// unchanged file hashes it once. Shared across all peer sessions.
+    verified_hashes: VerifiedHashCache,
     /// Live sync-operation registry, so peer sessions can surface what they are
     /// doing (serving/receiving files, reconciling, fetching) to the UI.
     operations: crate::operations::Operations,
@@ -296,10 +298,11 @@ pub async fn run(
 > {
     let runtime_configuration = Arc::new(RwLock::new(RuntimeConfiguration::new(&configuration)));
 
-    // Shared table of in-flight on-demand fetches (`onisync edit`). Seeded by
-    // `handle_changes` for local-origin requests and by peer sessions for
-    // relayed ones; replies are routed by `request_id`. Owns the peer runtime so
-    // its engine operations are plain methods. Cheap to clone (Arcs).
+    // Shared content-keyed chunk relay. Every peer session and `handle_changes`
+    // holds a clone: requests forwarded on one session and replies arriving on
+    // another share one waiter table, so multi-source pulls and relay coalescing
+    // work across links. Also owns the temporary-provider registry (CLI
+    // uploads). Cheap to clone (Arcs).
     let pending_fetches = crate::fetch::PendingFetches::new(runtime_configuration.clone());
 
     let identity = Identity::load(paths.identity_path()).map_err(|source| RunError::Identity {
@@ -420,6 +423,7 @@ pub async fn run(
         pending_fetches: pending_fetches.clone(),
         change_sender: change_sender.clone(),
         command_sender: command_sender.clone(),
+        verified_hashes: VerifiedHashCache::new(),
         operations: operations.clone(),
     };
 
@@ -801,6 +805,7 @@ async fn run_peer_session<S>(
         pending_fetches,
         change_sender,
         command_sender,
+        verified_hashes,
         operations,
     } = context;
 
@@ -838,19 +843,15 @@ async fn run_peer_session<S>(
     // session installed after we registered).
     let our_sender = peer_tx.clone();
 
-    // Per-link file transfers. `transfers` demuxes inbound `Sync::Transfer*`
-    // frames (by `TransferId`) to the endpoint task serving them — a sender we
-    // started (answering a peer's `TransferStart`) or a receiver we started
-    // (pulling a file we reconciled as wanted). When a receiver finishes it
-    // reports on `receiver_done`, which the select loop drains to materialize
-    // the bytes and drop the demux entry.
-    let mut transfers: HashMap<TransferId, UnboundedSender<TransferMessage>> = HashMap::new();
-
+    // Completed receives report their outcome here; the select loop drains it to
+    // materialize the bytes. There is no per-transfer demux table any more:
+    // inbound `ChunkData`/`ChunkMiss` are routed by the content-keyed relay
+    // (`pending_fetches`), not by a session-scoped id.
     let (receiver_done_tx, mut receiver_done_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(TransferId, ReceiverPurpose, ReceiveOutcome)>();
+        tokio::sync::mpsc::unbounded_channel::<(ReceiverPurpose, ReceiveOutcome)>();
 
     // Temp directory for in-flight received files. Kept per-session under the
-    // system temp dir; a completed transfer's temp file is then materialized
+    // system temp dir; a completed receive's temp file is then materialized
     // (moved) into the sync directories.
     let transfer_temp_dir = std::env::temp_dir().join(format!(
         "onisync-transfer-{}-{}",
@@ -858,29 +859,30 @@ async fn run_peer_session<S>(
         peer_public_key
     ));
 
-    // Start a receiver pull for `file_id`/`content_hash` on this link, tagged
-    // with `purpose` (what to do with the bytes once received). Spawns the
-    // receiver endpoint and a bridge that forwards its outcome onto
-    // `receiver_done_rx`. Returns the `(transfer_id, inbound_sender)` for the
-    // caller to register in the demux table.
+    // Start a content-addressed receive of `file_id`/`content_hash` from *this*
+    // peer (the announcing origin / the peer we're reconciling with), tagged
+    // with `purpose` (what to do with the bytes once received). The receive
+    // sources each chunk through the content-keyed relay, directing the first
+    // request toward this peer; a later chunk central has caught up on is served
+    // by it like any other holder — no session to renegotiate. The outcome is
+    // forwarded onto `receiver_done_rx`.
     let start_pull = {
-        let our_sender = our_sender.clone();
+        let pending_fetches = pending_fetches.clone();
         let receiver_done_tx = receiver_done_tx.clone();
         let transfer_temp_dir = transfer_temp_dir.clone();
         let operations = operations.clone();
         let peer_name = peer_name.to_owned();
+        let peer_public_key = peer_public_key.to_owned();
 
         move |file_id: FileId,
               content_hash: String,
               expected_size: u64,
               purpose: ReceiverPurpose| {
-            let transfer_id = TransferId::new();
-            let temp_path = transfer_temp_dir.join(transfer_id.to_string());
-            let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+            let temp_path = transfer_temp_dir.join(uuid::Uuid::new_v4().to_string());
 
             // Surface this pull as a live "receiving file" operation with byte
             // progress. The handle lives on the bridge task below and reaches a
-            // terminal state from the transfer outcome.
+            // terminal state from the receive outcome.
             let receiving = operations.begin(operations::OperationKind::receiving_file(
                 file_id, &peer_name,
             ));
@@ -892,15 +894,13 @@ async fn run_peer_session<S>(
                 }) as transfer::ProgressSink
             };
 
-            let inbound = spawn_receiver(
-                transfer_id,
+            let outcome_rx = spawn_content_receive(
+                &pending_fetches,
                 file_id,
                 content_hash,
                 expected_size,
                 temp_path,
-                our_sender.clone(),
-                Frame::Sync,
-                outcome_tx,
+                Some(peer_public_key.clone()),
                 Some(progress),
             );
 
@@ -911,13 +911,11 @@ async fn run_peer_session<S>(
                         ReceiveOutcome::Complete(_) => receiving.complete(),
                         ReceiveOutcome::Failed(error) => receiving.fail(error.to_string()),
                     }
-                    let _ = done_tx.send((transfer_id, purpose, outcome));
+                    let _ = done_tx.send((purpose, outcome));
                 }
                 // If `outcome_rx` closed without a value, `receiving` drops
                 // here and the operation is marked aborted.
             });
-
-            (transfer_id, inbound)
         }
     };
 
@@ -1077,7 +1075,7 @@ async fn run_peer_session<S>(
                         // announced and wants its bytes. Pull them over this
                         // link; materialize (and record the version) on
                         // completion.
-                        let purpose = ReceiverPurpose::Materialize {
+                        let purpose = ReceiverPurpose {
                             file_id,
                             content_hash: content_hash.clone(),
                             origin: ChangeOrigin::Peer {
@@ -1085,105 +1083,45 @@ async fn run_peer_session<S>(
                             },
                             placement,
                         };
-                        let (transfer_id, inbound) =
-                            start_pull(file_id, content_hash, expected_size, purpose);
-                        transfers.insert(transfer_id, inbound);
+                        start_pull(file_id, content_hash, expected_size, purpose);
                     }
                 }
             }
             completed = receiver_done_rx.recv() => {
-                let Some((transfer_id, purpose, outcome)) = completed else {
+                let Some((purpose, outcome)) = completed else {
                     // The done channel is never fully dropped while the session
                     // lives (we hold a sender clone), so `None` only at teardown.
                     continue;
                 };
-                transfers.remove(&transfer_id);
                 let content = match outcome {
                     ReceiveOutcome::Complete(content) => content,
                     ReceiveOutcome::Failed(error) => {
-                        log::warn!(
-                            "Transfer {transfer_id} from {peer_name} failed: {error}"
-                        );
-                        // A fetch that fails to receive its bytes must still
-                        // report failure to its waiter/parent so the fetch does
-                        // not hang.
-                        if let ReceiverPurpose::Fetch { then } = purpose {
-                            match then {
-                                fetch::FoundThen::DeliverLocal(sender) => {
-                                    let _ = sender.send(Err(bus::FetchError::NotAvailable));
-                                }
-                                fetch::FoundThen::RelayUp {
-                                    parent_peer,
-                                    request_id,
-                                    ..
-                                } => {
-                                    if let Some(sender) =
-                                        peer_outbound(&runtime_configuration, &parent_peer).await
-                                    {
-                                        let _ = sender.send(Frame::Sync(
-                                            SyncMessage::FetchMissing { request_id },
-                                        ));
-                                    }
-                                }
-                            }
-                        }
+                        log::warn!("Receive from {peer_name} failed: {error}");
                         continue;
                     }
                 };
-                match purpose {
-                    ReceiverPurpose::Materialize {
-                        file_id,
-                        content_hash,
-                        origin,
-                        placement,
-                    } => {
-                        log::debug!(
-                            "Transfer {transfer_id} from {peer_name} completed for {}; materializing",
-                            file_id.to_string()
-                        );
-                        if let Err(error) = change_sender.send(DaemonMessage::Materialize {
-                            file_id,
-                            content,
-                            content_hash,
-                            origin,
-                            placement,
-                        }) {
-                            log::error!(
-                                "change_sender closed; cannot materialize transfer for {}: {error}",
-                                file_id.to_string()
-                            );
-                            break;
-                        }
-                    }
-                    ReceiverPurpose::Fetch { then } => match then {
-                        fetch::FoundThen::DeliverLocal(sender) => {
-                            let _ = sender.send(Ok(content));
-                        }
-                        fetch::FoundThen::RelayUp {
-                            parent_peer,
-                            request_id,
-                            file_id,
-                            content_hash,
-                            size,
-                        } => {
-                            // Relay: hold the received bytes so our parent can
-                            // pull them, then announce (content-less, but
-                            // carrying the size) upward.
-                            pending_fetches
-                                .cache_relay_file(file_id, content_hash.clone(), content)
-                                .await;
-                            if let Some(sender) =
-                                peer_outbound(&runtime_configuration, &parent_peer).await
-                            {
-                                let _ = sender.send(Frame::Sync(SyncMessage::FetchFound {
-                                    request_id,
-                                    file_id,
-                                    content_hash,
-                                    size,
-                                }));
-                            }
-                        }
-                    },
+                let ReceiverPurpose {
+                    file_id,
+                    content_hash,
+                    origin,
+                    placement,
+                } = purpose;
+                log::debug!(
+                    "Receive from {peer_name} completed for {}; materializing",
+                    file_id.to_string()
+                );
+                if let Err(error) = change_sender.send(DaemonMessage::Materialize {
+                    file_id,
+                    content,
+                    content_hash,
+                    origin,
+                    placement,
+                }) {
+                    log::error!(
+                        "change_sender closed; cannot materialize receive for {}: {error}",
+                        file_id.to_string()
+                    );
+                    break;
                 }
             }
             inbound = incoming.next() => {
@@ -1359,10 +1297,11 @@ async fn run_peer_session<S>(
                         // double-fetch them.
                         let pulling: HashSet<FileId> =
                             wanted.iter().map(|wanted| wanted.file_id).collect();
-                        // Start a pull transfer for each wanted file: we are the
-                        // receiver/driver, the peer serves via its own sender
-                        // when it sees our `TransferStart`. `placement` is
-                        // `Create` for files we've never seen (using the
+                        // Start a content-addressed receive for each wanted
+                        // file, directing chunk requests toward this peer; it
+                        // serves the canonical chunks it holds and any other
+                        // holder can serve the rest via the relay. `placement`
+                        // is `Create` for files we've never seen (using the
                         // manifest's `logical_path`) and `Change` for files we
                         // already know — see `reconcile_peer_manifest`.
                         for WantedFile {
@@ -1420,7 +1359,7 @@ async fn run_peer_session<S>(
                                 );
                                 continue;
                             }
-                            let purpose = ReceiverPurpose::Materialize {
+                            let purpose = ReceiverPurpose {
                                 file_id,
                                 content_hash: content_hash.clone(),
                                 origin: ChangeOrigin::Peer {
@@ -1428,9 +1367,7 @@ async fn run_peer_session<S>(
                                 },
                                 placement,
                             };
-                            let (transfer_id, inbound) =
-                                start_pull(file_id, content_hash, size as u64, purpose);
-                            transfers.insert(transfer_id, inbound);
+                            start_pull(file_id, content_hash, size as u64, purpose);
                         }
 
                         // Placement sweep: for every announced file whose catalog
@@ -1444,7 +1381,7 @@ async fn run_peer_session<S>(
                         //
                         // We deliberately hand this to `handle_changes` via the bus
                         // rather than fetching here: the fetch floods
-                        // `FetchRequest`s and awaits `FetchFound` replies that
+                        // `ChunkRequest`s and awaits `ChunkData` replies that
                         // arrive as inbound frames on *this* session's select loop.
                         // Awaiting inline would block that loop and deadlock the
                         // fetch. Note: tag relationships from the peer's
@@ -1467,83 +1404,71 @@ async fn run_peer_session<S>(
                             }
                         }
                     }
-                    Frame::Sync(SyncMessage::FetchRequest {
-                        request_id,
-                        file_id,
-                        expected_hash,
-                    }) => {
-                        // A peer is asking us (recursively) for a file's bytes.
-                        // Answer locally if we hold matching content (with its
-                        // size, so the puller can cap its window); otherwise
-                        // relay to our other peers. The bytes themselves are
-                        // pulled over a transfer later.
-                        let local_size =
-                            local_hash_matches(&command_sender, file_id, &expected_hash).await;
-
-                        log::debug!(
-                            "FetchRequest from {peer_name} for {} (expected_hash {}): \
-                             local_size={local_size:?}",
-                            file_id.to_string(),
-                            expected_hash,
-                        );
-
-                        pending_fetches
-                            .handle_incoming_request(
-                                peer_public_key,
-                                request_id,
-                                file_id,
-                                expected_hash,
-                                local_size,
-                            )
-                            .await;
-                    }
-                    Frame::Sync(SyncMessage::FetchFound {
-                        request_id,
+                    // A peer asks us for the canonical chunk at `offset` of
+                    // `file_id`/`content_hash`. If a local source (a sync
+                    // directory or a temporary provider) verifies against
+                    // `content_hash`, answer `ChunkData` directly; otherwise
+                    // relay the request to our other neighbours (the relay fans
+                    // the eventual reply back). A relay holds no bytes.
+                    Frame::Sync(SyncMessage::ChunkRequest {
                         file_id,
                         content_hash,
-                        size,
+                        offset,
                     }) => {
-                        // Content-less: a child announced it has the file (and
-                        // its size). Pull the bytes from that child over a
-                        // transfer, then either deliver locally (origin) or relay
-                        // upward.
-                        let action = pending_fetches
-                            .handle_incoming_found(
-                                peer_public_key,
-                                request_id,
-                                file_id,
-                                content_hash,
-                                size,
-                            )
-                            .await;
-
-                        if let Some(fetch::FoundAction::Receive {
-                            from_peer,
+                        let answer = answer_local_chunk(
+                            &command_sender,
+                            &pending_fetches,
+                            &verified_hashes,
                             file_id,
-                            expected_hash,
-                            expected_size,
-                            then,
-                        }) = action
-                        {
-                            // The child that answered is `from_peer`, which is
-                            // this very connection (`peer_public_key`); pull over
-                            // our own link. The size carried by `FetchFound` caps
-                            // the request window at EOF.
-                            let _ = from_peer; // == peer_public_key; kept for clarity
+                            &content_hash,
+                            offset,
+                        )
+                        .await;
 
-                            let (transfer_id, inbound) = start_pull(
-                                file_id,
-                                expected_hash,
-                                expected_size,
-                                ReceiverPurpose::Fetch { then },
-                            );
-
-                            transfers.insert(transfer_id, inbound);
+                        match answer {
+                            Some(ChunkAnswer::Data(bytes)) => {
+                                let _ = our_sender.send(Frame::Sync(SyncMessage::ChunkData {
+                                    file_id,
+                                    content_hash,
+                                    offset,
+                                    bytes,
+                                }));
+                            }
+                            // We hold the content but it does not verify (an
+                            // impossible-for-a-consistent-catalog case) — treat
+                            // as absent and relay so another holder can serve it.
+                            Some(ChunkAnswer::Miss) | None => {
+                                pending_fetches
+                                    .relay_chunk_request(
+                                        peer_public_key,
+                                        file_id,
+                                        content_hash,
+                                        offset,
+                                    )
+                                    .await;
+                            }
                         }
                     }
-                    Frame::Sync(SyncMessage::FetchMissing { request_id }) => {
+                    // Reply bytes arriving from an upstream: fan to every
+                    // downstream waiter (local receives and relayed peers) for
+                    // this key via the content-keyed table.
+                    Frame::Sync(SyncMessage::ChunkData {
+                        file_id,
+                        content_hash,
+                        offset,
+                        bytes,
+                    }) => {
                         pending_fetches
-                            .handle_incoming_missing(peer_public_key, request_id)
+                            .handle_chunk_data(file_id, content_hash, offset, bytes)
+                            .await;
+                    }
+                    Frame::Sync(SyncMessage::ChunkMiss {
+                        file_id,
+                        content_hash,
+                        offset,
+                    }) => {
+                        pending_fetches
+                            .handle_chunk_miss(peer_public_key, file_id, content_hash, offset)
                             .await;
                     }
                     Frame::Sync(SyncMessage::TagManifest {
@@ -1617,195 +1542,6 @@ async fn run_peer_session<S>(
                             tag_id.to_string()
                         );
                     }
-                    // A peer opened a transfer: we are the holder/sender. Read
-                    // the file's bytes off disk (as a `FileToCopy`, so nothing
-                    // is buffered) and spawn a sender endpoint to serve them.
-                    Frame::Sync(SyncMessage::TransferStart {
-                        transfer_id,
-                        file_id,
-                        content_hash,
-                    }) => {
-                        let (respond_to, response) = tokio::sync::oneshot::channel();
-                        if command_sender
-                            .send(SyncDirectoryCommand::ReadFile { file_id, respond_to })
-                            .is_err()
-                        {
-                            log::error!(
-                                "command_sender closed; cannot serve transfer {transfer_id} \
-                                 to {peer_name}"
-                            );
-                            break;
-                        }
-                        let read_result = response.await.ok().flatten();
-                        log::debug!(
-                            "TransferStart {transfer_id} from {peer_name} for {} \
-                             (content_hash {}): local read {}",
-                            file_id.to_string(),
-                            content_hash,
-                            match &read_result {
-                                Some((_, _, local_hash)) =>
-                                    format!("hash {local_hash}"),
-                                None => "absent".to_owned(),
-                            },
-                        );
-                        // Resolve who serves the bytes, in priority order:
-                        //   1. a matching file in our sync directories
-                        //   2. a temporary provider (a local client serving on
-                        //      demand, e.g. the CLI uploading)
-                        //   3. a file we are holding as a fetch relay (evicted).
-                        // Each yields an endpoint we register in the demux table.
-                        let sync_content = match read_result {
-                            Some((_physical_path, content, local_hash))
-                                if local_hash == content_hash =>
-                            {
-                                Some(content)
-                            }
-                            _ => None,
-                        };
-                        // Build a progress sink + register a "serving file"
-                        // operation for whichever source ends up serving the
-                        // bytes. `serve_progress` begins the operation, wires a
-                        // byte-progress sink, and spawns a task that awaits the
-                        // sender's `SenderOutcome` to set the terminal state —
-                        // mirroring the receiver's `start_pull` bridge. It
-                        // returns the `(progress_sink, done_sender)` pair
-                        // `spawn_sender` needs. The operation's lifetime is thus
-                        // owned by that task, not the demux table, so it always
-                        // reaches a terminal state (the demux entry only tracks
-                        // frame routing).
-                        let serve_progress = |source: operations::ServeSource| {
-                            let handle = operations.begin(operations::OperationKind::sending_file(
-                                file_id, peer_name, source,
-                            ));
-                            let id = handle.id();
-                            let operations_for_sink = operations.clone();
-                            let sink = Box::new(move |done: u64, total: Option<u64>| {
-                                operations_for_sink.report_progress(id, done, total);
-                            }) as transfer::ProgressSink;
-
-                            let (done_tx, done_rx) =
-                                tokio::sync::oneshot::channel::<transfer::SenderOutcome>();
-                            tokio::spawn(async move {
-                                match done_rx.await {
-                                    Ok(transfer::SenderOutcome::Complete) => handle.complete(),
-                                    Ok(transfer::SenderOutcome::Aborted(reason)) => {
-                                        handle.fail(reason)
-                                    }
-                                    // Sender task dropped without reporting: the
-                                    // handle drops here and the operation is
-                                    // marked aborted.
-                                    Err(_) => {}
-                                }
-                            });
-                            (sink, done_tx)
-                        };
-                        let inbound = if let Some(content) = sync_content {
-                            log::debug!(
-                                "TransferStart {transfer_id}: serving {} from a sync directory",
-                                file_id.to_string()
-                            );
-                            let (sink, done_tx) =
-                                serve_progress(operations::ServeSource::SyncDirectory);
-                            Some(spawn_sender(
-                                transfer_id,
-                                content,
-                                our_sender.clone(),
-                                Frame::Sync,
-                                Some(sink),
-                                done_tx,
-                            ))
-                        } else if let Some(provider) =
-                            pending_fetches.provider_for(file_id, &content_hash).await
-                        {
-                            log::debug!(
-                                "TransferStart {transfer_id}: serving {} from a local provider",
-                                file_id.to_string()
-                            );
-                            let (sink, done_tx) = serve_progress(operations::ServeSource::Provider);
-                            Some(spawn_sender(
-                                transfer_id,
-                                provider,
-                                our_sender.clone(),
-                                Frame::Sync,
-                                Some(sink),
-                                done_tx,
-                            ))
-                        } else {
-                            pending_fetches
-                                .take_fetch_cached(file_id, &content_hash)
-                                .await
-                                .map(|content| {
-                                    log::debug!(
-                                        "TransferStart {transfer_id}: serving {} from the fetch cache",
-                                        file_id.to_string()
-                                    );
-                                    let (sink, done_tx) =
-                                        serve_progress(operations::ServeSource::FetchCache);
-                                    spawn_sender(
-                                        transfer_id,
-                                        content,
-                                        our_sender.clone(),
-                                        Frame::Sync,
-                                        Some(sink),
-                                        done_tx,
-                                    )
-                                })
-                        };
-                        match inbound {
-                            Some(inbound) => {
-                                // Deliver the opening `Start` so the sender knows
-                                // the transfer began (it only acts on requests).
-                                let _ = inbound.send(TransferMessage::Start {
-                                    file_id,
-                                    content_hash,
-                                });
-                                transfers.insert(transfer_id, inbound);
-                            }
-                            None => {
-                                log::warn!(
-                                    "Transfer {transfer_id} from {peer_name}: {} not available \
-                                     (no sync dir, provider, or fetch cache); aborting",
-                                    file_id.to_string()
-                                );
-                                let _ = our_sender.send(Frame::Sync(SyncMessage::TransferAbort {
-                                    transfer_id,
-                                    reason: "file not available".to_owned(),
-                                }));
-                            }
-                        }
-                    }
-                    // Chunk requests / chunks / aborts belong to an existing
-                    // transfer: demux to its endpoint by `transfer_id`.
-                    Frame::Sync(sync @ SyncMessage::TransferChunkRequest { .. })
-                    | Frame::Sync(sync @ SyncMessage::TransferChunk { .. })
-                    | Frame::Sync(sync @ SyncMessage::TransferAbort { .. }) => {
-                        if let Some((transfer_id, message)) = TransferMessage::from_sync(sync) {
-                            match transfers.get(&transfer_id) {
-                                Some(endpoint) => {
-                                    let is_abort =
-                                        matches!(message, TransferMessage::Abort { .. });
-                                    if endpoint.send(message).is_err() || is_abort {
-                                        // Endpoint gone, or the transfer aborted:
-                                        // drop the demux entry. The serve
-                                        // operation's terminal state is handled
-                                        // by the sender task via its
-                                        // `SenderOutcome`, not here.
-                                        transfers.remove(&transfer_id);
-                                    }
-                                }
-                                None => {
-                                    // Benign and expected: a completed receiver
-                                    // removes its demux entry while the sender's
-                                    // windowed in-flight chunks (offsets past
-                                    // EOF) are still arriving. Trace, not debug.
-                                    log::trace!(
-                                        "Peer {peer_name} sent frame for unknown transfer \
-                                         {transfer_id}; ignoring (late/orphaned)"
-                                    );
-                                }
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -1818,6 +1554,12 @@ async fn run_peer_session<S>(
         &our_sender,
     )
     .await;
+
+    // This link is gone: prune it from the relay's waiter table so any chunk
+    // key that was only reachable through it fails its downstream waiters
+    // (rather than hanging until the TTL) and any request it was waiting on is
+    // forgotten.
+    pending_fetches.prune_link(peer_public_key).await;
 }
 
 async fn send_frame<S>(
@@ -2266,12 +2008,12 @@ fn decide_request(
 }
 
 /// Read `file_id`'s bytes from local sync directories, but only return them if
-/// they hash to `expected_hash`. Used by the on-demand fetch engine to decide
-/// whether this node can satisfy a `Sync::FetchRequest` locally.
+/// they hash to `expected_hash`. Used by the on-demand fetch path to satisfy a
+/// `DaemonMessage::Fetch` locally before flooding chunk requests to peers.
 ///
 /// Returns `Some(bytes)` on a hash match, `None` if the file is absent locally
 /// or its local content does not match the requested hash (in which case the
-/// request should be forwarded to peers).
+/// request should be served from peers).
 async fn read_local_if_hash_matches(
     command_sender: &UnboundedSender<SyncDirectoryCommand>,
     file_id: FileId,
@@ -2305,22 +2047,149 @@ async fn read_local_if_hash_matches(
     }
 }
 
-/// Resolve a peer's outbound `Frame` sender by public key, if connected.
-async fn peer_outbound(
-    runtime_configuration: &Arc<RwLock<RuntimeConfiguration>>,
-    public_key: &str,
-) -> Option<UnboundedSender<Frame>> {
-    runtime_configuration
-        .read()
+/// Answer a content-addressed `ChunkRequest` from a **local** source, if this
+/// node holds `file_id`/`content_hash`.
+///
+/// Resolves a source in priority order — a matching file in our sync
+/// directories, then a temporary provider (a local client serving on demand,
+/// e.g. the CLI uploading) — and serves the canonical chunk at `offset` via
+/// [`transfer::answer_chunk_request`].
+///
+/// Both sources are already hash-gated by how they are resolved, so each is
+/// served **pre-verified** (no re-hashing per request):
+/// - a sync-directory file only serves when the hash `ReadFile` computed equals
+///   `content_hash`;
+/// - a provider is looked up by its `(file_id, content_hash)` registration key,
+///   which *is* its verification. (Re-hashing a provider would additionally
+///   fire its `on_complete` mid-serve and release the file — see
+///   [`transfer::answer_chunk_request`].)
+///
+/// Returns `Some(ChunkAnswer::Data)` when we served bytes, `Some(Miss)` when we
+/// hold the file but it does not match or the offset is malformed, and `None`
+/// when no local source holds the file at all (the caller then relays the
+/// request to other neighbours).
+async fn answer_local_chunk(
+    command_sender: &UnboundedSender<SyncDirectoryCommand>,
+    pending_fetches: &PendingFetches,
+    verified_hashes: &VerifiedHashCache,
+    file_id: FileId,
+    content_hash: &str,
+    offset: u64,
+) -> Option<ChunkAnswer> {
+    // 1. A file in our sync directories. `ReadFile` returns the file's current
+    // on-disk hash; serve only when it matches (pre-verified), else fall
+    // through so another holder / relay can answer.
+    let (respond_to, response) = tokio::sync::oneshot::channel();
+    if command_sender
+        .send(SyncDirectoryCommand::ReadFile { file_id, respond_to })
+        .is_ok()
+        && let Ok(Some((_physical_path, content, local_hash))) = response.await
+        && local_hash == content_hash
+    {
+        let path = content.path().map(|path| path.to_path_buf());
+        return Some(
+            transfer::answer_chunk_request(
+                &content,
+                path.as_deref(),
+                verified_hashes,
+                content_hash,
+                offset,
+                true,
+            )
+            .await,
+        );
+    }
+
+    // 2. A temporary provider (CLI upload/edit in flight), trusted by its
+    // registration key — served pre-verified so we never re-hash it (which
+    // would release the file after the first chunk).
+    if let Some(provider) = pending_fetches.provider_for(file_id, content_hash).await {
+        return Some(
+            transfer::answer_chunk_request(
+                &provider,
+                None,
+                verified_hashes,
+                content_hash,
+                offset,
+                true,
+            )
+            .await,
+        );
+    }
+
+    None
+}
+
+/// Spawn a **content-addressed receive** of `(file_id, content_hash)` into a
+/// fresh temp file, sourcing each chunk through the content-keyed relay.
+///
+/// Each chunk the receiver wants is routed toward `toward` (the announcing
+/// origin / peer we're reconciling with) when `Some`, else flooded across all
+/// neighbours. Inbound `ChunkData`/`ChunkMiss` frames are delivered to the
+/// receive by the relay's waiter table (which the per-chunk request registered
+/// as a `Local` waiter), so no session-scoped demux is needed. The final
+/// [`ReceiveOutcome`] is delivered on the returned oneshot.
+///
+/// This is the single receive entry point shared by live-sync/reconcile pulls
+/// (driven by a peer session) and on-demand fetches / deferred placement
+/// (driven inside `handle_changes`).
+fn spawn_content_receive(
+    pending_fetches: &PendingFetches,
+    file_id: FileId,
+    content_hash: String,
+    expected_size: u64,
+    temp_path: PathBuf,
+    toward: Option<String>,
+    progress: Option<transfer::ProgressSink>,
+) -> tokio::sync::oneshot::Receiver<ReceiveOutcome> {
+    let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+
+    // The receive driver emits `ChunkRequest`s on `req` and awaits `ChunkReply`s
+    // on `reply`. The bridge below routes each request through the relay,
+    // passing a clone of the reply sender so the relay's waiter table can fan
+    // the eventual `ChunkData`/`ChunkMiss` back to this receive.
+    let (req_tx, mut req_rx) = tokio::sync::mpsc::unbounded_channel::<ChunkRequest>();
+    let (reply_tx, reply_rx) = tokio::sync::mpsc::unbounded_channel::<ChunkReply>();
+
+    let pending_fetches_bridge = pending_fetches.clone();
+    let content_hash_bridge = content_hash.clone();
+    tokio::spawn(async move {
+        while let Some(ChunkRequest { offset }) = req_rx.recv().await {
+            pending_fetches_bridge
+                .request_chunk_local(
+                    file_id,
+                    content_hash_bridge.clone(),
+                    offset,
+                    toward.as_deref(),
+                    reply_tx.clone(),
+                )
+                .await;
+        }
+    });
+
+    tokio::spawn(async move {
+        let outcome = match transfer::receive(
+            content_hash,
+            expected_size,
+            temp_path,
+            req_tx,
+            reply_rx,
+            progress,
+        )
         .await
-        .peers
-        .get(public_key)
-        .and_then(|runtime_peer| runtime_peer.outbound.clone())
+        {
+            Ok(file_bytes) => ReceiveOutcome::Complete(file_bytes),
+            Err(error) => ReceiveOutcome::Failed(error),
+        };
+        let _ = outcome_tx.send(outcome);
+    });
+
+    outcome_rx
 }
 
 /// Ask the peer that announced a change (`change_origin`) to serve us its
 /// bytes: send a `StartReceive` command to that peer's live session, which owns
-/// the transfer machinery. No-op if the change is local-origin or the peer has
+/// the receive machinery. No-op if the change is local-origin or the peer has
 /// no live session (reconciliation will pick it up on the next connect).
 async fn request_pull_from_origin(
     runtime_configuration: &Arc<RwLock<RuntimeConfiguration>>,
@@ -2364,65 +2233,6 @@ async fn request_pull_from_origin(
                 file_id.to_string()
             );
         }
-    }
-}
-
-/// Whether a local sync directory holds `file_id` with content hashing to
-/// `expected_hash`, without buffering the bytes. Used to decide whether we can
-/// answer a relayed `Sync::FetchRequest` (as a content-less `FetchFound`) or
-/// must forward it onward.
-/// If we hold `file_id` locally with content matching `expected_hash`, return
-/// `Some(size_in_bytes)`; otherwise `None`. The size is read from the bytes we
-/// would serve, so a `FetchFound` we send can carry it and the puller can cap
-/// its request window at EOF.
-async fn local_hash_matches(
-    command_sender: &UnboundedSender<SyncDirectoryCommand>,
-    file_id: FileId,
-    expected_hash: &str,
-) -> Option<u64> {
-    let (respond_to, response) = tokio::sync::oneshot::channel();
-
-    if command_sender
-        .send(SyncDirectoryCommand::ReadFile {
-            file_id,
-            respond_to,
-        })
-        .is_err()
-    {
-        return None;
-    }
-
-    match response.await {
-        Ok(Some((_physical_path, content, content_hash))) => {
-            if content_hash != expected_hash {
-                log::debug!(
-                    "local_hash_matches: {} held locally but hash {} != expected {}",
-                    file_id.to_string(),
-                    content_hash,
-                    expected_hash,
-                );
-                return None;
-            }
-            match content.byte_len().await {
-                Ok(size) => Some(size),
-                Err(error) => {
-                    log::warn!(
-                        "local_hash_matches: {} matched but size read failed: {error}; answering without a size hint",
-                        file_id.to_string()
-                    );
-                    // Treat as held-but-size-unknown: 0 disables the puller's cap.
-                    Some(0)
-                }
-            }
-        }
-        Ok(None) => {
-            log::debug!(
-                "local_hash_matches: {} not held in any sync directory",
-                file_id.to_string()
-            );
-            None
-        }
-        Err(_) => None,
     }
 }
 
@@ -2672,9 +2482,9 @@ struct DeferredPlacement {
     file_id: FileId,
     logical_path: LogicalPath,
     file_tags: Vec<TagId>,
-    /// The file's latest catalog version hash, or `None` if the file has no
-    /// recorded version (in which case there is nothing to fetch by).
-    latest_hash: Option<String>,
+    /// The file's latest catalog `(content_hash, size)`, or `None` if the file
+    /// has no recorded version (in which case there is nothing to fetch by).
+    latest_version: Option<(String, u64)>,
     /// Resolves to `true` if the manager deferred placement (wants the file but
     /// has no local bytes to source), `false` otherwise.
     deferred: tokio::sync::oneshot::Receiver<bool>,
@@ -2725,8 +2535,8 @@ fn reconcile_tag_placement(
     // Read the latest catalog version hash now, alongside the other DB reads, so
     // the async follow-up needs no database access (and thus no `!Send` borrow
     // across an await). `None` = no recorded version (nothing to fetch by).
-    let latest_hash = match database.latest_version(file_id) {
-        Ok(version) => version.map(|version| version.content_hash),
+    let latest_version = match database.latest_version(file_id) {
+        Ok(version) => version.map(|version| (version.content_hash, version.size as u64)),
         Err(error) => {
             log::error!(
                 "reconcile_tag_placement: failed to read latest version for {}: {:?}",
@@ -2755,7 +2565,7 @@ fn reconcile_tag_placement(
         file_id,
         logical_path,
         file_tags,
-        latest_hash,
+        latest_version,
         deferred,
     })
 }
@@ -2778,7 +2588,7 @@ async fn fetch_and_place_deferred(
         file_id,
         logical_path,
         file_tags,
-        latest_hash,
+        latest_version,
         deferred,
     } = placement;
 
@@ -2799,7 +2609,7 @@ async fn fetch_and_place_deferred(
     // bytes on demand using the file's latest catalog version hash. Because the
     // catalog is byte-independent, this hash is present for any file we know
     // about even though its bytes are not (yet) local.
-    let Some(expected_hash) = latest_hash else {
+    let Some((expected_hash, expected_size)) = latest_version else {
         // No version has ever been recorded. Nothing to fetch by; a future
         // announcement / materialize will place it. Soft deferral.
         log::debug!(
@@ -2809,11 +2619,11 @@ async fn fetch_and_place_deferred(
         return;
     };
 
-    // Drive the fetch directly against the fetch engine rather than routing a
-    // `DaemonMessage::Fetch` back onto the ingest bus: we are *inside* the
-    // single-threaded `handle_changes` consumer, so awaiting a reply to a
-    // message we enqueue onto our own channel would deadlock. `start_local_fetch`
-    // floods the live peer tree and resolves the oneshot when the bytes arrive.
+    // Drive the content-addressed receive directly against the relay rather
+    // than routing a `DaemonMessage::Fetch` back onto the ingest bus: we are
+    // *inside* the single-threaded `handle_changes` consumer, so awaiting a
+    // reply to a message we enqueue onto our own channel would deadlock. The
+    // relay floods the live peer tree and resolves when the bytes arrive.
     log::debug!(
         "reconcile_tag_placement: fetching {} at catalog hash {} to place it locally",
         file_id.to_string(),
@@ -2821,13 +2631,17 @@ async fn fetch_and_place_deferred(
     );
     // Surface the placement fetch as a live operation for the UI.
     let placing = operations.begin(operations::OperationKind::placing_file(file_id));
-    let (fetch_respond, fetch_result) = tokio::sync::oneshot::channel();
-    pending_fetches
-        .start_local_fetch(file_id, expected_hash.clone(), fetch_respond)
-        .await;
 
-    let content = match fetch_result.await {
-        Ok(Ok(content)) => {
+    let content = match fetch_via_relay(
+        pending_fetches,
+        file_id,
+        expected_hash.clone(),
+        expected_size,
+        None,
+    )
+    .await
+    {
+        Ok(content) => {
             log::debug!(
                 "reconcile_tag_placement: fetch of {} succeeded; materializing",
                 file_id.to_string()
@@ -2835,22 +2649,14 @@ async fn fetch_and_place_deferred(
             placing.complete();
             content
         }
-        Ok(Err(error)) => {
-            // No peer had the bytes (or it timed out). Soft deferral: a later
-            // reconnect / announcement retries placement.
+        Err(error) => {
+            // No peer had the bytes. Soft deferral: a later reconnect /
+            // announcement retries placement.
             log::debug!(
                 "reconcile_tag_placement: fetch of {} failed ({error:?}); placement deferred until a peer can serve it",
                 file_id.to_string()
             );
             placing.fail(format!("{error:?}"));
-            return;
-        }
-        Err(_) => {
-            log::warn!(
-                "reconcile_tag_placement: fetch engine dropped responder for {}",
-                file_id.to_string()
-            );
-            placing.fail("fetch engine dropped responder");
             return;
         }
     };
@@ -2879,6 +2685,68 @@ async fn fetch_and_place_deferred(
             file_id.to_string()
         );
     }
+}
+
+/// On-demand fetch of `(file_id, content_hash)` through the content-keyed
+/// relay, flooding across the live peer tree (no preferred direction). Returns
+/// the completed temp file, or an error if no reachable holder could serve it.
+///
+/// Used by `onisync edit`, deferred TagBased placement, and the restore
+/// availability probe. Unlike a live-sync pull (which directs the first request
+/// toward the announcing origin), the direction here is unknown, so the first
+/// request for each chunk floods; whichever direction answers establishes the
+/// route for subsequent chunks.
+async fn fetch_via_relay(
+    pending_fetches: &PendingFetches,
+    file_id: FileId,
+    content_hash: String,
+    expected_size: u64,
+    progress: Option<transfer::ProgressSink>,
+) -> Result<FileBytes, bus::FetchError> {
+    let temp_dir = std::env::temp_dir().join(format!("onisync-fetch-{}", std::process::id()));
+    if let Err(error) = tokio::fs::create_dir_all(&temp_dir).await {
+        log::warn!("Failed to create fetch temp dir: {error}");
+    }
+    let temp_path = temp_dir.join(uuid::Uuid::new_v4().to_string());
+
+    let outcome_rx = spawn_content_receive(
+        pending_fetches,
+        file_id,
+        content_hash,
+        expected_size,
+        temp_path,
+        None,
+        progress,
+    );
+
+    match outcome_rx.await {
+        Ok(ReceiveOutcome::Complete(content)) => Ok(content),
+        Ok(ReceiveOutcome::Failed(_)) => Err(bus::FetchError::NotAvailable),
+        Err(_) => Err(bus::FetchError::NotAvailable),
+    }
+}
+
+/// Availability probe: does *anyone* in the live peer tree still hold the bytes
+/// for `(file_id, content_hash)`? Rather than a separate discovery message this
+/// is a single offset-0 `ChunkRequest` routed through the relay (flooding),
+/// whose returned bytes are discarded. Any `ChunkData` proves availability;
+/// exhaustion (`ChunkMiss` from all directions) or the TTL proves absence.
+///
+/// Used by restore before clearing a tombstone, so we never announce a restore
+/// whose bytes cannot be recovered.
+async fn probe_availability(
+    pending_fetches: &PendingFetches,
+    file_id: FileId,
+    content_hash: String,
+) -> bool {
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<ChunkReply>();
+    // Direction unknown: flood. The relay registers this as a `Local` waiter for
+    // offset 0 and forwards to all neighbours.
+    pending_fetches
+        .request_chunk_local(file_id, content_hash, 0, None, reply_tx)
+        .await;
+
+    matches!(reply_rx.recv().await, Some(ChunkReply::Data { .. }))
 }
 
 // This is the single change-handling pipeline task; its parameters are the
@@ -3446,8 +3314,9 @@ async fn handle_changes(
 
         // Route the two bus message kinds. A `Fetch` is an on-demand request
         // for a file's bytes (from `onisync edit`): satisfy it locally if we
-        // hold matching content, otherwise flood a `FetchRequest` to peers. A
-        // `Change` falls through to the DB-writer pipeline below.
+        // hold matching content, otherwise drive a content-addressed receive
+        // that floods `ChunkRequest`s to peers. A `Change` falls through to the
+        // DB-writer pipeline below.
         let ingest = match message {
             DaemonMessage::Change(ingest, change_origin) => (ingest, change_origin),
             DaemonMessage::Fetch {
@@ -3462,28 +3331,40 @@ async fn handle_changes(
                     return;
                 }
 
-                // Surface this on-demand fetch as a live operation. Interpose a
-                // oneshot so we can observe the outcome (to set the terminal
-                // state) before forwarding it to the original waiter.
-                let fetching = operations.begin(operations::OperationKind::fetching(file_id));
-                let (proxy_tx, proxy_rx) =
-                    tokio::sync::oneshot::channel::<Result<FileBytes, bus::FetchError>>();
-                tokio::spawn(async move {
-                    // If the fetch engine drops the responder, `proxy_rx` errors:
-                    // `fetching` then drops here (marked aborted) and the waiter
-                    // is left to time out, matching the pre-existing behaviour.
-                    if let Ok(result) = proxy_rx.await {
-                        match &result {
-                            Ok(_) => fetching.complete(),
-                            Err(error) => fetching.fail(error.to_string()),
-                        }
-                        let _ = respond_to.send(result);
+                // Resolve the version's authoritative size (needed to bound the
+                // receive) from the catalog. The catalog is byte-independent, so
+                // this is known for any file we know about even if its bytes are
+                // not local. Without a matching version we cannot fetch by hash.
+                let expected_size = match database.latest_version(file_id) {
+                    Ok(Some(version)) if version.content_hash == expected_hash => {
+                        version.size as u64
                     }
-                });
+                    _ => {
+                        let _ = respond_to.send(Err(bus::FetchError::NotAvailable));
+                        return;
+                    }
+                };
 
-                pending_fetches
-                    .start_local_fetch(file_id, expected_hash, proxy_tx)
+                // Surface this on-demand fetch as a live operation, then drive
+                // the content-addressed receive off-loop (flooding across the
+                // peer tree) so the single-threaded consumer is not blocked.
+                let fetching = operations.begin(operations::OperationKind::fetching(file_id));
+                let pending_fetches_fetch = pending_fetches.clone();
+                tokio::spawn(async move {
+                    let result = fetch_via_relay(
+                        &pending_fetches_fetch,
+                        file_id,
+                        expected_hash,
+                        expected_size,
+                        None,
+                    )
                     .await;
+                    match &result {
+                        Ok(_) => fetching.complete(),
+                        Err(error) => fetching.fail(error.to_string()),
+                    }
+                    let _ = respond_to.send(result);
+                });
 
                 continue;
             }
@@ -3560,11 +3441,8 @@ async fn handle_changes(
                     let available = if locally_available {
                         true
                     } else {
-                        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel::<bool>();
-                        pending_fetches_probe
-                            .start_local_probe(file_id, content_hash.clone(), probe_tx)
-                            .await;
-                        probe_rx.await.unwrap_or(false)
+                        probe_availability(&pending_fetches_probe, file_id, content_hash.clone())
+                            .await
                     };
 
                     if !available {
@@ -4046,10 +3924,11 @@ async fn handle_changes(
 
                 // Forward the announcement to our other peers immediately so the
                 // catalog propagates across the whole tree, independent of
-                // whether we pull the bytes. A downstream peer that then
-                // `TransferStart`s against us before (or without) us holding the
-                // bytes gets a graceful `TransferAbort` and fetches elsewhere /
-                // on demand.
+                // whether we pull the bytes. A downstream peer that then sends a
+                // `ChunkRequest` against us before (or without) us holding the
+                // bytes gets a `ChunkMiss` (we relay it onward), so it fetches
+                // from another holder — this is the fix for the central-relay
+                // race the design targets.
                 forward_to_peers(
                     &configuration,
                     &runtime_configuration,

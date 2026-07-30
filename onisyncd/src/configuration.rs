@@ -244,9 +244,9 @@ pub struct RuntimePeer {
     /// Sender into the outbound WebSocket task for this peer.
     /// `None` when no connection is currently established.
     ///
-    /// Carries `Frame` (not raw `Change`) because reconciliation and transfer
-    /// messages (`Sync::Manifest`, `Sync::TransferStart`, ...) share the same
-    /// outbound queue as live changes. `forward_to_peers` wraps in
+    /// Carries `Frame` (not raw `Change`) because reconciliation and chunk
+    /// transfer messages (`Sync::Manifest`, `Sync::ChunkRequest`, ...) share the
+    /// same outbound queue as live changes. `forward_to_peers` wraps in
     /// `Frame::Change`.
     pub outbound: Option<UnboundedSender<Frame>>,
     /// Command channel into this peer's live session, used by `handle_changes`

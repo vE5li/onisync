@@ -20,7 +20,7 @@ pub use onisync_core::{FileId, FileInfo, TagId};
 pub use onisyncd::api::{ApiError, ApiEvent};
 pub use onisyncd::database::{DeletedRule, SubtagRule, Tag};
 pub use onisyncd::operations::{
-    Direction, Operation, OperationEvent, OperationKind, OperationStatus, ServeSource,
+    Direction, Operation, OperationEvent, OperationKind, OperationStatus,
 };
 use onisyncd::paths::Paths;
 use onisyncd::transport::{
@@ -148,10 +148,10 @@ pub struct QueryEntries {
 /// classes. This DTO re-expresses the same information as flat, displayable
 /// fields.
 ///
-/// `kind` is a stable machine string (e.g. `"sending_file"`,
-/// `"receiving_file"`, `"connecting_to_peer"`) the UI switches on to choose an
-/// icon/label. The optional fields carry whatever that kind provides; a field
-/// is empty/None for kinds that do not use it.
+/// `kind` is a stable machine string (e.g. `"receiving_file"`,
+/// `"connecting_to_peer"`) the UI switches on to choose an icon/label. The
+/// optional fields carry whatever that kind provides; a field is empty/None for
+/// kinds that do not use it.
 pub struct OperationEntry {
     /// Stable id for the life of the operation; the UI keys rows on it so a
     /// row updates in place from start through progress to its terminal state.
@@ -162,9 +162,6 @@ pub struct OperationEntry {
     pub peer_name: Option<String>,
     /// The file this operation concerns, as its id string, if any.
     pub file_id: Option<String>,
-    /// For `sending_file`: where the bytes are read from
-    /// (`"sync_directory"` / `"provider"` / `"fetch_cache"`).
-    pub serve_source: Option<String>,
     /// The current lifecycle status.
     pub status: OperationStatusDto,
     /// Bytes/entries done so far, when the operation reports progress.
@@ -191,14 +188,13 @@ pub enum OperationStatusDto {
 
 impl From<Operation> for OperationEntry {
     fn from(operation: Operation) -> Self {
-        let (kind, peer_name, file_id, serve_source) = flatten_kind(&operation.kind);
+        let (kind, peer_name, file_id) = flatten_kind(&operation.kind);
         let (status, progress_done, progress_total) = flatten_status(&operation.status);
         Self {
             id: operation.id.as_u64(),
             kind,
             peer_name,
             file_id,
-            serve_source,
             status,
             progress_done,
             progress_total,
@@ -208,16 +204,12 @@ impl From<Operation> for OperationEntry {
     }
 }
 
-/// Flatten an [`OperationKind`] into `(kind, peer_name, file_id,
-/// serve_source)`.
-fn flatten_kind(kind: &OperationKind) -> (String, Option<String>, Option<String>, Option<String>) {
+/// Flatten an [`OperationKind`] into `(kind, peer_name, file_id)`.
+fn flatten_kind(kind: &OperationKind) -> (String, Option<String>, Option<String>) {
     match kind {
-        OperationKind::ConnectingToPeer { peer_name, .. } => (
-            "connecting_to_peer".to_owned(),
-            Some(peer_name.clone()),
-            None,
-            None,
-        ),
+        OperationKind::ConnectingToPeer { peer_name, .. } => {
+            ("connecting_to_peer".to_owned(), Some(peer_name.clone()), None)
+        }
         OperationKind::PeerConnected {
             peer_name,
             direction,
@@ -230,54 +222,25 @@ fn flatten_kind(kind: &OperationKind) -> (String, Option<String>, Option<String>
             .to_owned(),
             Some(peer_name.clone()),
             None,
-            None,
-        ),
-        OperationKind::SendingFile {
-            file_id,
-            peer_name,
-            source,
-        } => (
-            "sending_file".to_owned(),
-            Some(peer_name.clone()),
-            Some(file_id.clone()),
-            Some(
-                match source {
-                    ServeSource::SyncDirectory => "sync_directory",
-                    ServeSource::Provider => "provider",
-                    ServeSource::FetchCache => "fetch_cache",
-                }
-                .to_owned(),
-            ),
         ),
         OperationKind::ReceivingFile { file_id, peer_name } => (
             "receiving_file".to_owned(),
             Some(peer_name.clone()),
             Some(file_id.clone()),
-            None,
         ),
         OperationKind::Fetching { file_id } => {
-            ("fetching".to_owned(), None, Some(file_id.clone()), None)
+            ("fetching".to_owned(), None, Some(file_id.clone()))
         }
-        OperationKind::RelayingFetch { file_id, from_peer } => (
-            "relaying_fetch".to_owned(),
-            Some(from_peer.clone()),
-            Some(file_id.clone()),
-            None,
-        ),
         OperationKind::ReconcilingManifest { peer_name } => (
             "reconciling_manifest".to_owned(),
             Some(peer_name.clone()),
             None,
-            None,
         ),
-        OperationKind::ReconcilingTags { peer_name } => (
-            "reconciling_tags".to_owned(),
-            Some(peer_name.clone()),
-            None,
-            None,
-        ),
+        OperationKind::ReconcilingTags { peer_name } => {
+            ("reconciling_tags".to_owned(), Some(peer_name.clone()), None)
+        }
         OperationKind::PlacingFile { file_id } => {
-            ("placing_file".to_owned(), None, Some(file_id.clone()), None)
+            ("placing_file".to_owned(), None, Some(file_id.clone()))
         }
     }
 }

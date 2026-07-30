@@ -98,10 +98,11 @@ pub enum DaemonMessage {
     /// A mutation to apply. Fire-and-forget: no reply.
     Change(Ingest, ChangeOrigin),
     /// An on-demand request for a file's bytes (used by `onisync edit` when
-    /// the file is not present locally). `handle_changes` seeds a local-origin
-    /// entry in the pending-fetch table, floods `Sync::FetchRequest` to peers,
-    /// and resolves `respond_to` when a matching `FetchFound` arrives (or with
-    /// an error on timeout / exhaustion).
+    /// the file is not present locally). `handle_changes` resolves the version's
+    /// size from the catalog and drives a content-addressed receive that floods
+    /// `Sync::ChunkRequest`s across the live peer tree (via the content-keyed
+    /// relay), resolving `respond_to` when the bytes arrive (or with an error if
+    /// no reachable holder can serve them).
     Fetch {
         file_id: FileId,
         /// The BLAKE3 hex digest the requester expects; a peer's bytes are only
@@ -135,7 +136,7 @@ pub enum DaemonMessage {
     /// Enqueued by a peer session's connect-time reconciliation sweep so
     /// the fetch runs inside `handle_changes` rather than blocking the
     /// session's frame loop (the fetch needs that loop to relay
-    /// `FetchRequest`/`FetchFound`). Fire-and-forget.
+    /// `ChunkRequest`/`ChunkData`). Fire-and-forget.
     ReconcilePlacement { file_id: FileId },
     /// Record a file + version into the catalog (`files` + `file_versions`) on
     /// behalf of a peer session's `Manifest` reconciliation. The session
