@@ -1287,10 +1287,25 @@ impl SyncDirectoryManager {
                 sync_directory_path,
             } => {
                 let sync_directory = self.sync_directory_for_path(&sync_directory_path)?;
-                let file = sync_directory
-                    .database
-                    .get_file(file_id)
-                    .map_err(|_| SyncDirectoryError::FailedRemovingFile)?;
+                // Tolerate a missing per-directory row: the file was either
+                // never placed in this directory (e.g. a TagBased directory
+                // whose tag filter never matched) or a previous `RemoveFile`
+                // for the same `file_id` already cleaned it up. Either way
+                // there is nothing to do here; treat it as a successful no-op
+                // rather than an error to avoid spurious `FailedRemovingFile`
+                // log noise on idempotent redeliveries.
+                let file = match sync_directory.database.get_file(file_id) {
+                    Ok(file) => file,
+                    Err(DatabaseError::MissingFile) => {
+                        log::debug!(
+                            "RemoveFile: {} not tracked in {}; nothing to do",
+                            file_id.to_string(),
+                            sync_directory.path.to_string_lossy()
+                        );
+                        return Ok(());
+                    }
+                    Err(_) => return Err(SyncDirectoryError::FailedRemovingFile),
+                };
 
                 // Recovery vault: a Universal directory with `keep_deleted_files`
                 // retains its physical copy (and its per-directory DB row) on

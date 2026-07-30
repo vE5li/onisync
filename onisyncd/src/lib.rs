@@ -1782,18 +1782,24 @@ fn reconcile_peer_manifest(
         // than the delete keeps the file live (the content path below handles
         // bytes).
         if entry.deleted {
+            // If we already hold a tombstone for this file, we are in the same
+            // terminal state as the peer and there is nothing to do — regardless
+            // of whose `deleted_at` is larger. Skipping here prevents pointless
+            // re-enqueuing of `Change::FileDeleted` on every manifest exchange,
+            // which would otherwise re-run the fan-out (`RemoveFile` per sync
+            // directory, forward-to-peers) for a delete that has already fully
+            // converged.
+            let ours = database.file_deletion_state(entry.file_id).ok().flatten();
+            if ours.as_ref().is_some_and(|state| state.deleted) {
+                continue;
+            }
             let ours_observed_at = database
                 .latest_version(entry.file_id)
                 .ok()
                 .flatten()
                 .map(|version| version.observed_at)
                 .unwrap_or(0);
-            let ours_restored_at = database
-                .file_deletion_state(entry.file_id)
-                .ok()
-                .flatten()
-                .map(|state| state.restored_at)
-                .unwrap_or(0);
+            let ours_restored_at = ours.map(|state| state.restored_at).unwrap_or(0);
             if entry.deleted_at > ours_observed_at.max(ours_restored_at) {
                 log::debug!(
                     "Applying peer delete for {} from {peer_name} (deleted_at={} > max(ours_observed_at={ours_observed_at}, \
@@ -4209,12 +4215,41 @@ async fn handle_changes(
                         }
                     };
 
+                // Idempotent-redelivery guard: if we already hold a tombstone
+                // for this file, we're in the same terminal state as the
+                // sender. Skip the DB write, the per-sync-directory fan-out,
+                // and the forward. Without this, a peer redelivering a delete
+                // we've already applied would spuriously re-run `RemoveFile`
+                // (which fails with `FailedRemovingFile` because the
+                // per-sync-directory row is already gone) and re-broadcast the
+                // change, causing tombstones to pile up across the mesh on
+                // every reconnect.
+                match database.file_deletion_state(*file_id) {
+                    Ok(Some(state)) if state.deleted => {
+                        log::debug!(
+                            "Ignoring FileDeleted for {} (already tombstoned)",
+                            file_id.to_string()
+                        );
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        log::error!(
+                            "FileDeleted: failed to read deletion state for {}: {:?}; skipping",
+                            file_id.to_string(),
+                            error
+                        );
+                        continue;
+                    }
+                }
+
                 match database.remove_file(*file_id, *deleted_at) {
                     Ok(true) => {}
                     Ok(false) => {
-                        // A newer edit out-dated this delete (last-writer-wins):
-                        // the file stays live. Do not remove it from sync
-                        // directories or forward the delete.
+                        // A newer edit or restore out-dated this delete
+                        // (last-writer-wins): the file stays live. Do not
+                        // remove it from sync directories or forward the
+                        // delete.
                         log::debug!(
                             "Ignoring FileDeleted for {} (a newer version supersedes it)",
                             file_id.to_string()
@@ -4954,5 +4989,51 @@ mod reconcile_tests {
         assert!(deletions.is_empty(), "stale delete must not win");
         // Equal latest hash means nothing to pull either.
         assert!(wanted.is_empty());
+    }
+
+    /// A peer's delete tombstone for a file we already hold as tombstoned must
+    /// not be scheduled again. Without this short-circuit, every manifest
+    /// exchange would re-enqueue `Change::FileDeleted` for every dead file,
+    /// re-running the per-sync-directory fan-out (spurious
+    /// `FailedRemovingFile`) and re-broadcasting the delete to peers, causing
+    /// tombstones to pile up across the mesh on every reconnect.
+    #[test]
+    fn peer_delete_for_already_tombstoned_file_is_ignored() {
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("f.txt"), 0)
+            .unwrap();
+        database.record_version(file_id, "v1", "local", 1).unwrap();
+        // Locally tombstone the file at some timestamp.
+        let ours_deleted_at = database::now_millis() + 5_000;
+        assert!(database.remove_file(file_id, ours_deleted_at).unwrap());
+
+        // The peer's manifest also reports the file as deleted. Regardless of
+        // whether its `deleted_at` matches ours, precedes ours, or exceeds
+        // ours, the outcome must be a no-op: we're already in the terminal
+        // tombstoned state.
+        for peer_deleted_at in [ours_deleted_at - 1, ours_deleted_at, ours_deleted_at + 1] {
+            let entry = ManifestEntry {
+                file_id,
+                history: vec![(1, "v1".to_owned(), 1)],
+                latest_observed_at: 0,
+                logical_path: LogicalPath::new("f.txt"),
+                logical_path_modified_at: 0,
+                deleted: true,
+                deleted_at: peer_deleted_at,
+                restored_at: 0,
+            };
+
+            let (wanted, deletions, moves, restores) =
+                reconcile_peer_manifest("peer", vec![entry], &database);
+            assert!(wanted.is_empty(), "no bytes to pull for a tombstoned file");
+            assert!(
+                deletions.is_empty(),
+                "already-tombstoned file must not schedule another delete (peer_deleted_at={peer_deleted_at})"
+            );
+            assert!(moves.is_empty());
+            assert!(restores.is_empty());
+        }
     }
 }

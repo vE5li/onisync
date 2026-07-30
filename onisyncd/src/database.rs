@@ -1301,15 +1301,24 @@ impl FileDatabase {
     /// (a peer offline during the delete learns of it on reconnect) and can win
     /// last-writer-wins against a stale "present".
     ///
-    /// Three-way last-writer-wins guard: the delete is applied only if
-    /// `deleted_at` is strictly newer than **both** the file's latest recorded
-    /// version `observed_at` (restore-after-edit) **and** its `restored_at`
-    /// (an explicit restore). Equivalently, the delete wins iff
+    /// Precondition: the file is currently live (not already tombstoned).
+    /// Callers filter out redundant redeliveries via
+    /// [`file_deletion_state`](Self::file_deletion_state) beforehand — a
+    /// tombstone is a terminal state, and comparing one `deleted_at` against
+    /// another is meaningless (both peers converge on the originator's stamp).
+    /// This function therefore only decides live-vs-tombstoned, never
+    /// tombstoned-vs-tombstoned.
+    ///
+    /// Last-writer-wins guard: the delete is applied only if `deleted_at` is
+    /// strictly newer than **both** the file's latest recorded version
+    /// `observed_at` (restore-after-edit) **and** its `restored_at` (an
+    /// explicit restore). Equivalently, the delete wins iff
     /// `deleted_at > max(latest observed_at, restored_at)`. The `file_versions`
     /// history is left intact.
     ///
-    /// Returns `true` if the tombstone was applied, `false` if a newer edit or
-    /// restore out-dated it (the file stays live).
+    /// Returns `true` if the file transitioned from live to tombstoned;
+    /// `false` if a newer edit or restore out-dated the delete and the file
+    /// stays live.
     pub fn remove_file(&self, file_id: FileId, deleted_at: i64) -> Result<bool, DatabaseError> {
         let latest_observed_at = self
             .latest_version(file_id)?
@@ -3224,7 +3233,7 @@ mod tests {
         // Regression: tagging a file then deleting the *tag* (not untagging)
         // leaves the relationship live but the tag row tombstoned. The applied-
         // tags read must exclude it so the UI doesn't fetch a MissingTag.
-        let mut database = memory_db();
+        let database = memory_db();
         let file_id = FileId::new();
         let tag_id = TagId::new();
         database
