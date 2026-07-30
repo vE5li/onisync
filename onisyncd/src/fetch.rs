@@ -211,7 +211,11 @@ impl PendingFetches {
             None => self.connected_peers(None).await,
         };
 
+        let short = short_hash(&content_hash);
         if targets.is_empty() {
+            log::debug!(
+                "relay[{short}]: local request offset={offset}: no connected peers; local miss"
+            );
             let _ = reply_tx.send(ChunkReply::Miss { offset });
             return;
         }
@@ -222,10 +226,19 @@ impl PendingFetches {
             match table.get_mut(&key) {
                 Some(entry) => {
                     entry.downstream.push(Waiter::Local(reply_tx));
+                    log::trace!(
+                        "relay[{short}]: local request offset={offset} coalesced onto existing entry ({} downstream)",
+                        entry.downstream.len()
+                    );
                 }
                 None => {
-                    let upstream_outstanding =
+                    let upstream_outstanding: HashSet<String> =
                         targets.iter().map(|peer| peer.public_key.clone()).collect();
+                    log::debug!(
+                        "relay[{short}]: local request offset={offset}: new entry, forwarding to {} upstream {:?}",
+                        upstream_outstanding.len(),
+                        upstream_outstanding
+                    );
                     table.insert(
                         key.clone(),
                         WaiterEntry {
@@ -267,9 +280,13 @@ impl PendingFetches {
         offset: u64,
     ) {
         let key = (file_id, content_hash.clone(), offset);
+        let short = short_hash(&content_hash);
 
         let peers = self.connected_peers(Some(from_public_key)).await;
         if peers.is_empty() {
+            log::debug!(
+                "relay[{short}]: request offset={offset} from {from_public_key}: no other neighbours; miss back"
+            );
             if let Some(sender) = self.peer_outbound(from_public_key).await {
                 let _ = sender.send(Frame::Sync(SyncMessage::ChunkMiss {
                     file_id,
@@ -286,10 +303,19 @@ impl PendingFetches {
             match table.get_mut(&key) {
                 Some(entry) => {
                     entry.downstream.push(Waiter::Peer(from_public_key.to_owned()));
+                    log::trace!(
+                        "relay[{short}]: request offset={offset} from {from_public_key} coalesced ({} downstream)",
+                        entry.downstream.len()
+                    );
                 }
                 None => {
-                    let upstream_outstanding =
+                    let upstream_outstanding: HashSet<String> =
                         peers.iter().map(|peer| peer.public_key.clone()).collect();
+                    log::debug!(
+                        "relay[{short}]: request offset={offset} from {from_public_key}: forwarding to {} upstream {:?}",
+                        upstream_outstanding.len(),
+                        upstream_outstanding
+                    );
                     table.insert(
                         key.clone(),
                         WaiterEntry {
@@ -327,21 +353,32 @@ impl PendingFetches {
         bytes: Vec<u8>,
     ) {
         let key = (file_id, content_hash.clone(), offset);
+        let short = short_hash(&content_hash);
         let entry = {
             let mut table = self.inner.lock().await;
             table.remove(&key)
         };
-        let Some(entry) = entry else { return };
+        let Some(entry) = entry else {
+            log::trace!(
+                "relay[{short}]: data offset={offset} ({} bytes) but no waiter entry (late/duplicate); dropping",
+                bytes.len()
+            );
+            return;
+        };
 
+        let mut local = 0usize;
+        let mut peers = 0usize;
         for waiter in entry.downstream {
             match waiter {
                 Waiter::Local(reply) => {
+                    local += 1;
                     let _ = reply.send(ChunkReply::Data {
                         offset,
                         bytes: bytes.clone(),
                     });
                 }
                 Waiter::Peer(public_key) => {
+                    peers += 1;
                     if let Some(sender) = self.peer_outbound(&public_key).await {
                         let _ = sender.send(Frame::Sync(SyncMessage::ChunkData {
                             file_id,
@@ -353,6 +390,10 @@ impl PendingFetches {
                 }
             }
         }
+        log::debug!(
+            "relay[{short}]: data offset={offset} ({} bytes) fanned to {local} local + {peers} peer waiter(s)",
+            bytes.len()
+        );
     }
 
     /// Handle an inbound `ChunkMiss` from `from_public_key`. Remove it from the
@@ -366,18 +407,31 @@ impl PendingFetches {
         offset: u64,
     ) {
         let key = (file_id, content_hash.clone(), offset);
+        let short = short_hash(&content_hash);
         let exhausted = {
             let mut table = self.inner.lock().await;
             match table.get_mut(&key) {
                 Some(entry) => {
                     entry.upstream_outstanding.remove(from_public_key);
                     if entry.upstream_outstanding.is_empty() {
+                        log::debug!(
+                            "relay[{short}]: miss offset={offset} from {from_public_key}: all upstreams exhausted; fanning miss down"
+                        );
                         table.remove(&key)
                     } else {
+                        log::trace!(
+                            "relay[{short}]: miss offset={offset} from {from_public_key}: {} upstream(s) still outstanding",
+                            entry.upstream_outstanding.len()
+                        );
                         None
                     }
                 }
-                None => None,
+                None => {
+                    log::trace!(
+                        "relay[{short}]: miss offset={offset} from {from_public_key} but no waiter entry; ignoring"
+                    );
+                    None
+                }
             }
         };
 
@@ -410,6 +464,12 @@ impl PendingFetches {
                     exhausted.push((key, entry));
                 }
             }
+        }
+        if !exhausted.is_empty() {
+            log::debug!(
+                "relay: link {public_key} dropped; failing {} affected waiter entry/entries",
+                exhausted.len()
+            );
         }
         for ((file_id, content_hash, offset), entry) in exhausted {
             self.fan_miss(file_id, &content_hash, offset, entry).await;
@@ -462,10 +522,20 @@ impl PendingFetches {
             };
             if let Some(entry) = entry {
                 let (file_id, content_hash, offset) = key;
+                log::debug!(
+                    "relay[{}]: TTL expired for offset={offset}; fanning miss to {} downstream waiter(s)",
+                    short_hash(&content_hash),
+                    entry.downstream.len()
+                );
                 this.fan_miss(file_id, &content_hash, offset, entry).await;
             }
         });
     }
+}
+
+/// A short, log-friendly prefix of a hex content hash (first 8 chars).
+fn short_hash(hash: &str) -> &str {
+    hash.get(..8).unwrap_or(hash)
 }
 
 #[cfg(test)]

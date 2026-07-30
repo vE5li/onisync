@@ -179,6 +179,7 @@ async fn receive_inner(
     replies: &mut UnboundedReceiver<ChunkReply>,
     progress: Option<&ProgressSink>,
 ) -> Result<(), TransferError> {
+    let short = short_hash(content_hash);
     let mut file = tokio::fs::File::create(temp_path)
         .await
         .map_err(TransferError::Io)?;
@@ -189,6 +190,11 @@ async fn receive_inner(
     // authoritative size.
     let request_ceiling = expected_size.max(1);
     let may_request = |offset: u64| offset < request_ceiling;
+    let total_chunks = expected_size.max(1).div_ceil(CHUNK_SIZE as u64);
+
+    log::debug!(
+        "receive[{short}]: start; expected_size={expected_size} ({total_chunks} chunk(s)), window={WINDOW}"
+    );
 
     let mut next_request_offset: u64 = 0;
     let mut in_flight: u64 = 0;
@@ -197,6 +203,10 @@ async fn receive_inner(
 
     // Prime the window, capped so we never request past EOF.
     while in_flight < WINDOW && may_request(next_request_offset) {
+        log::trace!(
+            "receive[{short}]: request offset={next_request_offset} (priming, in_flight will be {})",
+            in_flight + 1
+        );
         requests
             .send(ChunkRequest {
                 offset: next_request_offset,
@@ -205,46 +215,69 @@ async fn receive_inner(
         next_request_offset += CHUNK_SIZE as u64;
         in_flight += 1;
     }
+    log::debug!("receive[{short}]: primed {in_flight} request(s) in flight");
 
     loop {
         // Per-chunk liveness timeout: reset on each successful write (below).
         // A connected-but-silent peer trips this rather than hanging forever.
         let message = match tokio::time::timeout(crate::fetch::HOP_TIMEOUT, replies.recv()).await {
             Ok(Some(message)) => message,
-            Ok(None) => return Err(TransferError::ChannelClosed),
-            Err(_) => return Err(TransferError::LivenessTimeout),
+            Ok(None) => {
+                log::warn!(
+                    "receive[{short}]: reply channel closed at write_offset={write_offset}/{expected_size}"
+                );
+                return Err(TransferError::ChannelClosed);
+            }
+            Err(_) => {
+                log::warn!(
+                    "receive[{short}]: liveness timeout ({:?}) at write_offset={write_offset}/{expected_size}, in_flight={in_flight}",
+                    crate::fetch::HOP_TIMEOUT
+                );
+                return Err(TransferError::LivenessTimeout);
+            }
         };
 
         match message {
             ChunkReply::Data { offset, bytes } => {
+                let len = bytes.len();
                 in_flight = in_flight.saturating_sub(1);
                 // Duplicate for an already-written offset: drop it (races are
                 // free — bytes for a key are bit-identical).
                 if offset < write_offset {
+                    log::trace!(
+                        "receive[{short}]: duplicate data offset={offset} ({len} bytes) already written; dropping"
+                    );
                     continue;
                 }
+                log::trace!(
+                    "receive[{short}]: got data offset={offset} ({len} bytes), in_flight now {in_flight}"
+                );
                 pending.entry(offset).or_insert(bytes);
 
                 // Flush any contiguous chunks starting at write_offset.
-                let mut wrote_any = false;
                 while let Some(chunk) = pending.remove(&write_offset) {
                     hasher.update(&chunk);
                     file.write_all(&chunk).await.map_err(TransferError::Io)?;
                     write_offset += chunk.len() as u64;
-                    wrote_any = true;
                     if let Some(report) = progress {
                         report(write_offset, Some(expected_size));
                     }
                 }
-                let _ = wrote_any;
 
                 // Completion: we have written the whole file.
                 if write_offset >= expected_size {
                     file.flush().await.map_err(TransferError::Io)?;
                     let actual = hasher.finalize().to_hex().to_string();
                     if actual == content_hash {
+                        log::debug!(
+                            "receive[{short}]: complete; wrote {write_offset} bytes, hash verified"
+                        );
                         return Ok(());
                     }
+                    log::warn!(
+                        "receive[{short}]: hash mismatch after {write_offset} bytes (got {})",
+                        short_hash(&actual)
+                    );
                     return Err(TransferError::HashMismatch {
                         expected: content_hash.to_owned(),
                         actual,
@@ -253,6 +286,10 @@ async fn receive_inner(
 
                 // Refill the window, capped so we never request past EOF.
                 while in_flight < WINDOW && may_request(next_request_offset) {
+                    log::trace!(
+                        "receive[{short}]: request offset={next_request_offset} (refill, in_flight will be {})",
+                        in_flight + 1
+                    );
                     requests
                         .send(ChunkRequest {
                             offset: next_request_offset,
@@ -267,12 +304,24 @@ async fn receive_inner(
                 // harmless: ignore it. Otherwise the chunk is unavailable from
                 // every direction the peer session tried, so the receive fails.
                 if offset < write_offset {
+                    log::trace!(
+                        "receive[{short}]: stale miss offset={offset} already written; ignoring"
+                    );
                     continue;
                 }
+                log::warn!(
+                    "receive[{short}]: chunk offset={offset} unavailable from any peer at write_offset={write_offset}/{expected_size}"
+                );
                 return Err(TransferError::ChunkUnavailable { offset });
             }
         }
     }
+}
+
+/// A short, log-friendly prefix of a hex content hash (first 8 chars), so log
+/// lines can correlate a transfer without dumping the full 64-char digest.
+fn short_hash(hash: &str) -> &str {
+    hash.get(..8).unwrap_or(hash)
 }
 
 /// A source of file bytes a holder reads chunks from.
@@ -437,8 +486,11 @@ pub async fn answer_chunk_request<S: ChunkSource>(
     offset: u64,
     pre_verified: bool,
 ) -> ChunkAnswer {
+    let short = short_hash(content_hash);
+
     // Malformed request: offsets must land on chunk boundaries.
     if !offset.is_multiple_of(CHUNK_SIZE as u64) {
+        log::warn!("answer[{short}]: misaligned offset={offset}; miss");
         return ChunkAnswer::Miss;
     }
 
@@ -449,15 +501,40 @@ pub async fn answer_chunk_request<S: ChunkSource>(
             Some(path) => {
                 let (mtime, size) = match tokio::fs::metadata(path).await {
                     Ok(metadata) => (metadata.modified().ok(), metadata.len()),
-                    Err(_) => return ChunkAnswer::Miss,
+                    Err(error) => {
+                        log::debug!(
+                            "answer[{short}]: metadata failed for {}: {error}; miss",
+                            path.display()
+                        );
+                        return ChunkAnswer::Miss;
+                    }
                 };
                 match cache.get(path, mtime, size) {
-                    Some(cached) => cached == content_hash,
+                    Some(cached) => {
+                        log::trace!(
+                            "answer[{short}]: offset={offset} verified from cache (size={size})"
+                        );
+                        cached == content_hash
+                    }
                     None => {
+                        log::debug!(
+                            "answer[{short}]: offset={offset} cache miss; hashing {} ({size} bytes)",
+                            path.display()
+                        );
+                        let started = std::time::Instant::now();
                         let hash = match hash_source(source).await {
                             Some(hash) => hash,
-                            None => return ChunkAnswer::Miss,
+                            None => {
+                                log::debug!("answer[{short}]: hashing failed; miss");
+                                return ChunkAnswer::Miss;
+                            }
                         };
+                        log::debug!(
+                            "answer[{short}]: hashed {} in {:?} -> {}",
+                            path.display(),
+                            started.elapsed(),
+                            short_hash(&hash)
+                        );
                         cache.put(path.to_path_buf(), mtime, size, hash.clone());
                         hash == content_hash
                     }
@@ -470,13 +547,24 @@ pub async fn answer_chunk_request<S: ChunkSource>(
         };
 
         if !verified {
+            log::debug!("answer[{short}]: offset={offset} source does not match hash; miss");
             return ChunkAnswer::Miss;
         }
     }
 
     match source.read_chunk_at(offset, CHUNK_SIZE).await {
-        Ok((bytes, _last)) => ChunkAnswer::Data(bytes),
-        Err(_) => ChunkAnswer::Miss,
+        Ok((bytes, _last)) => {
+            log::trace!(
+                "answer[{short}]: serving offset={offset} ({} bytes){}",
+                bytes.len(),
+                if pre_verified { " [pre-verified]" } else { "" }
+            );
+            ChunkAnswer::Data(bytes)
+        }
+        Err(error) => {
+            log::debug!("answer[{short}]: read failed at offset={offset}: {error}; miss");
+            ChunkAnswer::Miss
+        }
     }
 }
 

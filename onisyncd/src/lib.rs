@@ -1415,6 +1415,11 @@ async fn run_peer_session<S>(
                         content_hash,
                         offset,
                     }) => {
+                        let short = content_hash.get(..8).unwrap_or(&content_hash);
+                        log::debug!(
+                            "peer[{peer_name}] <- ChunkRequest {} [{short}] offset={offset}",
+                            file_id.to_string()
+                        );
                         let answer = answer_local_chunk(
                             &command_sender,
                             &pending_fetches,
@@ -1427,6 +1432,10 @@ async fn run_peer_session<S>(
 
                         match answer {
                             Some(ChunkAnswer::Data(bytes)) => {
+                                log::debug!(
+                                    "peer[{peer_name}] -> ChunkData [{short}] offset={offset} ({} bytes) served locally",
+                                    bytes.len()
+                                );
                                 let _ = our_sender.send(Frame::Sync(SyncMessage::ChunkData {
                                     file_id,
                                     content_hash,
@@ -1438,6 +1447,9 @@ async fn run_peer_session<S>(
                             // impossible-for-a-consistent-catalog case) — treat
                             // as absent and relay so another holder can serve it.
                             Some(ChunkAnswer::Miss) | None => {
+                                log::debug!(
+                                    "peer[{peer_name}]: [{short}] offset={offset} not served locally; relaying"
+                                );
                                 pending_fetches
                                     .relay_chunk_request(
                                         peer_public_key,
@@ -1458,6 +1470,12 @@ async fn run_peer_session<S>(
                         offset,
                         bytes,
                     }) => {
+                        log::debug!(
+                            "peer[{peer_name}] <- ChunkData {} [{}] offset={offset} ({} bytes)",
+                            file_id.to_string(),
+                            content_hash.get(..8).unwrap_or(&content_hash),
+                            bytes.len()
+                        );
                         pending_fetches
                             .handle_chunk_data(file_id, content_hash, offset, bytes)
                             .await;
@@ -1467,6 +1485,11 @@ async fn run_peer_session<S>(
                         content_hash,
                         offset,
                     }) => {
+                        log::debug!(
+                            "peer[{peer_name}] <- ChunkMiss {} [{}] offset={offset}",
+                            file_id.to_string(),
+                            content_hash.get(..8).unwrap_or(&content_hash)
+                        );
                         pending_fetches
                             .handle_chunk_miss(peer_public_key, file_id, content_hash, offset)
                             .await;
@@ -2055,14 +2078,18 @@ async fn read_local_if_hash_matches(
 /// e.g. the CLI uploading) — and serves the canonical chunk at `offset` via
 /// [`transfer::answer_chunk_request`].
 ///
-/// Both sources are already hash-gated by how they are resolved, so each is
-/// served **pre-verified** (no re-hashing per request):
-/// - a sync-directory file only serves when the hash `ReadFile` computed equals
-///   `content_hash`;
-/// - a provider is looked up by its `(file_id, content_hash)` registration key,
-///   which *is* its verification. (Re-hashing a provider would additionally
-///   fire its `on_complete` mid-serve and release the file — see
-///   [`transfer::answer_chunk_request`].)
+/// The sync-directory case resolves only the file's *path* (via `LocalPath`,
+/// which does **not** read or hash the bytes) and lets
+/// [`transfer::answer_chunk_request`] verify against `content_hash` through the
+/// `verified_hashes` cache — so the file is hashed **once** and every
+/// subsequent chunk request is a cache hit plus a bounded seek/read. This keeps
+/// serving a large file O(size) rather than O(size²/chunk): the previous
+/// `ReadFile`-per-chunk path re-hashed the whole file on *every* request (the
+/// cause of large-file download timeouts). A provider is looked up by its
+/// `(file_id, content_hash)` registration key, which *is* its verification, and
+/// is served **pre-verified** (re-hashing a provider would fire its
+/// `on_complete` mid-serve and release the file — see
+/// [`transfer::answer_chunk_request`]).
 ///
 /// Returns `Some(ChunkAnswer::Data)` when we served bytes, `Some(Miss)` when we
 /// hold the file but it does not match or the offset is malformed, and `None`
@@ -2076,25 +2103,24 @@ async fn answer_local_chunk(
     content_hash: &str,
     offset: u64,
 ) -> Option<ChunkAnswer> {
-    // 1. A file in our sync directories. `ReadFile` returns the file's current
-    // on-disk hash; serve only when it matches (pre-verified), else fall
-    // through so another holder / relay can answer.
+    // 1. A file in our sync directories. Resolve just the path (no hashing);
+    // `answer_chunk_request` verifies against `content_hash` via the cache
+    // (hashing once, then serving from the cache on subsequent chunks).
     let (respond_to, response) = tokio::sync::oneshot::channel();
     if command_sender
-        .send(SyncDirectoryCommand::ReadFile { file_id, respond_to })
+        .send(SyncDirectoryCommand::LocalPath { file_id, respond_to })
         .is_ok()
-        && let Ok(Some((_physical_path, content, local_hash))) = response.await
-        && local_hash == content_hash
+        && let Ok(Some(path)) = response.await
     {
-        let path = content.path().map(|path| path.to_path_buf());
+        let source = FileBytes::FileToCopy(path.clone());
         return Some(
             transfer::answer_chunk_request(
-                &content,
-                path.as_deref(),
+                &source,
+                Some(&path),
                 verified_hashes,
                 content_hash,
                 offset,
-                true,
+                /* pre_verified */ false,
             )
             .await,
         );
@@ -2143,6 +2169,13 @@ fn spawn_content_receive(
     progress: Option<transfer::ProgressSink>,
 ) -> tokio::sync::oneshot::Receiver<ReceiveOutcome> {
     let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel();
+
+    log::debug!(
+        "spawn_content_receive: {} [{}] size={expected_size} toward={}",
+        file_id.to_string(),
+        content_hash.get(..8).unwrap_or(&content_hash),
+        toward.as_deref().unwrap_or("<flood>")
+    );
 
     // The receive driver emits `ChunkRequest`s on `req` and awaits `ChunkReply`s
     // on `reply`. The bridge below routes each request through the relay,
@@ -2708,6 +2741,12 @@ async fn fetch_via_relay(
         log::warn!("Failed to create fetch temp dir: {error}");
     }
     let temp_path = temp_dir.join(uuid::Uuid::new_v4().to_string());
+    let short = content_hash.get(..8).unwrap_or(&content_hash).to_owned();
+    log::debug!(
+        "fetch_via_relay: start {} [{short}] size={expected_size} (flood)",
+        file_id.to_string()
+    );
+    let started = std::time::Instant::now();
 
     let outcome_rx = spawn_content_receive(
         pending_fetches,
@@ -2720,9 +2759,29 @@ async fn fetch_via_relay(
     );
 
     match outcome_rx.await {
-        Ok(ReceiveOutcome::Complete(content)) => Ok(content),
-        Ok(ReceiveOutcome::Failed(_)) => Err(bus::FetchError::NotAvailable),
-        Err(_) => Err(bus::FetchError::NotAvailable),
+        Ok(ReceiveOutcome::Complete(content)) => {
+            log::debug!(
+                "fetch_via_relay: {} [{short}] complete in {:?}",
+                file_id.to_string(),
+                started.elapsed()
+            );
+            Ok(content)
+        }
+        Ok(ReceiveOutcome::Failed(error)) => {
+            log::warn!(
+                "fetch_via_relay: {} [{short}] failed in {:?}: {error}",
+                file_id.to_string(),
+                started.elapsed()
+            );
+            Err(bus::FetchError::NotAvailable)
+        }
+        Err(_) => {
+            log::warn!(
+                "fetch_via_relay: {} [{short}] receive task dropped",
+                file_id.to_string()
+            );
+            Err(bus::FetchError::NotAvailable)
+        }
     }
 }
 
