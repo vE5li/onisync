@@ -17,6 +17,11 @@ extension OniSyncServiceX on onisync.OniSyncApp {
     await deleteTag(tagId: await resolveTagId(prefix: tagId));
   }
 
+  /// Restore a soft-deleted tag by its string id.
+  Future<void> restoreTagByString(String tagId) async {
+    await restoreTag(tagId: await resolveTagId(prefix: tagId));
+  }
+
   /// Rename a tag identified by its string id.
   Future<void> renameTagByString({
     required String tagId,
@@ -36,6 +41,12 @@ extension OniSyncServiceX on onisync.OniSyncApp {
   /// Delete a file by its string id (as shown in FileEntry.fileId).
   Future<void> deleteFileByString(String fileId) async {
     await deleteFile(fileId: await resolveFileId(prefix: fileId));
+  }
+
+  /// Restore a soft-deleted file by its string id. Best-effort: throws if no
+  /// source still holds the file's bytes.
+  Future<void> restoreFileByString(String fileId) async {
+    await restoreFile(fileId: await resolveFileId(prefix: fileId));
   }
 
   /// Apply a tag (by string id) to a file (by string id).

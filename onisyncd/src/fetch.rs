@@ -52,6 +52,12 @@ enum ReplyTarget {
     /// This request was relayed from a peer; the answer must be sent back to
     /// that peer (identified by public key).
     Peer(String),
+    /// This request is a local *availability probe* (used by restore): the
+    /// caller only wants to know whether the bytes are recoverable somewhere in
+    /// the peer tree, not to pull them. Resolves `true` on the first matching
+    /// `FetchFound` and `false` when the subtree is exhausted (`FetchMissing` /
+    /// timeout / no peers). No transfer is ever opened at the origin.
+    LocalProbe(oneshot::Sender<bool>),
 }
 
 /// A fetch this node is currently awaiting answers for.
@@ -219,11 +225,14 @@ impl PendingFetches {
     /// one public key (the peer a relayed request came from — never echo it
     /// back).
     async fn connected_peers(&self, exclude: Option<&str>) -> Vec<PeerOutbound> {
-        let runtime = self.runtime_configuration.read().await;
-        runtime
+        self.runtime_configuration
+            .read()
+            .await
             .peers
             .iter()
-            .filter(|(public_key, _)| exclude != Some(public_key.as_str()))
+            .filter(|(public_key, _)| {
+                !exclude.is_some_and(|exclude| exclude == public_key.as_str())
+            })
             .filter_map(|(public_key, runtime_peer)| {
                 runtime_peer.outbound.as_ref().map(|sender| PeerOutbound {
                     public_key: public_key.clone(),
@@ -253,6 +262,7 @@ impl PendingFetches {
         respond_to: oneshot::Sender<Result<FileBytes, FetchError>>,
     ) {
         let peers = self.connected_peers(None).await;
+
         if peers.is_empty() {
             log::debug!(
                 "start_local_fetch: {} (hash {}): no connected peers; reporting NotAvailable",
@@ -282,6 +292,72 @@ impl PendingFetches {
                     file_id,
                     expected_hash: expected_hash.clone(),
                     reply_to: ReplyTarget::Local(respond_to),
+                    children_outstanding: children,
+                },
+            );
+        }
+
+        let request = Frame::Sync(SyncMessage::FetchRequest {
+            request_id,
+            file_id,
+            expected_hash,
+        });
+        for peer in &peers {
+            let _ = peer.sender.send(request.clone());
+        }
+
+        self.arm_hop_timeout(request_id);
+    }
+
+    /// Begin an *availability probe*: flood a `FetchRequest` across the live
+    /// peer tree exactly like [`Self::start_local_fetch`], but resolve
+    /// `respond_to` with a plain `bool` and **never open a transfer** at this
+    /// node.
+    ///
+    /// Used by restore to answer "does anyone still hold the bytes for this
+    /// (soft-deleted) file at `expected_hash`?" without eagerly pulling the
+    /// content here. `true` on the first matching `FetchFound`; `false` when
+    /// the subtree is exhausted (all children `FetchMissing` / timed out)
+    /// or there are no connected peers. The caller checks the local
+    /// `keep_deleted_files` vault separately before flooding, so "no peers"
+    /// correctly maps to `false` here.
+    pub async fn start_local_probe(
+        &self,
+        file_id: FileId,
+        expected_hash: String,
+        respond_to: oneshot::Sender<bool>,
+    ) {
+        let peers = self.connected_peers(None).await;
+
+        if peers.is_empty() {
+            log::debug!(
+                "start_local_probe: {} (hash {}): no connected peers; reporting unavailable",
+                file_id.to_string(),
+                expected_hash,
+            );
+            let _ = respond_to.send(false);
+            return;
+        }
+
+        let request_id = RequestId::new();
+        let children: HashSet<String> = peers.iter().map(|peer| peer.public_key.clone()).collect();
+
+        log::debug!(
+            "start_local_probe: {} (hash {}) as request {request_id}; flooding to {} peer(s): {:?}",
+            file_id.to_string(),
+            expected_hash,
+            children.len(),
+            children,
+        );
+
+        {
+            let mut table = self.inner.lock().await;
+            table.insert(
+                request_id,
+                PendingFetch {
+                    file_id,
+                    expected_hash: expected_hash.clone(),
+                    reply_to: ReplyTarget::LocalProbe(respond_to),
                     children_outstanding: children,
                 },
             );
@@ -335,29 +411,34 @@ impl PendingFetches {
         }
 
         let peers = self.connected_peers(Some(from_public_key)).await;
+
         if peers.is_empty() {
             log::debug!(
-                "handle_incoming_request: request {request_id} for {} from {}: not local and no other peers to relay to; answering \
-                 FetchMissing",
+                "Request {request_id} for {} from {}: not local and no other peers to relay to; answering FetchMissing",
                 file_id.to_string(),
                 from_public_key,
             );
+
             if let Some(sender) = self.peer_outbound(from_public_key).await {
                 let _ = sender.send(Frame::Sync(SyncMessage::FetchMissing { request_id }));
             }
+
             return;
         }
 
         let children: HashSet<String> = peers.iter().map(|peer| peer.public_key.clone()).collect();
+
         log::debug!(
-            "handle_incoming_request: request {request_id} for {} from {}: not local; relaying to {} other peer(s): {:?}",
+            "Request {request_id} for {} from {}: not local; relaying to {} other peer(s): {:?}",
             file_id.to_string(),
             from_public_key,
             children.len(),
             children,
         );
+
         {
             let mut table = self.inner.lock().await;
+
             // A duplicate request_id (would only happen on a cyclic graph, which
             // we assume away) is ignored: keep the first registration.
             table.entry(request_id).or_insert(PendingFetch {
@@ -373,6 +454,7 @@ impl PendingFetches {
             file_id,
             expected_hash,
         });
+
         for peer in &peers {
             let _ = peer.sender.send(request.clone());
         }
@@ -399,9 +481,10 @@ impl PendingFetches {
             let mut table = self.inner.lock().await;
             table.remove(&request_id)
         };
+
         let Some(entry) = entry else {
             log::debug!(
-                "handle_incoming_found: FetchFound for {} from {} but no pending entry (late duplicate or already resolved); ignoring",
+                "FetchFound for {} from {} but no pending entry (late duplicate or already resolved); ignoring",
                 file_id.to_string(),
                 from_public_key,
             );
@@ -420,13 +503,21 @@ impl PendingFetches {
         }
 
         log::debug!(
-            "handle_incoming_found: request {request_id} for {} answered by {}; opening receiver transfer",
+            "Request {request_id} for {} answered by {}; opening receiver transfer",
             file_id.to_string(),
             from_public_key,
         );
 
         let then = match entry.reply_to {
             ReplyTarget::Local(sender) => FoundThen::DeliverLocal(sender),
+            // An availability probe (restore): the bytes exist somewhere, which
+            // is all the probe wanted to know. Resolve `true` and open NO
+            // transfer — the actual bytes are pulled later, only into the
+            // directories that want them, by ordinary placement reconciliation.
+            ReplyTarget::LocalProbe(sender) => {
+                let _ = sender.send(true);
+                return None;
+            }
             ReplyTarget::Peer(parent_public_key) => FoundThen::RelayUp {
                 parent_peer: parent_public_key,
                 request_id,
@@ -451,14 +542,17 @@ impl PendingFetches {
     pub async fn handle_incoming_missing(&self, from_public_key: &str, request_id: RequestId) {
         let resolved = {
             let mut table = self.inner.lock().await;
+
             match table.get_mut(&request_id) {
                 Some(entry) => {
                     entry.children_outstanding.remove(from_public_key);
+
                     log::debug!(
                         "handle_incoming_missing: {} reported missing for request {request_id}; {} child(ren) still outstanding",
                         from_public_key,
                         entry.children_outstanding.len(),
                     );
+
                     if entry.children_outstanding.is_empty() {
                         table.remove(&request_id)
                     } else {
@@ -471,6 +565,7 @@ impl PendingFetches {
                          ignoring",
                         from_public_key,
                     );
+
                     None
                 }
             }
@@ -488,9 +583,14 @@ impl PendingFetches {
             request_id,
             entry.file_id.to_string()
         );
+
         match entry.reply_to {
             ReplyTarget::Local(sender) => {
                 let _ = sender.send(Err(FetchError::NotAvailable));
+            }
+            // The probe's subtree is exhausted: nobody holds the bytes.
+            ReplyTarget::LocalProbe(sender) => {
+                let _ = sender.send(false);
             }
             ReplyTarget::Peer(parent_public_key) => {
                 if let Some(sender) = self.peer_outbound(&parent_public_key).await {
@@ -504,17 +604,21 @@ impl PendingFetches {
     /// `request_id` as missing if it is still pending (a child never answered).
     fn arm_hop_timeout(&self, request_id: RequestId) {
         let this = self.clone();
+
         tokio::spawn(async move {
             tokio::time::sleep(HOP_TIMEOUT).await;
+
             let entry = {
                 let mut table = this.inner.lock().await;
                 table.remove(&request_id)
             };
+
             if let Some(entry) = entry {
                 log::debug!(
                     "Fetch {} timed out at a hop; reporting missing upward",
                     request_id
                 );
+
                 this.report_missing(request_id, entry).await;
             }
         });

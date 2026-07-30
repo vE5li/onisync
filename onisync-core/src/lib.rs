@@ -154,6 +154,38 @@ pub mod state {
             /// it when applying a peer's delete.
             deleted_at: i64,
         },
+        /// Un-delete a previously soft-deleted file — a user-initiated restore
+        /// from the deleted-files view.
+        ///
+        /// Semantically this is a *version bump*, not a distinct kind of edit:
+        /// it re-announces the file's latest known version and clears the
+        /// tombstone. It is metadata-only, like `FileMetadataChanged` — the
+        /// receiver pulls the bytes over a separate transfer only into the
+        /// directories that want them.
+        ///
+        /// The originating device only emits this after confirming the bytes
+        /// are still recoverable somewhere (its own `keep_deleted_files` vault
+        /// or a peer that still holds them); a restore with no available source
+        /// fails locally and is never announced. Receivers therefore treat it
+        /// as authoritative — the version exists in the network.
+        FileRestored {
+            file_id: FileId,
+            /// BLAKE3 hex digest of the version being restored (the file's
+            /// latest known version at restore time). Keys the byte pull and is
+            /// recorded as the restored version, exactly like
+            /// `FileMetadataChanged::content_hash`.
+            content_hash: String,
+            /// The restored version's content size in bytes.
+            size: u64,
+            /// The unix-millis wall-clock time the restore happened, stamped on
+            /// the originating device and preserved across the wire. Recorded
+            /// as the restored version's `observed_at` so it beats
+            /// any lingering peer `deleted_at` under
+            /// last-writer-wins — this is what makes the
+            /// un-delete win reconciliation against a peer still holding the
+            /// tombstone. Never restamp it when applying a peer's restore.
+            restored_at: i64,
+        },
         // Tag-mutation variants each carry `modified_at`: the unix-millis
         // wall-clock time stamped on the *originating* device. It is preserved
         // verbatim as the change propagates and drives last-writer-wins
@@ -287,10 +319,17 @@ pub mod state {
         /// Soft-delete tombstone state. When `deleted` is true this entry
         /// advertises a deletion: the receiver applies it (removing/hiding the
         /// file) unless it holds a version whose `observed_at` beats
-        /// `deleted_at` (restore-after-delete, last-writer-wins).
+        /// `deleted_at`, or an explicit restore whose `restored_at` beats it
+        /// (three-way last-writer-wins).
         pub deleted: bool,
         /// The unix-millis time the file was deleted (0 when not deleted).
         pub deleted_at: i64,
+        /// The unix-millis time the file was last explicitly restored (0 when
+        /// never restored). Advertised so a peer that deleted the file while
+        /// offline can be out-voted by our restore under last-writer-wins,
+        /// without either side fabricating a content version. Symmetric to
+        /// `deleted_at`.
+        pub restored_at: i64,
     }
 
     /// What a tag relationship attaches a tag to. Mirrors the daemon's
@@ -499,6 +538,12 @@ pub struct FileInfo {
     /// across concurrent inserts. Consumers highlight
     /// `file_id[..short_id_length]` and dim the remainder.
     pub short_id_length: usize,
+    /// Whether the file is soft-deleted (tombstoned). Always `false` when the
+    /// row was fetched under `DeletedRule::Exclude` (the default). Under
+    /// `DeletedRule::Include` this may be `true`, letting the caller
+    /// distinguish live from tombstoned rows in a mixed result set (and letting
+    /// the UI render a "deleted" badge).
+    pub deleted: bool,
 }
 
 macro_rules! make_id_type {

@@ -18,7 +18,7 @@
 // glob and the generated code fails to compile.
 pub use onisync_core::{FileId, FileInfo, TagId};
 pub use onisyncd::api::{ApiError, ApiEvent};
-pub use onisyncd::database::{SubtagRule, Tag};
+pub use onisyncd::database::{DeletedRule, SubtagRule, Tag};
 pub use onisyncd::operations::{
     Direction, Operation, OperationEvent, OperationKind, OperationStatus, ServeSource,
 };
@@ -49,6 +49,12 @@ pub struct FileEntry {
     /// `jj`/`git`. The UI highlights `file_id[..short_id_length]` and dims the
     /// rest. Computed on read; not stable across concurrent inserts.
     pub short_id_length: i64,
+    /// Whether this file is soft-deleted (tombstoned). Always `false` for rows
+    /// returned by the standard live-only listing/search; only set when the
+    /// caller opted into the "show deleted" view via
+    /// [`DeletedRule::Include`]. The UI uses this to render a "deleted"
+    /// badge distinct from live rows.
+    pub deleted: bool,
 }
 
 impl From<FileInfo> for FileEntry {
@@ -60,6 +66,7 @@ impl From<FileInfo> for FileEntry {
             version_number: info.version_number,
             size: info.size as i64,
             short_id_length: info.short_id_length as i64,
+            deleted: info.deleted,
         }
     }
 }
@@ -84,11 +91,31 @@ pub enum _SubtagRule {
     Exclude,
 }
 
+/// Mirror of [`DeletedRule`] so `flutter_rust_bridge` generates it as a real
+/// Dart *enum* the UI can pass to [`OniSyncApp::run_query`]. Variants MUST
+/// stay in sync with [`onisyncd::database::DeletedRule`]; see the sibling
+/// [`_SubtagRule`] doc for why this mirror declaration exists.
+///
+/// Semantics (see [`onisyncd::database::DeletedRule`]):
+///   * `Exclude` — standard live-only search (default);
+///   * `Include` — search over tombstoned rows too; `run_query` returns only
+///     the tombstoned matches for the "show deleted" toggle.
+#[cfg(feature = "flutter_rust_bridge")]
+#[flutter_rust_bridge::frb(mirror(DeletedRule))]
+pub enum _DeletedRule {
+    Include,
+    Exclude,
+}
+
 /// A tag flattened into primitive fields for the Dart UI (see [`FileEntry`]).
 pub struct TagEntry {
     pub tag_id: String,
     pub name: String,
     pub color: String,
+    /// Whether this tag is soft-deleted (tombstoned). Mirrors
+    /// [`FileEntry::deleted`]: always `false` for standard listings, only
+    /// possibly `true` under [`DeletedRule::Include`].
+    pub deleted: bool,
 }
 
 impl From<Tag> for TagEntry {
@@ -97,6 +124,7 @@ impl From<Tag> for TagEntry {
             tag_id: tag.id.to_string(),
             name: tag.name,
             color: tag.color,
+            deleted: tag.deleted,
         }
     }
 }
@@ -461,13 +489,20 @@ impl OniSyncApp {
     /// The files and tags matching the free-form `query` (`$tag`, `!tag`, and
     /// name substrings), as flattened [`FileEntry`]/[`TagEntry`] rows. Tag
     /// tokens are resolved in the daemon.
+    ///
+    /// `deleted_rule` toggles between the standard live-only view
+    /// ([`DeletedRule::Exclude`]) and the "show deleted" view
+    /// ([`DeletedRule::Include`], which returns *only* tombstoned files/tags
+    /// — see [`Api::run_query`](onisyncd::api::Api::run_query)). This is what
+    /// the UI's "search deleted" toggle wires to.
     pub async fn run_query(
         &self,
         query: String,
         subtag_rule: SubtagRule,
+        deleted_rule: DeletedRule,
     ) -> Result<QueryEntries, ApiError> {
         let backend = self.try_backend()?;
-        let result = backend.run_query(query, subtag_rule).await?;
+        let result = backend.run_query(query, subtag_rule, deleted_rule).await?;
         Ok(QueryEntries {
             files: result.files.into_iter().map(FileEntry::from).collect(),
             tags: result.tags.into_iter().map(TagEntry::from).collect(),
@@ -476,10 +511,23 @@ impl OniSyncApp {
 
     /// Get a single file's flattened [`FileEntry`] by id string (a full or
     /// short id prefix). Errors `NotFound` if unknown.
-    pub async fn get_file_entry(&self, file_id: String) -> Result<FileEntry, ApiError> {
+    ///
+    /// `deleted_rule` mirrors [`Self::run_query`]: under
+    /// [`DeletedRule::Exclude`] a tombstoned file reads as `NotFound` (the
+    /// default for pickers and operational lookups); under
+    /// [`DeletedRule::Include`] it comes back with `FileEntry::deleted =
+    /// true`, so a detail screen opened from the "show deleted" search can
+    /// render its metadata.
+    pub async fn get_file_entry(
+        &self,
+        file_id: String,
+        deleted_rule: DeletedRule,
+    ) -> Result<FileEntry, ApiError> {
         let backend = self.try_backend()?;
         let file_id = backend.resolve_file_id(file_id).await?;
-        Ok(FileEntry::from(backend.get_file(file_id).await?))
+        Ok(FileEntry::from(
+            backend.get_file(file_id, deleted_rule).await?,
+        ))
     }
 
     /// Absolute on-disk path where `file_id`'s bytes currently live locally,
@@ -501,11 +549,16 @@ impl OniSyncApp {
     }
 
     /// Get a single tag's flattened [`TagEntry`] by id string (a full or short
-    /// id prefix). Errors `NotFound` if unknown.
-    pub async fn get_tag_entry(&self, tag_id: String) -> Result<TagEntry, ApiError> {
+    /// id prefix). Errors `NotFound` if unknown. See
+    /// [`Self::get_file_entry`] for the `deleted_rule` semantics.
+    pub async fn get_tag_entry(
+        &self,
+        tag_id: String,
+        deleted_rule: DeletedRule,
+    ) -> Result<TagEntry, ApiError> {
         let backend = self.try_backend()?;
         let tag_id = backend.resolve_tag_id(tag_id).await?;
-        Ok(TagEntry::from(backend.get_tag(tag_id).await?))
+        Ok(TagEntry::from(backend.get_tag(tag_id, deleted_rule).await?))
     }
 
     /// Create a tag; returns the freshly-minted id.
@@ -516,6 +569,14 @@ impl OniSyncApp {
     /// Delete a tag.
     pub async fn delete_tag(&self, tag_id: TagId) -> Result<(), ApiError> {
         self.try_backend()?.delete_tag(tag_id).await
+    }
+
+    /// Restore a soft-deleted tag. Unlike a file restore this always succeeds
+    /// for a known tag (a tag carries no content to recover): it re-announces
+    /// the tag definition with a fresh timestamp, winning last-writer-wins over
+    /// the delete.
+    pub async fn restore_tag(&self, tag_id: TagId) -> Result<(), ApiError> {
+        self.try_backend()?.restore_tag(tag_id).await
     }
 
     /// Rename a tag. The change propagates through the usual event stream, so
@@ -549,6 +610,13 @@ impl OniSyncApp {
     /// Delete a file.
     pub async fn delete_file(&self, file_id: FileId) -> Result<(), ApiError> {
         self.try_backend()?.delete_file(file_id).await
+    }
+
+    /// Restore a soft-deleted file (best-effort). Fails with
+    /// `ApiError::NotFound` if no source (local `keep_deleted_files` vault
+    /// or a connected peer) still holds the file's bytes.
+    pub async fn restore_file(&self, file_id: FileId) -> Result<(), ApiError> {
+        self.try_backend()?.restore_file(file_id).await
     }
 
     /// Move (rename) a file to a new logical path. String-id variant of the

@@ -43,7 +43,7 @@ use onisync_core::{FileId, FileInfo, TagId};
 use tokio::sync::broadcast;
 
 use crate::api::{Api, ApiError, ApiEvent, QueryResult};
-use crate::database::{SubtagRule, Tag};
+use crate::database::{DeletedRule, SubtagRule, Tag};
 use crate::operations::{Operation, OperationEvent};
 
 /// The transport-agnostic UI-facing API.
@@ -83,17 +83,33 @@ pub trait TransportBackend {
 
     /// Run a free-form query (`$tag`, `!tag`, and name substrings) and return
     /// both the matching files and tags. Tag tokens are resolved in the daemon.
+    ///
+    /// `deleted_rule` toggles the "show deleted rows" view; see
+    /// [`Api::run_query`](crate::api::Api::run_query) for the exact semantics.
     fn run_query(
         &self,
         query: String,
         subtag_rule: SubtagRule,
+        deleted_rule: DeletedRule,
     ) -> impl Future<Output = Result<QueryResult, ApiError>> + Send;
 
     /// Get a single file's [`FileInfo`] by id (`NotFound` if unknown).
-    fn get_file(&self, file_id: FileId) -> impl Future<Output = Result<FileInfo, ApiError>> + Send;
+    /// `deleted_rule` controls whether a tombstoned file reads as `NotFound`
+    /// or is returned with `FileInfo::deleted = true` (see
+    /// [`Api::get_file`](crate::api::Api::get_file)).
+    fn get_file(
+        &self,
+        file_id: FileId,
+        deleted_rule: DeletedRule,
+    ) -> impl Future<Output = Result<FileInfo, ApiError>> + Send;
 
-    /// Get a single tag by id (`NotFound` if unknown).
-    fn get_tag(&self, tag_id: TagId) -> impl Future<Output = Result<Tag, ApiError>> + Send;
+    /// Get a single tag by id (`NotFound` if unknown). See [`Self::get_file`]
+    /// for the `deleted_rule` semantics.
+    fn get_tag(
+        &self,
+        tag_id: TagId,
+        deleted_rule: DeletedRule,
+    ) -> impl Future<Output = Result<Tag, ApiError>> + Send;
 
     /// List the subtags (children) of `tag_id` in the tag hierarchy.
     fn subtags_for_tag(
@@ -118,6 +134,9 @@ pub trait TransportBackend {
 
     /// Delete a tag.
     fn delete_tag(&self, tag_id: TagId) -> impl Future<Output = Result<(), ApiError>> + Send;
+
+    /// Restore a soft-deleted tag.
+    fn restore_tag(&self, tag_id: TagId) -> impl Future<Output = Result<(), ApiError>> + Send;
 
     /// Rename a tag.
     fn rename_tag(
@@ -177,6 +196,10 @@ pub trait TransportBackend {
 
     /// Delete a file.
     fn delete_file(&self, file_id: FileId) -> impl Future<Output = Result<(), ApiError>> + Send;
+
+    /// Restore a soft-deleted file (best-effort; fails if no source holds its
+    /// bytes).
+    fn restore_file(&self, file_id: FileId) -> impl Future<Output = Result<(), ApiError>> + Send;
 
     /// Move (rename) a file to a new logical path.
     fn move_file(
@@ -383,16 +406,21 @@ impl TransportBackend for InProcessBackend {
         &self,
         query: String,
         subtag_rule: SubtagRule,
+        deleted_rule: DeletedRule,
     ) -> Result<QueryResult, ApiError> {
-        self.api.run_query(&query, subtag_rule)
+        self.api.run_query(&query, subtag_rule, deleted_rule)
     }
 
-    async fn get_file(&self, file_id: FileId) -> Result<FileInfo, ApiError> {
-        self.api.get_file(file_id)
+    async fn get_file(
+        &self,
+        file_id: FileId,
+        deleted_rule: DeletedRule,
+    ) -> Result<FileInfo, ApiError> {
+        self.api.get_file(file_id, deleted_rule)
     }
 
-    async fn get_tag(&self, tag_id: TagId) -> Result<Tag, ApiError> {
-        self.api.get_tag(tag_id)
+    async fn get_tag(&self, tag_id: TagId, deleted_rule: DeletedRule) -> Result<Tag, ApiError> {
+        self.api.get_tag(tag_id, deleted_rule)
     }
 
     async fn subtags_for_tag(
@@ -417,6 +445,10 @@ impl TransportBackend for InProcessBackend {
 
     async fn delete_tag(&self, tag_id: TagId) -> Result<(), ApiError> {
         self.api.delete_tag(tag_id)
+    }
+
+    async fn restore_tag(&self, tag_id: TagId) -> Result<(), ApiError> {
+        self.api.restore_tag(tag_id)
     }
 
     async fn rename_tag(&self, tag_id: TagId, name: String) -> Result<(), ApiError> {
@@ -475,6 +507,10 @@ impl TransportBackend for InProcessBackend {
 
     async fn delete_file(&self, file_id: FileId) -> Result<(), ApiError> {
         self.api.delete_file(file_id)
+    }
+
+    async fn restore_file(&self, file_id: FileId) -> Result<(), ApiError> {
+        self.api.restore_file(file_id).await
     }
 
     async fn move_file(&self, file_id: FileId, logical_path: String) -> Result<(), ApiError> {
@@ -573,24 +609,31 @@ impl TransportBackend for Backend {
         &self,
         query: String,
         subtag_rule: SubtagRule,
+        deleted_rule: DeletedRule,
     ) -> Result<QueryResult, ApiError> {
         match self {
-            Backend::InProcess(backend) => backend.run_query(query, subtag_rule).await,
-            Backend::Ipc(backend) => backend.run_query(query, subtag_rule).await,
+            Backend::InProcess(backend) => {
+                backend.run_query(query, subtag_rule, deleted_rule).await
+            }
+            Backend::Ipc(backend) => backend.run_query(query, subtag_rule, deleted_rule).await,
         }
     }
 
-    async fn get_file(&self, file_id: FileId) -> Result<FileInfo, ApiError> {
+    async fn get_file(
+        &self,
+        file_id: FileId,
+        deleted_rule: DeletedRule,
+    ) -> Result<FileInfo, ApiError> {
         match self {
-            Backend::InProcess(backend) => backend.get_file(file_id).await,
-            Backend::Ipc(backend) => backend.get_file(file_id).await,
+            Backend::InProcess(backend) => backend.get_file(file_id, deleted_rule).await,
+            Backend::Ipc(backend) => backend.get_file(file_id, deleted_rule).await,
         }
     }
 
-    async fn get_tag(&self, tag_id: TagId) -> Result<Tag, ApiError> {
+    async fn get_tag(&self, tag_id: TagId, deleted_rule: DeletedRule) -> Result<Tag, ApiError> {
         match self {
-            Backend::InProcess(backend) => backend.get_tag(tag_id).await,
-            Backend::Ipc(backend) => backend.get_tag(tag_id).await,
+            Backend::InProcess(backend) => backend.get_tag(tag_id, deleted_rule).await,
+            Backend::Ipc(backend) => backend.get_tag(tag_id, deleted_rule).await,
         }
     }
 
@@ -620,6 +663,13 @@ impl TransportBackend for Backend {
         match self {
             Backend::InProcess(backend) => backend.create_tag(name, color).await,
             Backend::Ipc(backend) => backend.create_tag(name, color).await,
+        }
+    }
+
+    async fn restore_tag(&self, tag_id: TagId) -> Result<(), ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.restore_tag(tag_id).await,
+            Backend::Ipc(backend) => backend.restore_tag(tag_id).await,
         }
     }
 
@@ -685,6 +735,13 @@ impl TransportBackend for Backend {
         match self {
             Backend::InProcess(backend) => backend.delete_file(file_id).await,
             Backend::Ipc(backend) => backend.delete_file(file_id).await,
+        }
+    }
+
+    async fn restore_file(&self, file_id: FileId) -> Result<(), ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.restore_file(file_id).await,
+            Backend::Ipc(backend) => backend.restore_file(file_id).await,
         }
     }
 

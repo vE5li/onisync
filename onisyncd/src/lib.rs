@@ -1259,7 +1259,7 @@ async fn run_peer_session<S>(
                         let reconciling = operations.begin(
                             operations::OperationKind::reconciling_manifest(peer_name),
                         );
-                        let (wanted, deletions, moves) =
+                        let (wanted, deletions, moves, restores) =
                             reconcile_peer_manifest(peer_name, entries, &database);
                         reconciling.complete();
 
@@ -1283,6 +1283,39 @@ async fn run_peer_session<S>(
                             {
                                 log::error!(
                                     "Reconciliation: failed to enqueue delete for {} \
+                                     announced by {peer_name}: {error}",
+                                    file_id.to_string()
+                                );
+                            }
+                        }
+
+                        // Apply peer restores that won last-writer-wins by
+                        // enqueuing them as `Change::FileRestored` through the
+                        // sole DB writer. This reuses the live-restore handler
+                        // (three-way LWW guard, tombstone clear, byte pull,
+                        // forward) — the offline-restore catch-up.
+                        for WantedRestore {
+                            file_id,
+                            restored_at,
+                            content_hash,
+                            size,
+                        } in restores
+                        {
+                            if let Err(error) =
+                                change_sender.send(DaemonMessage::Change(
+                                    Ingest::from_change(Change::FileRestored {
+                                        file_id,
+                                        content_hash,
+                                        size,
+                                        restored_at,
+                                    }),
+                                    ChangeOrigin::Peer {
+                                        public_key: peer_public_key.to_owned(),
+                                    },
+                                ))
+                            {
+                                log::error!(
+                                    "Reconciliation: failed to enqueue restore for {} \
                                      announced by {peer_name}: {error}",
                                     file_id.to_string()
                                 );
@@ -1446,12 +1479,14 @@ async fn run_peer_session<S>(
                         // pulled over a transfer later.
                         let local_size =
                             local_hash_matches(&command_sender, file_id, &expected_hash).await;
+
                         log::debug!(
                             "FetchRequest from {peer_name} for {} (expected_hash {}): \
                              local_size={local_size:?}",
                             file_id.to_string(),
                             expected_hash,
                         );
+
                         pending_fetches
                             .handle_incoming_request(
                                 peer_public_key,
@@ -1481,6 +1516,7 @@ async fn run_peer_session<S>(
                                 size,
                             )
                             .await;
+
                         if let Some(fetch::FoundAction::Receive {
                             from_peer,
                             file_id,
@@ -1494,12 +1530,14 @@ async fn run_peer_session<S>(
                             // our own link. The size carried by `FetchFound` caps
                             // the request window at EOF.
                             let _ = from_peer; // == peer_public_key; kept for clarity
+
                             let (transfer_id, inbound) = start_pull(
                                 file_id,
                                 expected_hash,
                                 expected_size,
                                 ReceiverPurpose::Fetch { then },
                             );
+
                             transfers.insert(transfer_id, inbound);
                         }
                     }
@@ -1523,15 +1561,18 @@ async fn run_peer_session<S>(
                             .peers
                             .get(peer_public_key)
                             .and_then(|runtime_peer| runtime_peer.outbound.clone());
+
                         let Some(outbound) = outbound else {
                             log::warn!(
-                                "No outbound channel registered for {peer_name}; \
-                                 cannot answer tag manifest"
+                                "Peer {peer_name} is not connected; \
+                                 not responding to TagManifest"
                             );
                             continue;
                         };
+
                         let reconciling_tags = operations
                             .begin(operations::OperationKind::reconciling_tags(peer_name));
+
                         reconcile_peer_tag_manifest(
                             peer_name,
                             peer_public_key,
@@ -1553,14 +1594,17 @@ async fn run_peer_session<S>(
                             .peers
                             .get(peer_public_key)
                             .and_then(|runtime_peer| runtime_peer.outbound.clone());
+
                         let Some(outbound) = outbound else {
                             log::warn!(
-                                "No outbound channel for {peer_name}; \
-                                 dropping response to TagRequest"
+                                "Peer {peer_name} is not connected; \
+                                 not responding to TagRequest"
                             );
                             continue;
                         };
+
                         let frame = build_tag_request_response(peer_name, tag_id, &database);
+
                         if let Err(error) = outbound.send(frame) {
                             log::warn!(
                                 "Failed to enqueue tag Sync response for {peer_name}: {error}"
@@ -1839,14 +1883,18 @@ fn build_local_manifest(database: &FileDatabase) -> Result<Vec<ManifestEntry>, S
                 logical_path_modified_at,
                 deleted,
                 deleted_at,
-            )| ManifestEntry {
-                file_id,
-                history,
-                latest_observed_at,
-                logical_path,
-                logical_path_modified_at,
-                deleted,
-                deleted_at,
+                restored_at,
+            )| {
+                ManifestEntry {
+                    file_id,
+                    history,
+                    latest_observed_at,
+                    logical_path,
+                    logical_path_modified_at,
+                    deleted,
+                    deleted_at,
+                    restored_at,
+                }
             },
         )
         .collect())
@@ -1874,12 +1922,30 @@ pub struct WantedFile {
 }
 
 /// A file deletion learned from a peer's manifest that wins last-writer-wins
-/// against our local state (the peer's `deleted_at` is newer than our latest
-/// version `observed_at`). Applied by enqueuing a `Change::FileDeleted`.
+/// against our local state (the peer's `deleted_at` is newer than the newest of
+/// our latest version `observed_at` and our `restored_at`). Applied by
+/// enqueuing a `Change::FileDeleted`.
 #[derive(Debug, Clone)]
 pub struct WantedDeletion {
     pub file_id: FileId,
     pub deleted_at: i64,
+}
+
+/// A file restore learned from a peer's manifest that wins last-writer-wins
+/// against our local delete (the peer advertises the file as live and its
+/// `restored_at` is newer than our `deleted_at`). Applied by enqueuing a
+/// `Change::FileRestored`, which reuses the live-restore handler (three-way LWW
+/// guard, tombstone clear, byte pull, forward). This is the offline-restore
+/// catch-up: an un-delete performed while we were disconnected.
+#[derive(Debug, Clone)]
+pub struct WantedRestore {
+    pub file_id: FileId,
+    pub restored_at: i64,
+    /// The peer's latest content hash, used to pull the bytes back into any
+    /// local sync directory that wants the now-live file.
+    pub content_hash: String,
+    /// The peer's latest content size in bytes.
+    pub size: u64,
 }
 
 /// A logical-path change learned from a peer's manifest for a file we already
@@ -1928,7 +1994,12 @@ fn reconcile_peer_manifest(
     peer_name: &str,
     entries: Vec<ManifestEntry>,
     database: &FileDatabase,
-) -> (Vec<WantedFile>, Vec<WantedDeletion>, Vec<WantedMove>) {
+) -> (
+    Vec<WantedFile>,
+    Vec<WantedDeletion>,
+    Vec<WantedMove>,
+    Vec<WantedRestore>,
+) {
     log::info!(
         "Reconciling {} manifest entries from {peer_name}",
         entries.len()
@@ -1937,13 +2008,14 @@ fn reconcile_peer_manifest(
     let mut wanted = Vec::new();
     let mut deletions = Vec::new();
     let mut moves = Vec::new();
+    let mut restores = Vec::new();
     for entry in entries {
         // Deletion tombstones take precedence over content reconciliation. If
-        // the peer advertises a delete, apply last-writer-wins against our
-        // latest local version: a delete newer than our latest edit wins (we
-        // apply it); an edit newer than the delete keeps the file (the normal
-        // content path below handles pulling/keeping bytes). This is the
-        // restore-after-delete rule.
+        // the peer advertises a delete, apply three-way last-writer-wins: the
+        // delete wins only if `deleted_at` is newer than BOTH our latest edit
+        // `observed_at` AND our explicit `restored_at`. An edit or restore newer
+        // than the delete keeps the file live (the content path below handles
+        // bytes).
         if entry.deleted {
             let ours_observed_at = database
                 .latest_version(entry.file_id)
@@ -1951,9 +2023,16 @@ fn reconcile_peer_manifest(
                 .flatten()
                 .map(|version| version.observed_at)
                 .unwrap_or(0);
-            if entry.deleted_at > ours_observed_at {
+            let ours_restored_at = database
+                .file_deletion_state(entry.file_id)
+                .ok()
+                .flatten()
+                .map(|state| state.restored_at)
+                .unwrap_or(0);
+            if entry.deleted_at > ours_observed_at.max(ours_restored_at) {
                 log::debug!(
-                    "Applying peer delete for {} from {peer_name} (deleted_at={} > ours_observed_at={ours_observed_at})",
+                    "Applying peer delete for {} from {peer_name} (deleted_at={} > max(ours_observed_at={ours_observed_at}, \
+                     ours_restored_at={ours_restored_at}))",
                     entry.file_id.to_string(),
                     entry.deleted_at,
                 );
@@ -1964,6 +2043,35 @@ fn reconcile_peer_manifest(
             }
             // Whether or not the delete won, do not also request bytes for a
             // tombstoned entry.
+            continue;
+        }
+
+        // The peer advertises the file as live. If it carries an explicit
+        // restore stamp and we still hold the file tombstoned with an older
+        // `deleted_at`, the peer's restore wins last-writer-wins: apply it
+        // locally (offline-restore catch-up). We only need this for a file we
+        // currently consider deleted; a live-vs-live file is handled by the
+        // normal content path below.
+        if entry.restored_at > 0
+            && let Some(state) = database.file_deletion_state(entry.file_id).ok().flatten()
+            && state.deleted
+            && entry.restored_at > state.deleted_at
+            && let Some((hash, size)) = entry.history.last().map(|(_, h, s)| (h.clone(), *s))
+        {
+            log::debug!(
+                "Applying peer restore for {} from {peer_name} (restored_at={} > ours_deleted_at={})",
+                entry.file_id.to_string(),
+                entry.restored_at,
+                state.deleted_at,
+            );
+            restores.push(WantedRestore {
+                file_id: entry.file_id,
+                restored_at: entry.restored_at,
+                content_hash: hash,
+                size: size as u64,
+            });
+            // The restore drives its own byte pull via the FileRestored handler;
+            // don't also run the content path for this entry.
             continue;
         }
 
@@ -2084,7 +2192,7 @@ fn reconcile_peer_manifest(
         }
     }
 
-    (wanted, deletions, moves)
+    (wanted, deletions, moves, restores)
 }
 
 enum ReconcileDecision {
@@ -2273,6 +2381,7 @@ async fn local_hash_matches(
     expected_hash: &str,
 ) -> Option<u64> {
     let (respond_to, response) = tokio::sync::oneshot::channel();
+
     if command_sender
         .send(SyncDirectoryCommand::ReadFile {
             file_id,
@@ -2282,6 +2391,7 @@ async fn local_hash_matches(
     {
         return None;
     }
+
     match response.await {
         Ok(Some((_physical_path, content, content_hash))) => {
             if content_hash != expected_hash {
@@ -3377,6 +3487,200 @@ async fn handle_changes(
 
                 continue;
             }
+            DaemonMessage::Restore {
+                file_id,
+                respond_to,
+            } => {
+                // User-initiated restore of a soft-deleted file. Read the file's
+                // latest known version *while it is still tombstoned* (its
+                // version history is retained on soft delete). The catalog is
+                // not mutated here — only once the bytes are confirmed
+                // recoverable (see `ApplyRestore`).
+                let deletion_state = database.file_deletion_state(file_id).unwrap_or_else(
+                    |error| {
+                        log::error!(
+                            "Restore: file_deletion_state failed for {}: {:?}; treating as unknown",
+                            file_id.to_string(),
+                            error
+                        );
+                        None
+                    },
+                );
+
+                let is_deleted = matches!(deletion_state, Some(state) if state.deleted);
+                if !is_deleted {
+                    // Not tombstoned (or unknown): nothing to restore.
+                    let _ = respond_to.send(Err(bus::RestoreError::NotDeleted));
+                    continue;
+                }
+
+                let latest = database.latest_version(file_id).unwrap_or_else(|error| {
+                    log::error!(
+                        "Restore: latest_version failed for {}: {:?}",
+                        file_id.to_string(),
+                        error
+                    );
+                    None
+                });
+
+                // A tombstoned file always has a version in practice (one is
+                // recorded at creation before it could ever be deleted). Guard
+                // defensively: without a version there is no hash to restore by.
+                let Some(latest) = latest else {
+                    log::error!(
+                        "Restore: {} is tombstoned but has no recorded version; cannot restore",
+                        file_id.to_string()
+                    );
+                    let _ = respond_to.send(Err(bus::RestoreError::NotAvailable));
+                    continue;
+                };
+
+                let content_hash = latest.content_hash;
+                let size = latest.size as u64;
+                // Stamp the restore now: recorded as the restored version's
+                // `observed_at` so it beats any lingering peer `deleted_at`.
+                let restored_at = database::now_millis();
+
+                // Run the availability probe off-loop so the (potentially slow)
+                // peer round-trip never blocks the sole DB writer. It checks the
+                // local `keep_deleted_files` vault first, then floods a probe to
+                // peers. On success it re-enters via `ApplyRestore` (handled on
+                // this loop); on failure it replies `Err` directly.
+                let command_sender_probe = command_sender.clone();
+                let pending_fetches_probe = pending_fetches.clone();
+                let change_sender_probe = change_sender.clone();
+                tokio::spawn(async move {
+                    // Local vault (or any local copy) first: cheap and avoids a
+                    // network round-trip when we kept the bytes ourselves.
+                    let locally_available =
+                        read_local_if_hash_matches(&command_sender_probe, file_id, &content_hash)
+                            .await
+                            .is_some();
+
+                    let available = if locally_available {
+                        true
+                    } else {
+                        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel::<bool>();
+                        pending_fetches_probe
+                            .start_local_probe(file_id, content_hash.clone(), probe_tx)
+                            .await;
+                        probe_rx.await.unwrap_or(false)
+                    };
+
+                    if !available {
+                        log::debug!(
+                            "Restore: {} has no recoverable bytes (vault/peers); failing restore",
+                            file_id.to_string()
+                        );
+                        let _ = respond_to.send(Err(bus::RestoreError::NotAvailable));
+                        return;
+                    }
+
+                    // Bytes are recoverable: hand the catalog mutation back to
+                    // the DB-writer loop.
+                    if change_sender_probe
+                        .send(DaemonMessage::ApplyRestore {
+                            file_id,
+                            content_hash,
+                            size,
+                            restored_at,
+                            respond_to,
+                        })
+                        .is_err()
+                    {
+                        log::error!(
+                            "Restore: change channel closed; cannot apply restore for {}",
+                            file_id.to_string()
+                        );
+                        // `respond_to` moved into the failed send; the waiter
+                        // times out, which is the shutting-down case.
+                    }
+                });
+
+                continue;
+            }
+            DaemonMessage::ApplyRestore {
+                file_id,
+                content_hash,
+                size,
+                restored_at,
+                respond_to,
+            } => {
+                // The probe confirmed the bytes are recoverable. Apply the
+                // restore on the DB-writer loop: set the `restored_at` clock and
+                // clear the tombstone (no fabricated version — the three-way LWW
+                // handles it), forward the un-delete to peers, then drive
+                // placement so the bytes are pulled ONLY into directories that
+                // want them.
+                match database.apply_restore(file_id, restored_at) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // A delete newer than our restore stamp still wins. This
+                        // should not happen for a user-initiated restore stamped
+                        // "now", but stay defensive rather than lie about success.
+                        log::warn!(
+                            "ApplyRestore: {} still tombstoned after restore (a newer delete wins); failing",
+                            file_id.to_string()
+                        );
+                        let _ = respond_to.send(Err(bus::RestoreError::NotAvailable));
+                        continue;
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "ApplyRestore: failed to apply restore for {}: {:?}",
+                            file_id.to_string(),
+                            error
+                        );
+                        let _ = respond_to.send(Err(bus::RestoreError::NotAvailable));
+                        continue;
+                    }
+                }
+
+                let change = Change::FileRestored {
+                    file_id,
+                    content_hash,
+                    size,
+                    restored_at,
+                };
+                forward_to_peers(
+                    &configuration,
+                    &runtime_configuration,
+                    &change,
+                    &ChangeOrigin::Local {
+                        directory_path: std::path::PathBuf::new(),
+                    },
+                )
+                .await;
+
+                // Re-drive placement: pull the bytes into any sync directory
+                // that should hold the now-live file (Universal dirs, matching
+                // TagBased dirs), sourcing them from the vault or a peer. If no
+                // local directory wants the file, nothing is pulled.
+                if let Some(deferred) = reconcile_tag_placement(&command_sender, &database, file_id)
+                {
+                    let pending_fetches = pending_fetches.clone();
+                    let change_sender = change_sender.clone();
+                    let operations = operations.clone();
+                    tokio::spawn(async move {
+                        fetch_and_place_deferred(
+                            &pending_fetches,
+                            &change_sender,
+                            &operations,
+                            deferred,
+                        )
+                        .await;
+                    });
+                }
+
+                // Publish to UI-facing API subscribers so the deleted-files view
+                // refreshes (the file is now live). This arm `continue`s and so
+                // bypasses the shared publish at the bottom of the loop; emit
+                // here, mirroring it.
+                let _ = event_sender.send(change);
+
+                let _ = respond_to.send(Ok(()));
+                continue;
+            }
             DaemonMessage::ReconcilePlacement { file_id } => {
                 // Connect-time placement sweep, handed off from a peer session so
                 // the fetch runs here (not on the session's frame loop). If a
@@ -4025,6 +4329,93 @@ async fn handle_changes(
                 )
                 .await;
             }
+            // An inbound `FileRestored` from a peer: the peer un-deleted a file
+            // and already confirmed its bytes were recoverable, so this is
+            // authoritative. Mirror `FileMetadataChanged` — record the restored
+            // version (its `restored_at` becomes the version's `observed_at`,
+            // beating any local `deleted_at` under LWW), clear our tombstone,
+            // forward onward, and pull the bytes into any local sync directory
+            // that wants them. No local-availability gate here: only the
+            // *originating* device gates restore on availability.
+            Change::FileRestored {
+                file_id,
+                content_hash,
+                size,
+                restored_at,
+            } => {
+                // Skip only if this hash is already our latest catalog version
+                // AND the file is already live — otherwise a restore that clears
+                // a tombstone (or reverts to an older-but-restored hash) is a
+                // genuine state change we must apply.
+                let current_hash = database
+                    .latest_version(*file_id)
+                    .ok()
+                    .flatten()
+                    .map(|version| version.content_hash);
+                let already_live = matches!(
+                    database.file_deletion_state(*file_id),
+                    Ok(Some(state)) if !state.deleted
+                );
+
+                if current_hash.as_deref() == Some(content_hash.as_str()) && already_live {
+                    log::debug!(
+                        "Ignoring no-op FileRestored for {} (already the current, live version)",
+                        file_id.to_string()
+                    );
+                    forward_to_peers(
+                        &configuration,
+                        &runtime_configuration,
+                        &change,
+                        &change_origin,
+                    )
+                    .await;
+                    continue;
+                }
+
+                // Apply the restore under three-way LWW using the peer's
+                // `restored_at` stamp (preserved verbatim from the wire), so it
+                // orders correctly against our own `deleted_at`. No version is
+                // fabricated: the restored version is the file's latest existing
+                // version, which we already have in our history. If a newer
+                // local delete out-votes the restore, `apply_restore` leaves the
+                // tombstone and we skip the byte pull.
+                let restored = match database.apply_restore(*file_id, *restored_at) {
+                    Ok(restored) => restored,
+                    Err(error) => {
+                        log::error!(
+                            "FileRestored: failed to apply restore for {}: {:?}",
+                            file_id.to_string(),
+                            error
+                        );
+                        false
+                    }
+                };
+
+                // Always forward so the announcement propagates the tree, even
+                // if it lost LWW locally (a downstream peer may still be behind).
+                forward_to_peers(
+                    &configuration,
+                    &runtime_configuration,
+                    &change,
+                    &change_origin,
+                )
+                .await;
+
+                // Pull the bytes to update any local sync directory that should
+                // hold this now-live file — only if the restore actually won
+                // (otherwise the file stays tombstoned and wants no bytes).
+                if restored {
+                    request_pull_from_origin(
+                        &runtime_configuration,
+                        &change_origin,
+                        *file_id,
+                        content_hash.clone(),
+                        *size,
+                        bus::MaterializePlacement::Change,
+                    )
+                    .await;
+                }
+            }
             // Every tag mutation below carries `modified_at`, stamped on the
             // originating device and preserved across the wire. It is passed
             // straight to the DB layer, which applies last-writer-wins: an
@@ -4151,16 +4542,34 @@ async fn handle_changes(
                 // materialized before this `FileTagged` arrived placed the file
                 // only where tags already matched). Re-run placement now, and if
                 // the bytes are not local, fetch them.
+                //
+                // The synchronous DB step runs here on the loop, but the
+                // follow-up (`fetch_and_place_deferred`) must NOT be awaited on
+                // this loop: it blocks for the whole network fetch, and it
+                // finishes by enqueueing a `DaemonMessage::Materialize` onto
+                // *this* loop's own channel. Awaiting it stalls the
+                // single-threaded consumer (so the `Materialize` it produces
+                // can never be dequeued) and, in the meantime, blocks every
+                // other `DaemonMessage` behind it — including UI-visible
+                // change events. Spawn instead; the follow-up holds only
+                // owned, `Send` data by design. See the mirror comment on
+                // `DaemonMessage::ReconcilePlacement`.
                 if let Some(deferred) =
                     reconcile_tag_placement(&command_sender, &database, *file_id)
                 {
-                    fetch_and_place_deferred(
-                        &pending_fetches,
-                        &change_sender,
-                        &operations,
-                        deferred,
-                    )
-                    .await;
+                    let pending_fetches = pending_fetches.clone();
+                    let change_sender = change_sender.clone();
+                    let operations = operations.clone();
+
+                    tokio::spawn(async move {
+                        fetch_and_place_deferred(
+                            &pending_fetches,
+                            &change_sender,
+                            &operations,
+                            deferred,
+                        )
+                        .await;
+                    });
                 }
 
                 forward_to_peers(
@@ -4198,16 +4607,29 @@ async fn handle_changes(
                 // directory's tags should be dropped from it. Re-run placement
                 // (symmetric with `FileTagged`). A removal never defers, but use
                 // the same two-step API for consistency.
+                //
+                // Spawn the async follow-up for the same reason as
+                // `FileTagged` (see the comment there): even though the
+                // untag path never actually defers a fetch, awaiting it on
+                // this loop would still block every subsequent
+                // `DaemonMessage` until the manager replies, and keeping the
+                // two arms structurally identical avoids future footguns.
                 if let Some(deferred) =
                     reconcile_tag_placement(&command_sender, &database, *file_id)
                 {
-                    fetch_and_place_deferred(
-                        &pending_fetches,
-                        &change_sender,
-                        &operations,
-                        deferred,
-                    )
-                    .await;
+                    let pending_fetches = pending_fetches.clone();
+                    let change_sender = change_sender.clone();
+                    let operations = operations.clone();
+
+                    tokio::spawn(async move {
+                        fetch_and_place_deferred(
+                            &pending_fetches,
+                            &change_sender,
+                            &operations,
+                            deferred,
+                        )
+                        .await;
+                    });
                 }
 
                 forward_to_peers(
@@ -4321,9 +4743,11 @@ mod reconcile_tests {
             logical_path_modified_at: 0,
             deleted: false,
             deleted_at: 0,
+            restored_at: 0,
         };
 
-        let (wanted, deletions, _moves) = reconcile_peer_manifest("peer", vec![entry], &database);
+        let (wanted, deletions, _moves, _restores) =
+            reconcile_peer_manifest("peer", vec![entry], &database);
         assert!(deletions.is_empty());
         assert_eq!(wanted.len(), 1);
         assert_eq!(wanted[0].file_id, file_id);
@@ -4360,9 +4784,11 @@ mod reconcile_tests {
             logical_path_modified_at: 0,
             deleted: false,
             deleted_at: 0,
+            restored_at: 0,
         };
 
-        let (wanted, deletions, _moves) = reconcile_peer_manifest("peer", vec![entry], &database);
+        let (wanted, deletions, _moves, _restores) =
+            reconcile_peer_manifest("peer", vec![entry], &database);
         assert!(deletions.is_empty());
         assert!(wanted.is_empty());
     }
@@ -4387,9 +4813,11 @@ mod reconcile_tests {
             logical_path_modified_at: 0,
             deleted: false,
             deleted_at: 0,
+            restored_at: 0,
         };
 
-        let (wanted, deletions, _moves) = reconcile_peer_manifest("peer", vec![entry], &database);
+        let (wanted, deletions, _moves, _restores) =
+            reconcile_peer_manifest("peer", vec![entry], &database);
         assert!(deletions.is_empty());
         assert_eq!(wanted.len(), 1);
         assert_eq!(wanted[0].file_id, file_id);
@@ -4425,9 +4853,11 @@ mod reconcile_tests {
             logical_path_modified_at: 20,
             deleted: false,
             deleted_at: 0,
+            restored_at: 0,
         };
 
-        let (wanted, deletions, moves) = reconcile_peer_manifest("peer", vec![entry], &database);
+        let (wanted, deletions, moves, _restores) =
+            reconcile_peer_manifest("peer", vec![entry], &database);
         assert!(deletions.is_empty());
         assert!(
             wanted.is_empty(),
@@ -4459,9 +4889,11 @@ mod reconcile_tests {
             logical_path_modified_at: 20,
             deleted: false,
             deleted_at: 0,
+            restored_at: 0,
         };
 
-        let (_wanted, _deletions, moves) = reconcile_peer_manifest("peer", vec![entry], &database);
+        let (_wanted, _deletions, moves, _restores) =
+            reconcile_peer_manifest("peer", vec![entry], &database);
         assert!(moves.is_empty(), "a stale peer path must not win LWW");
     }
 
@@ -4479,9 +4911,11 @@ mod reconcile_tests {
             logical_path_modified_at: 999,
             deleted: false,
             deleted_at: 0,
+            restored_at: 0,
         };
 
-        let (_wanted, _deletions, moves) = reconcile_peer_manifest("peer", vec![entry], &database);
+        let (_wanted, _deletions, moves, _restores) =
+            reconcile_peer_manifest("peer", vec![entry], &database);
         assert!(
             moves.is_empty(),
             "an unknown file adopts the path via Create, not a move"
@@ -4543,9 +4977,11 @@ mod reconcile_tests {
             logical_path_modified_at: 0,
             deleted: true,
             deleted_at: database::now_millis() + 10_000,
+            restored_at: 0,
         };
 
-        let (wanted, deletions, _moves) = reconcile_peer_manifest("peer", vec![entry], &database);
+        let (wanted, deletions, _moves, _restores) =
+            reconcile_peer_manifest("peer", vec![entry], &database);
         assert!(wanted.is_empty(), "a tombstoned file must not be pulled");
         assert_eq!(deletions.len(), 1);
         assert_eq!(deletions[0].file_id, file_id);
@@ -4572,9 +5008,11 @@ mod reconcile_tests {
             logical_path_modified_at: 0,
             deleted: true,
             deleted_at: 1,
+            restored_at: 0,
         };
 
-        let (wanted, deletions, _moves) = reconcile_peer_manifest("peer", vec![entry], &database);
+        let (wanted, deletions, _moves, _restores) =
+            reconcile_peer_manifest("peer", vec![entry], &database);
         assert!(deletions.is_empty(), "stale delete must not win");
         // Equal latest hash means nothing to pull either.
         assert!(wanted.is_empty());

@@ -51,6 +51,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
   String? _error;
   bool _deleted = false;
   bool _watching = false;
+  bool _restoring = false;
 
   onisync.OniSyncApp get _app => widget.session.app;
 
@@ -86,7 +87,15 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
     try {
       // Direct parents/subtags only (Exclude = no hierarchy walk). Matches the
       // file detail, which also shows direct membership.
-      final tag = await _app.getTagEntry(tagId: widget.tagId);
+      //
+      // For the tag itself we pass `Include` so a tombstoned tag opened from
+      // the home screen's "show deleted" toggle still loads (with its
+      // `deleted` flag set). Parents/subtags are always live-only — a
+      // tombstoned tag can't participate in a live hierarchy edge.
+      final tag = await _app.getTagEntry(
+        tagId: widget.tagId,
+        deletedRule: onisync.DeletedRule.include,
+      );
       final parents = await _app.tagIdsForTagString(
         tagId: widget.tagId,
         subtagRule: onisync.SubtagRule.exclude,
@@ -100,7 +109,10 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
       // would do.
       final relatedIds = {...parents, ...subtags};
       final relatedEntries = await Future.wait(
-        relatedIds.map((id) => _app.getTagEntry(tagId: id)),
+        relatedIds.map((id) => _app.getTagEntry(
+              tagId: id,
+              deletedRule: onisync.DeletedRule.exclude,
+            )),
       );
       if (!mounted) return;
       setState(() {
@@ -189,9 +201,12 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
   }) async {
     final onisync.QueryEntries all;
     try {
+      // Tag-picker sheets only surface live tags — you can't apply a
+      // tombstoned tag to anything.
       all = await _app.runQuery(
         query: '',
         subtagRule: onisync.SubtagRule.include,
+        deletedRule: onisync.DeletedRule.exclude,
       );
     } catch (error) {
       _snack('Failed to load tags: $error');
@@ -338,19 +353,58 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
     }
   }
 
+  /// Restore a soft-deleted tag. Unlike a file, a tag carries no content, so
+  /// this always succeeds for a known tag (it re-announces the definition with
+  /// a fresh timestamp, winning last-writer-wins over the delete). On success
+  /// we reload so the view re-renders as live.
+  Future<void> _restoreTag() async {
+    final tag = _tag;
+    if (tag == null) return;
+    setState(() => _restoring = true);
+    try {
+      await _app.restoreTagByString(tag.tagId);
+      if (!mounted) return;
+      _deleted = false;
+      _snack('Restored "${tag.name}".');
+      await _load();
+    } catch (error) {
+      if (!mounted) return;
+      _snack('Failed to restore tag: $error');
+    } finally {
+      if (mounted) setState(() => _restoring = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final tag = _tag;
+    // See FileDetailScreen.build for the strikethrough / restore-swap
+    // rationale; the two detail screens keep matching tombstone treatments.
+    final titleStyle = tag?.deleted == true
+        ? const TextStyle(decoration: TextDecoration.lineThrough)
+        : null;
     return Scaffold(
       appBar: AppBar(
-        title: Text(tag?.name ?? 'Tag'),
+        title: Text(tag?.name ?? 'Tag', style: titleStyle),
         actions: [
           if (tag != null)
-            IconButton(
-              icon: const Icon(Icons.delete_outline),
-              tooltip: 'Delete tag',
-              onPressed: _deleteTag,
-            ),
+            (tag.deleted
+                ? IconButton(
+                    icon: _restoring
+                        ? const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.restore_from_trash),
+                    tooltip: 'Restore tag',
+                    onPressed: _restoring ? null : _restoreTag,
+                  )
+                : IconButton(
+                    icon: const Icon(Icons.delete_outline),
+                    tooltip: 'Delete tag',
+                    onPressed: _deleteTag,
+                  )),
         ],
       ),
       body: _buildBody(),

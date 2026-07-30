@@ -175,6 +175,42 @@ pub enum DaemonMessage {
         size: u64,
         tags: Vec<TagId>,
     },
+    /// User-initiated restore of a soft-deleted file. Request-reply (like
+    /// [`DaemonMessage::Fetch`]) because the outcome is only known after an
+    /// async *availability probe*.
+    ///
+    /// `handle_changes` reads the file's latest known version while it is still
+    /// tombstoned, then checks whether the bytes are still recoverable — first
+    /// the local `keep_deleted_files` vault, then (best-effort) a probe flooded
+    /// across the peer tree. Only if the bytes are available does it clear the
+    /// tombstone, record the restored version, forward a `Change::FileRestored`
+    /// to peers, and drive placement so the bytes land where wanted. If nothing
+    /// holds the bytes, the tombstone is left untouched and this resolves
+    /// `Err(RestoreError::NotAvailable)`.
+    Restore {
+        file_id: FileId,
+        respond_to: oneshot::Sender<Result<(), RestoreError>>,
+    },
+    /// Internal follow-up to [`DaemonMessage::Restore`], enqueued by the
+    /// spawned availability probe once it has confirmed the bytes are
+    /// recoverable. Handled synchronously by the sole DB writer so the catalog
+    /// mutation (record the restored version, clear the tombstone), the
+    /// `Change::FileRestored` peer-forward, and placement all happen on the
+    /// writer loop rather than off it.
+    ///
+    /// Split out from `Restore` so the (potentially slow) probe never blocks
+    /// the single-threaded consumer — mirroring how `Fetch` spawns and
+    /// re-enters via `Materialize`.
+    ApplyRestore {
+        file_id: FileId,
+        content_hash: String,
+        size: u64,
+        /// Wall-clock stamp captured when the restore was initiated; recorded
+        /// as the restored version's `observed_at` (beats any peer
+        /// `deleted_at`).
+        restored_at: i64,
+        respond_to: oneshot::Sender<Result<(), RestoreError>>,
+    },
 }
 
 /// A command sent to a specific peer's live session by `handle_changes`.
@@ -241,6 +277,33 @@ impl std::fmt::Display for FetchError {
             }
             FetchError::TimedOut => formatter.write_str("fetch timed out"),
             FetchError::ShuttingDown => formatter.write_str("runtime is shutting down"),
+        }
+    }
+}
+
+/// Why a restore failed.
+#[derive(Debug, Clone)]
+pub enum RestoreError {
+    /// The file is not soft-deleted (nothing to restore), or is unknown.
+    NotDeleted,
+    /// Best-effort recovery found no source for the bytes: neither a local
+    /// `keep_deleted_files` vault nor any connected peer still holds them. The
+    /// tombstone is left in place.
+    NotAvailable,
+    /// The runtime is shutting down; the request cannot be served.
+    ShuttingDown,
+}
+
+impl std::fmt::Display for RestoreError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RestoreError::NotDeleted => {
+                formatter.write_str("file is not deleted; nothing to restore")
+            }
+            RestoreError::NotAvailable => {
+                formatter.write_str("no source holds the file's bytes; cannot restore")
+            }
+            RestoreError::ShuttingDown => formatter.write_str("runtime is shutting down"),
         }
     }
 }

@@ -57,6 +57,12 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _error;
   bool _loading = false;
 
+  /// When true, the search runs against soft-deleted (tombstoned) files and
+  /// tags instead of live ones — see [onisync.DeletedRule]. Toggled by the
+  /// small button next to the search field. Off by default: the standard
+  /// search only ever shows live rows.
+  bool _showDeleted = false;
+
   /// Change-stream watcher: re-runs the *current* query whenever the underlying
   /// data changes so the results stay accurate. Deliberately does nothing when
   /// the user has not typed a query yet — we never synthesise an empty query.
@@ -144,6 +150,9 @@ class _HomeScreenState extends State<HomeScreen> {
       final result = await session.app.runQuery(
         query: _query.text,
         subtagRule: onisync.SubtagRule.include,
+        deletedRule: _showDeleted
+            ? onisync.DeletedRule.include
+            : onisync.DeletedRule.exclude,
       );
       if (!mounted || epoch != _queryEpoch) return;
       setState(() {
@@ -175,7 +184,12 @@ class _HomeScreenState extends State<HomeScreen> {
   /// whitespace, no query sigils) and the search returned zero tags, returns
   /// that name so the results view can offer to create it. Otherwise returns
   /// null and no "create" affordance is shown.
+  ///
+  /// The affordance is suppressed while [_showDeleted] is on: in that mode
+  /// the empty result set means "no *deleted* tag matches", not "no tag by
+  /// this name exists", so offering to create one would be misleading.
   String? get _createCandidate {
+    if (_showDeleted) return null;
     final text = _query.text.trim();
     if (text.isEmpty) return null;
     if (text.contains(RegExp(r'[\s$!]'))) return null;
@@ -220,10 +234,38 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             Padding(
               padding: const EdgeInsets.all(16),
-              child: _SearchBar(
-                controller: _query,
-                focusNode: _queryFocus,
-                loading: _loading,
+              child: Row(
+                children: [
+                  Expanded(
+                    child: _SearchBar(
+                      controller: _query,
+                      focusNode: _queryFocus,
+                      loading: _loading,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  // Toggle: search live vs. tombstoned rows. When on, the
+                  // daemon returns only soft-deleted files/tags for the same
+                  // query text; when off, only live ones.
+                  IconButton.filledTonal(
+                    isSelected: _showDeleted,
+                    tooltip: _showDeleted
+                        ? 'Showing deleted — tap to search live'
+                        : 'Search deleted files and tags',
+                    icon: Icon(
+                      _showDeleted
+                          ? Icons.delete
+                          : Icons.delete_outline,
+                    ),
+                    onPressed: () {
+                      setState(() => _showDeleted = !_showDeleted);
+                      // Re-run immediately if a query is already active so
+                      // the mode change is visible without waiting for a
+                      // keystroke.
+                      if (_results != null) _runQuery();
+                    },
+                  ),
+                ],
               ),
             ),
             Expanded(child: _buildResults()),
@@ -352,10 +394,16 @@ class _TagRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Deleted rows only appear under the "show deleted" toggle; strike the
+    // name through so the user can tell at a glance that a row is a
+    // tombstone rather than a live tag.
+    final titleStyle = tag.deleted
+        ? const TextStyle(decoration: TextDecoration.lineThrough)
+        : null;
     return ListTile(
       dense: true,
       leading: TagColorSwatch(color: tag.color),
-      title: Text(tag.name),
+      title: Text(tag.name, style: titleStyle),
       trailing: const Icon(Icons.chevron_right),
       onTap: () {
         // Drop focus from the search field before pushing so the soft keyboard
@@ -406,12 +454,13 @@ class _FileRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final shortHash = file.contentHash.length > 12
-        ? file.contentHash.substring(0, 12)
-        : file.contentHash;
+    // See `_TagRow` for why we strike deleted rows through.
+    final titleStyle = file.deleted
+        ? const TextStyle(decoration: TextDecoration.lineThrough)
+        : null;
     return ListTile(
       dense: true,
-      title: Text(file.path),
+      title: Text(file.path, style: titleStyle),
       trailing: const Icon(Icons.chevron_right),
       onTap: () {
         // See _TagRow.onTap for why we drop focus before navigating.

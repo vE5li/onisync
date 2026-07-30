@@ -59,7 +59,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{Api, ApiError, ApiEvent, QueryResult};
-use crate::database::{SubtagRule, Tag};
+use crate::database::{DeletedRule, SubtagRule, Tag};
 use crate::transport::{EventStream, OperationStream, OperationUpdate, TransportBackend};
 
 /// A UI-facing API call, sent by a control client to the daemon.
@@ -85,20 +85,26 @@ pub enum ControlRequest {
     },
     /// Run a free-form query (`$tag`, `!tag`, and name substrings) and return
     /// both the matching files and tags. Tag tokens are resolved in the daemon.
+    /// `deleted_rule` toggles whether tombstoned files/tags participate (see
+    /// [`Api::run_query`](crate::api::Api::run_query)).
     /// Answered with [`ControlResponse::QueryResult`].
     RunQuery {
         query: String,
         subtag_rule: SubtagRule,
+        deleted_rule: DeletedRule,
     },
     /// Get a single file's info by id. Answered with [`ControlResponse::File`]
-    /// (or `Error(NotFound)`).
+    /// (or `Error(NotFound)`). `deleted_rule` toggles tombstone visibility;
+    /// see [`Api::get_file`](crate::api::Api::get_file).
     GetFile {
         file_id: FileId,
+        deleted_rule: DeletedRule,
     },
     /// Get a single tag by id. Answered with [`ControlResponse::Tag`] (or
     /// `Error(NotFound)`).
     GetTag {
         tag_id: TagId,
+        deleted_rule: DeletedRule,
     },
     SubtagsForTag {
         tag_id: TagId,
@@ -114,6 +120,9 @@ pub enum ControlRequest {
         color: String,
     },
     DeleteTag {
+        tag_id: TagId,
+    },
+    RestoreTag {
         tag_id: TagId,
     },
     RenameTag {
@@ -160,6 +169,9 @@ pub enum ControlRequest {
         file_id: FileId,
     },
     DeleteFile {
+        file_id: FileId,
+    },
+    RestoreFile {
         file_id: FileId,
     },
     MoveFile {
@@ -562,16 +574,25 @@ async fn dispatch(
             Ok(tag_ids) => ControlResponse::TagIds(tag_ids),
             Err(error) => ControlResponse::Error(error),
         },
-        ControlRequest::RunQuery { query, subtag_rule } => match api.run_query(&query, subtag_rule)
-        {
+        ControlRequest::RunQuery {
+            query,
+            subtag_rule,
+            deleted_rule,
+        } => match api.run_query(&query, subtag_rule, deleted_rule) {
             Ok(result) => ControlResponse::QueryResult(result),
             Err(error) => ControlResponse::Error(error),
         },
-        ControlRequest::GetFile { file_id } => match api.get_file(file_id) {
+        ControlRequest::GetFile {
+            file_id,
+            deleted_rule,
+        } => match api.get_file(file_id, deleted_rule) {
             Ok(file) => ControlResponse::File(file),
             Err(error) => ControlResponse::Error(error),
         },
-        ControlRequest::GetTag { tag_id } => match api.get_tag(tag_id) {
+        ControlRequest::GetTag {
+            tag_id,
+            deleted_rule,
+        } => match api.get_tag(tag_id, deleted_rule) {
             Ok(tag) => ControlResponse::Tag(tag),
             Err(error) => ControlResponse::Error(error),
         },
@@ -594,6 +615,10 @@ async fn dispatch(
             Err(error) => ControlResponse::Error(error),
         },
         ControlRequest::DeleteTag { tag_id } => match api.delete_tag(tag_id) {
+            Ok(()) => ControlResponse::Ok,
+            Err(error) => ControlResponse::Error(error),
+        },
+        ControlRequest::RestoreTag { tag_id } => match api.restore_tag(tag_id) {
             Ok(()) => ControlResponse::Ok,
             Err(error) => ControlResponse::Error(error),
         },
@@ -658,6 +683,10 @@ async fn dispatch(
             }
         }
         ControlRequest::DeleteFile { file_id } => match api.delete_file(file_id) {
+            Ok(()) => ControlResponse::Ok,
+            Err(error) => ControlResponse::Error(error),
+        },
+        ControlRequest::RestoreFile { file_id } => match api.restore_file(file_id).await {
             Ok(()) => ControlResponse::Ok,
             Err(error) => ControlResponse::Error(error),
         },
@@ -1081,9 +1110,14 @@ impl TransportBackend for IpcClientBackend {
         &self,
         query: String,
         subtag_rule: SubtagRule,
+        deleted_rule: DeletedRule,
     ) -> Result<QueryResult, ApiError> {
         match self
-            .call(ControlRequest::RunQuery { query, subtag_rule })
+            .call(ControlRequest::RunQuery {
+                query,
+                subtag_rule,
+                deleted_rule,
+            })
             .await?
         {
             ControlResponse::QueryResult(result) => Ok(result),
@@ -1091,15 +1125,31 @@ impl TransportBackend for IpcClientBackend {
         }
     }
 
-    async fn get_file(&self, file_id: FileId) -> Result<FileInfo, ApiError> {
-        match self.call(ControlRequest::GetFile { file_id }).await? {
+    async fn get_file(
+        &self,
+        file_id: FileId,
+        deleted_rule: DeletedRule,
+    ) -> Result<FileInfo, ApiError> {
+        match self
+            .call(ControlRequest::GetFile {
+                file_id,
+                deleted_rule,
+            })
+            .await?
+        {
             ControlResponse::File(file) => Ok(file),
             other => Err(unexpected(other)),
         }
     }
 
-    async fn get_tag(&self, tag_id: TagId) -> Result<Tag, ApiError> {
-        match self.call(ControlRequest::GetTag { tag_id }).await? {
+    async fn get_tag(&self, tag_id: TagId, deleted_rule: DeletedRule) -> Result<Tag, ApiError> {
+        match self
+            .call(ControlRequest::GetTag {
+                tag_id,
+                deleted_rule,
+            })
+            .await?
+        {
             ControlResponse::Tag(tag) => Ok(tag),
             other => Err(unexpected(other)),
         }
@@ -1148,6 +1198,13 @@ impl TransportBackend for IpcClientBackend {
 
     async fn delete_tag(&self, tag_id: TagId) -> Result<(), ApiError> {
         match self.call(ControlRequest::DeleteTag { tag_id }).await? {
+            ControlResponse::Ok => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn restore_tag(&self, tag_id: TagId) -> Result<(), ApiError> {
+        match self.call(ControlRequest::RestoreTag { tag_id }).await? {
             ControlResponse::Ok => Ok(()),
             other => Err(unexpected(other)),
         }
@@ -1261,6 +1318,13 @@ impl TransportBackend for IpcClientBackend {
 
     async fn delete_file(&self, file_id: FileId) -> Result<(), ApiError> {
         match self.call(ControlRequest::DeleteFile { file_id }).await? {
+            ControlResponse::Ok => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn restore_file(&self, file_id: FileId) -> Result<(), ApiError> {
+        match self.call(ControlRequest::RestoreFile { file_id }).await? {
             ControlResponse::Ok => Ok(()),
             other => Err(unexpected(other)),
         }

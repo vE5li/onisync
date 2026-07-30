@@ -18,9 +18,18 @@ pub type VersionHistory = Vec<(i64, String, i64)>;
 /// [`VersionHistory`], the unix-millis timestamp of its latest version, the
 /// file's logical path, the unix-millis time that path was last changed
 /// (`logical_path_modified_at`, the path's LWW clock), and its soft-delete
-/// tombstone state (`deleted`, `deleted_at`).
+/// tombstone state (`deleted`, `deleted_at`, `restored_at`).
 /// Maps directly onto a `state::ManifestEntry`.
-pub type ManifestRow = (FileId, VersionHistory, i64, LogicalPath, i64, bool, i64);
+pub type ManifestRow = (
+    FileId,
+    VersionHistory,
+    i64,
+    LogicalPath,
+    i64,
+    bool,
+    i64,
+    i64,
+);
 
 /// A single recorded version of a file's content.
 ///
@@ -41,16 +50,69 @@ pub struct FileVersion {
     pub size: i64,
 }
 
+/// A file's soft-delete tombstone state: the materialized `deleted` flag plus
+/// the two wall-clocks that (together with the latest version `observed_at`)
+/// decide it under three-way last-writer-wins.
+///
+/// The file is live iff `max(latest observed_at, restored_at) > deleted_at`;
+/// `deleted` caches that decision so reads keep a simple `WHERE deleted = 0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeletionState {
+    pub deleted: bool,
+    /// Unix-millis of the last delete (0 if never deleted).
+    pub deleted_at: i64,
+    /// Unix-millis of the last explicit restore (0 if never restored).
+    pub restored_at: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SubtagRule {
     Include,
     Exclude,
 }
 
+/// Governs whether soft-deleted (tombstoned) rows are visible to a read.
+///
+/// Applies to `files_v2.deleted` and `tags_v1.deleted`. Relationship-level
+/// tombstones (`entries_v1.deleted`) are always filtered — a search for
+/// "deleted files" is about files whose own row is tombstoned, not files that
+/// were merely untagged.
+///
+/// - [`Exclude`](DeletedRule::Exclude): behave as before — every read hides
+///   tombstoned rows (`WHERE ... deleted = 0`). This is what every non-search
+///   caller wants.
+/// - [`Include`](DeletedRule::Include): drop that filter so live *and*
+///   tombstoned rows come back together. Search callers that want to show
+///   deleted rows to the user use this, then post-filter by the returned
+///   `deleted` flag to keep only the tombstoned ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeletedRule {
     Include,
     Exclude,
+}
+
+impl DeletedRule {
+    /// SQL fragment appended after other `WHERE` clauses to enforce the rule.
+    /// `Exclude` yields `" AND deleted = 0"`; `Include` yields `""`.
+    ///
+    /// Callers embed this into a query that already has at least one `WHERE`
+    /// clause so the leading `AND` is well-formed. When there is no prior
+    /// clause, use [`Self::where_deleted_clause`] instead.
+    fn and_deleted_clause(self) -> &'static str {
+        match self {
+            DeletedRule::Exclude => " AND deleted = 0",
+            DeletedRule::Include => "",
+        }
+    }
+
+    /// SQL fragment for a standalone `WHERE`: `" WHERE deleted = 0"` under
+    /// `Exclude`, empty under `Include`.
+    fn where_deleted_clause(self) -> &'static str {
+        match self {
+            DeletedRule::Exclude => " WHERE deleted = 0",
+            DeletedRule::Include => "",
+        }
+    }
 }
 
 /// A single clause of a file search (see [`FileDatabase::file_ids_for_query`]).
@@ -151,6 +213,11 @@ pub struct Tag {
     pub name: String,
     pub color: String,
     pub metadata: Option<MetadataFormat>,
+    /// Whether the tag is soft-deleted (tombstoned). Always `false` when the
+    /// row was fetched under [`DeletedRule::Exclude`] (the default). Under
+    /// [`DeletedRule::Include`] this may be `true`, letting the caller
+    /// distinguish live from tombstoned rows in a mixed result set.
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,9 +342,12 @@ impl FileDatabase {
         let connection =
             Connection::open(database_path).map_err(|_| DatabaseError::UnableToOpenOrCreate)?;
 
-        // Run migrations here.
+        // Run migrations here. Each `migrate_*_to_vN` runs before the matching
+        // `create_*_vN` so a restored older-version backup is walked forward
+        // through every intermediate version on startup (see AGENTS.md).
+        Self::migrate_files_to_v2(&connection)?;
 
-        Self::create_files_v1(&connection)?;
+        Self::create_files_v2(&connection)?;
         Self::create_tags_v1(&connection)?;
         Self::create_entries_v1(&connection)?;
         Self::create_file_versions_v1(&connection)?;
@@ -285,45 +355,108 @@ impl FileDatabase {
         Ok(Self { connection })
     }
 
-    fn create_files_v1(connection: &Connection) -> Result<(), DatabaseError> {
+    /// Migrate the main catalog `files_v1` → `files_v2`, adding the
+    /// `restored_at` clock.
+    ///
+    /// Frozen once shipped (see AGENTS.md): never edit this. If `files_v1`
+    /// exists (an older backup restored on this build), create `files_v2` and
+    /// copy every row across, seeding `restored_at = 0` (no explicit restore
+    /// has happened), then drop `files_v1`. A no-op when `files_v1` is absent.
+    fn migrate_files_to_v2(connection: &Connection) -> Result<(), DatabaseError> {
+        let files_v1_exists: bool = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files_v1'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .unwrap_or(false);
+
+        if !files_v1_exists {
+            return Ok(());
+        }
+
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS files_v2 (
+                    id                        TEXT PRIMARY KEY,
+                    logical_path              TEXT NOT NULL,
+                    logical_path_modified_at  INTEGER NOT NULL,
+                    deleted                   INTEGER NOT NULL,
+                    deleted_at                INTEGER NOT NULL,
+                    restored_at               INTEGER NOT NULL
+                )",
+                (),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        connection
+            .execute(
+                "INSERT INTO files_v2
+                    (id, logical_path, logical_path_modified_at, deleted, deleted_at, restored_at)
+                 SELECT id, logical_path, logical_path_modified_at, deleted, deleted_at, 0
+                 FROM files_v1",
+                (),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        connection
+            .execute("DROP TABLE files_v1", ())
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    fn create_files_v2(connection: &Connection) -> Result<(), DatabaseError> {
         // `logical_path` is the file's logical identity: its human-readable
         // path/name (possibly nested, e.g. `foo/bar/name.txt`), independent
         // of where any individual sync directory stores the bytes on disk.
         // Contrast with `SyncDirectoryDatabase.files_v1.physical_path`, which
         // is the on-disk location within a particular sync directory.
         //
-        // `deleted` / `deleted_at` are the soft-delete tombstone. Unlike tags
-        // (which reuse their `modified_at` clock), a file has no single
-        // per-file timestamp — its "latest activity" time is the newest
-        // `file_versions_v1.observed_at` — so the delete time needs its own
-        // column. `deleted_at` is the unix-millis wall clock stamped when the
-        // file was deleted, preserved across the wire. Reconciliation
-        // compares it against the peer's latest version `observed_at`: an
-        // edit newer than the delete resurrects the file (last-writer-wins).
-        // All live reads filter `deleted = 0`; reconciliation deliberately
+        // `deleted` is the soft-delete tombstone flag (0 = live, 1 = deleted).
+        // It is a *materialized* view of the three-way last-writer-wins between
+        // the delete, the latest content edit, and an explicit restore: the
+        // file is live iff `max(latest file_versions_v1.observed_at,
+        // restored_at) > deleted_at`. Keeping `deleted` as a stored flag
+        // (maintained by `remove_file` / `restore_file`) lets every read keep
+        // its simple `WHERE deleted = 0` filter; reconciliation deliberately
         // considers tombstoned rows so a delete can win over a stale peer.
+        //
+        // The three clocks that decide `deleted`:
+        // - `deleted_at`: unix-millis wall clock stamped when the file was deleted,
+        //   preserved across the wire.
+        // - latest `file_versions_v1.observed_at`: a content edit newer than the delete
+        //   resurrects the file (restore-after-edit).
+        // - `restored_at`: unix-millis wall clock of an explicit user restore,
+        //   preserved across the wire. A restore newer than the delete resurrects the
+        //   file *without* fabricating a version. Symmetric to `deleted_at`; never
+        //   restamp it when applying a peer's restore. 0 means "never explicitly
+        //   restored".
         //
         // `logical_path_modified_at` is the unix-millis wall-clock time the
         // `logical_path` was last changed, stamped on the *originating*
         // device and preserved across the wire. It is the last-writer-wins
         // clock for the path *only* (content has its own clock via
-        // `file_versions_v1.observed_at`; deletes use `deleted_at`; tags are
-        // reconciled separately with their own `modified_at`). It exists so
-        // a move made while a peer is offline reconciles on reconnect: the
-        // manifest advertises this timestamp and the receiver adopts the
-        // peer's path only when it is strictly newer. Never restamp it when
-        // applying a peer's move. Do NOT fold other metadata into this clock
-        // — a bare "modified" clock would let a content edit silently
-        // override a path (they are independently edited). See
-        // `Change::FileMoved`.
+        // `file_versions_v1.observed_at`; deletes use `deleted_at`; restores
+        // use `restored_at`; tags are reconciled separately with their own
+        // `modified_at`). It exists so a move made while a peer is offline
+        // reconciles on reconnect: the manifest advertises this timestamp and
+        // the receiver adopts the peer's path only when it is strictly newer.
+        // Never restamp it when applying a peer's move. Do NOT fold other
+        // metadata into this clock — a bare "modified" clock would let a
+        // content edit silently override a path (they are independently
+        // edited). See `Change::FileMoved`.
         connection
             .execute(
-                "CREATE TABLE IF NOT EXISTS files_v1 (
+                "CREATE TABLE IF NOT EXISTS files_v2 (
                     id                        TEXT PRIMARY KEY,
                     logical_path              TEXT NOT NULL,
                     logical_path_modified_at  INTEGER NOT NULL,
                     deleted                   INTEGER NOT NULL,
-                    deleted_at                INTEGER NOT NULL
+                    deleted_at                INTEGER NOT NULL,
+                    restored_at               INTEGER NOT NULL
                 )",
                 (),
             )
@@ -639,9 +772,9 @@ impl FileDatabase {
         // is acceptable.
         let mut id_statement = self
             .connection
-            .prepare("SELECT id, logical_path, logical_path_modified_at, deleted, deleted_at FROM files_v1")
+            .prepare("SELECT id, logical_path, logical_path_modified_at, deleted, deleted_at, restored_at FROM files_v2")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
-        let file_rows: Vec<(FileId, LogicalPath, i64, bool, i64)> = id_statement
+        let file_rows: Vec<(FileId, LogicalPath, i64, bool, i64, i64)> = id_statement
             .query_map([], |row| {
                 let deleted: i64 = row.get(3)?;
                 Ok((
@@ -650,6 +783,7 @@ impl FileDatabase {
                     row.get::<_, i64>(2)?,
                     deleted != 0,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
@@ -657,7 +791,9 @@ impl FileDatabase {
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let mut entries = Vec::with_capacity(file_rows.len());
-        for (file_id, logical_path, logical_path_modified_at, deleted, deleted_at) in file_rows {
+        for (file_id, logical_path, logical_path_modified_at, deleted, deleted_at, restored_at) in
+            file_rows
+        {
             let history = self.version_history(file_id)?;
             // Files in `files` should always have at least one version
             // (every add/change path records one), but be defensive.
@@ -680,6 +816,7 @@ impl FileDatabase {
                 logical_path_modified_at,
                 deleted,
                 deleted_at,
+                restored_at,
             ));
         }
         Ok(entries)
@@ -831,7 +968,7 @@ impl FileDatabase {
         let count: i64 = self
             .connection
             .query_row(
-                "SELECT COUNT(*) FROM files_v1 WHERE id = ?1",
+                "SELECT COUNT(*) FROM files_v2 WHERE id = ?1",
                 [file_id],
                 |row| row.get(0),
             )
@@ -873,7 +1010,7 @@ impl FileDatabase {
         let predecessor: Option<String> = self
             .connection
             .query_row(
-                "SELECT id FROM files_v1 WHERE id < ?1 ORDER BY id DESC LIMIT 1",
+                "SELECT id FROM files_v2 WHERE id < ?1 ORDER BY id DESC LIMIT 1",
                 [&full],
                 |row| row.get(0),
             )
@@ -884,7 +1021,7 @@ impl FileDatabase {
         let successor: Option<String> = self
             .connection
             .query_row(
-                "SELECT id FROM files_v1 WHERE id > ?1 ORDER BY id ASC LIMIT 1",
+                "SELECT id FROM files_v2 WHERE id > ?1 ORDER BY id ASC LIMIT 1",
                 [&full],
                 |row| row.get(0),
             )
@@ -914,7 +1051,7 @@ impl FileDatabase {
     ///   (e.g. a colliding file was added since the short id was displayed).
     pub fn resolve_file_id_prefix(&self, prefix: &str) -> Result<FileId, DatabaseError> {
         let normalised = normalise_id_prefix(prefix).ok_or(DatabaseError::MissingFile)?;
-        match resolve_id_prefix(&self.connection, "files_v1", "id", &normalised)? {
+        match resolve_id_prefix(&self.connection, "files_v2", "id", &normalised)? {
             PrefixResolution::Unique(id) => {
                 FileId::from_string(&id).ok_or(DatabaseError::MissingFile)
             }
@@ -1010,12 +1147,12 @@ impl FileDatabase {
         logical_path: &LogicalPath,
         logical_path_modified_at: i64,
     ) -> Result<(), DatabaseError> {
-        // A freshly added file is always live: `deleted = 0`, `deleted_at = 0`.
-        // (No default on the columns, so they are set explicitly here.)
+        // A freshly added file is always live: `deleted = 0`, `deleted_at = 0`,
+        // `restored_at = 0` (never explicitly restored yet).
         self.connection
             .execute(
-                "INSERT INTO files_v1 (id, logical_path, logical_path_modified_at, deleted, deleted_at)
-                 VALUES (?1, ?2, ?3, 0, 0)",
+                "INSERT INTO files_v2 (id, logical_path, logical_path_modified_at, deleted, deleted_at, restored_at)
+                 VALUES (?1, ?2, ?3, 0, 0, 0)",
                 (file_id, logical_path, logical_path_modified_at),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
@@ -1023,34 +1160,105 @@ impl FileDatabase {
         Ok(())
     }
 
-    /// Clear a file's soft-delete tombstone (mark it live again). Used when a
-    /// version newer than a local delete arrives (the restore-after-delete
-    /// case) so the previously-tombstoned file becomes visible again.
+    /// Clear a file's soft-delete tombstone when a **newer content edit**
+    /// supersedes the delete (restore-after-edit). Called by the
+    /// version-arrival paths after recording a version: if the file's
+    /// latest version `observed_at` is strictly newer than `deleted_at`,
+    /// the edit wins last-writer-wins and the file becomes live again.
+    /// Otherwise it is a no-op (a stale/duplicate version does not
+    /// resurrect a newer delete).
+    ///
+    /// This is the edit half of the three-way LWW; explicit user restores go
+    /// through [`apply_restore`](Self::apply_restore). `restored_at` is left
+    /// untouched here — an edit is not a restore.
     pub fn restore_file(&self, file_id: FileId) -> Result<(), DatabaseError> {
+        let Some(state) = self.file_deletion_state(file_id)? else {
+            return Ok(());
+        };
+        if !state.deleted {
+            return Ok(());
+        }
+
+        let latest_observed_at = self
+            .latest_version(file_id)?
+            .map(|version| version.observed_at)
+            .unwrap_or(0);
+
+        if latest_observed_at <= state.deleted_at {
+            // No edit newer than the delete; the tombstone stands.
+            return Ok(());
+        }
+
         self.connection
-            .execute(
-                "UPDATE files_v1 SET deleted = 0, deleted_at = 0 WHERE id = ?1",
-                [file_id],
-            )
+            .execute("UPDATE files_v2 SET deleted = 0 WHERE id = ?1", [file_id])
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         Ok(())
     }
 
-    /// The soft-delete tombstone state of a file as `(deleted, deleted_at)`, or
-    /// `None` if the file is unknown. Used by reconciliation to decide
-    /// delete-vs-edit last-writer-wins.
+    /// Apply an **explicit user restore** to a file, last-writer-wins.
+    ///
+    /// Records `restored_at` as the file's restore clock (only advancing it, so
+    /// a duplicate/older restore is a no-op) and clears the tombstone iff the
+    /// restore is strictly newer than the delete (`restored_at > deleted_at`).
+    /// Unlike [`restore_file`](Self::restore_file), this does not depend on a
+    /// version edit — it is the restore half of the three-way LWW and is what
+    /// makes a peer's still-present `deleted_at` lose to our un-delete on
+    /// reconnect (the manifest advertises `restored_at`).
+    ///
+    /// Returns `true` if the file is live after this call's changes (either the
+    /// restore won or it was already live), `false` if a newer delete still
+    /// out-votes the restore (the file stays tombstoned).
+    pub fn apply_restore(&self, file_id: FileId, restored_at: i64) -> Result<bool, DatabaseError> {
+        let Some(state) = self.file_deletion_state(file_id)? else {
+            return Ok(false);
+        };
+
+        // Advance the restore clock (monotonic: never move it backward).
+        if restored_at > state.restored_at {
+            self.connection
+                .execute(
+                    "UPDATE files_v2 SET restored_at = ?2 WHERE id = ?1",
+                    (file_id, restored_at),
+                )
+                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        }
+
+        let effective_restored_at = state.restored_at.max(restored_at);
+        let latest_observed_at = self
+            .latest_version(file_id)?
+            .map(|version| version.observed_at)
+            .unwrap_or(0);
+
+        // Live iff the newest of {edit, restore} beats the delete.
+        let live = effective_restored_at.max(latest_observed_at) > state.deleted_at;
+        if live && state.deleted {
+            self.connection
+                .execute("UPDATE files_v2 SET deleted = 0 WHERE id = ?1", [file_id])
+                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        }
+
+        Ok(live)
+    }
+
+    /// The soft-delete tombstone state of a file, or `None` if the file is
+    /// unknown. Used by reconciliation to decide delete-vs-edit-vs-restore
+    /// last-writer-wins.
     pub fn file_deletion_state(
         &self,
         file_id: FileId,
-    ) -> Result<Option<(bool, i64)>, DatabaseError> {
+    ) -> Result<Option<DeletionState>, DatabaseError> {
         self.connection
             .query_row(
-                "SELECT deleted, deleted_at FROM files_v1 WHERE id = ?1",
+                "SELECT deleted, deleted_at, restored_at FROM files_v2 WHERE id = ?1",
                 [file_id],
                 |row| {
                     let deleted: i64 = row.get(0)?;
-                    Ok((deleted != 0, row.get::<_, i64>(1)?))
+                    Ok(DeletionState {
+                        deleted: deleted != 0,
+                        deleted_at: row.get::<_, i64>(1)?,
+                        restored_at: row.get::<_, i64>(2)?,
+                    })
                 },
             )
             .optional()
@@ -1078,7 +1286,7 @@ impl FileDatabase {
         let rows = self
             .connection
             .execute(
-                "UPDATE files_v1
+                "UPDATE files_v2
                  SET logical_path = ?2, logical_path_modified_at = ?3
                  WHERE id = ?1 AND logical_path_modified_at < ?3",
                 (file_id, logical_path, modified_at),
@@ -1093,29 +1301,35 @@ impl FileDatabase {
     /// (a peer offline during the delete learns of it on reconnect) and can win
     /// last-writer-wins against a stale "present".
     ///
-    /// Last-writer-wins guard: the delete is applied only if `deleted_at` is
-    /// strictly newer than the file's latest recorded version `observed_at`.
-    /// This is the restore-after-delete rule — an edit made after the delete
-    /// (its `observed_at` beats `deleted_at`) keeps the file alive. The
-    /// `file_versions` history is left intact.
+    /// Three-way last-writer-wins guard: the delete is applied only if
+    /// `deleted_at` is strictly newer than **both** the file's latest recorded
+    /// version `observed_at` (restore-after-edit) **and** its `restored_at`
+    /// (an explicit restore). Equivalently, the delete wins iff
+    /// `deleted_at > max(latest observed_at, restored_at)`. The `file_versions`
+    /// history is left intact.
     ///
-    /// Returns `true` if the tombstone was applied, `false` if a newer version
-    /// out-dated it (the file stays live).
+    /// Returns `true` if the tombstone was applied, `false` if a newer edit or
+    /// restore out-dated it (the file stays live).
     pub fn remove_file(&self, file_id: FileId, deleted_at: i64) -> Result<bool, DatabaseError> {
         let latest_observed_at = self
             .latest_version(file_id)?
             .map(|version| version.observed_at)
             .unwrap_or(0);
+        let restored_at = self
+            .file_deletion_state(file_id)?
+            .map(|state| state.restored_at)
+            .unwrap_or(0);
 
-        if deleted_at <= latest_observed_at {
-            // A newer edit supersedes this delete; keep the file live.
+        if deleted_at <= latest_observed_at.max(restored_at) {
+            // A newer edit or explicit restore supersedes this delete; keep the
+            // file live.
             return Ok(false);
         }
 
         let affected = self
             .connection
             .execute(
-                "UPDATE files_v1 SET deleted = 1, deleted_at = ?2 WHERE id = ?1",
+                "UPDATE files_v2 SET deleted = 1, deleted_at = ?2 WHERE id = ?1",
                 (file_id, deleted_at),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
@@ -1451,10 +1665,18 @@ impl FileDatabase {
     /// excludes nothing). For [`QueryTerm::AnyMatch`] the substring side
     /// still stands when the tag set is empty. Composes
     /// [`Self::file_ids_for_tag`] and [`Self::get_all_files`]; no new SQL.
+    ///
+    /// `deleted_rule` is passed through to [`Self::get_all_files`] so that
+    /// tombstoned files can participate in the candidate pool under
+    /// [`DeletedRule::Include`]. Relationship traversal (`entries_v1`)
+    /// stays live-only regardless — only the file's own row visibility is
+    /// affected. Callers filter the returned ids by their `deleted` flag if
+    /// they want an only-deleted view.
     pub fn file_ids_for_query(
         &self,
         terms: &[QueryTerm],
         subtag_rule: SubtagRule,
+        deleted_rule: DeletedRule,
     ) -> Result<impl IntoIterator<Item = FileId>, DatabaseError> {
         // The set of files carrying at least one tag in `tag_ids` (the union of
         // each tag's files). An empty set yields no files.
@@ -1486,9 +1708,16 @@ impl FileDatabase {
                 let next = files_for_any_tag(tag_ids)?;
                 set.retain(|file_id| next.contains(file_id));
             }
+            // A `HasTag` seed comes from `entries_v1` (always live) and does
+            // not consult `files_v1.deleted`, so it can include ids for
+            // tombstoned files. We do NOT drop them here — `Api::run_query`
+            // joins each id through `file_info_from_id` (which honors the
+            // requested `deleted_rule`) and skips misses. This preserves the
+            // long-standing tolerance for files referenced from `entries_v1`
+            // without a matching `file_versions` row yet.
             set
         } else {
-            self.get_all_files()?
+            self.get_all_files(deleted_rule)?
                 .into_iter()
                 .map(|file| file.file_id)
                 .collect()
@@ -1522,7 +1751,7 @@ impl FileDatabase {
 
         if has_text_term {
             let paths: std::collections::BTreeMap<FileId, String> = self
-                .get_all_files()?
+                .get_all_files(deleted_rule)?
                 .into_iter()
                 .map(|file| (file.file_id, file.logical_path.as_str().to_lowercase()))
                 .collect();
@@ -1592,10 +1821,18 @@ impl FileDatabase {
     /// matches no tag. For [`QueryTerm::AnyMatch`] the substring side still
     /// stands when the tag set is empty. Composes [`Self::subtag_ids_for_tag`]
     /// and [`Self::get_all_tags`]; no new SQL.
+    ///
+    /// `deleted_rule` is passed through to [`Self::get_all_tags`] so that
+    /// tombstoned tags can participate in the candidate pool under
+    /// [`DeletedRule::Include`]. Relationship traversal (`entries_v1`)
+    /// stays live-only regardless — only the tag's own row visibility is
+    /// affected. Callers filter the returned ids by their `deleted` flag if
+    /// they want an only-deleted view.
     pub fn tag_ids_for_query(
         &self,
         terms: &[QueryTerm],
         subtag_rule: SubtagRule,
+        deleted_rule: DeletedRule,
     ) -> Result<impl IntoIterator<Item = TagId>, DatabaseError> {
         // The set of tags that are a subtag of at least one tag in `tag_ids`
         // (the union of each tag's subtags). An empty set yields no tags.
@@ -1624,9 +1861,18 @@ impl FileDatabase {
                 let next = subtags_of_any(tag_ids)?;
                 set.retain(|tag_id| next.contains(tag_id));
             }
+            // Subtag traversal comes from `entries_v1` (always live) and does
+            // not consult `tags_v1.deleted`, so it can include ids for
+            // tombstoned tags. We do NOT drop them here — `Api::run_query`
+            // joins each id through `tag_from_id` (which honors the requested
+            // `deleted_rule`) and skips misses, matching the tolerance in
+            // `file_ids_for_query`.
             set
         } else {
-            self.get_all_tags()?.into_iter().map(|tag| tag.id).collect()
+            self.get_all_tags(deleted_rule)?
+                .into_iter()
+                .map(|tag| tag.id)
+                .collect()
         };
 
         for term in terms {
@@ -1655,7 +1901,7 @@ impl FileDatabase {
 
         if has_text_term {
             let names: std::collections::BTreeMap<TagId, String> = self
-                .get_all_tags()?
+                .get_all_tags(deleted_rule)?
                 .into_iter()
                 .map(|tag| (tag.id, tag.name.to_lowercase()))
                 .collect();
@@ -1705,10 +1951,23 @@ impl FileDatabase {
         file_id: FileId,
         subtag_rule: SubtagRule,
     ) -> Result<impl IntoIterator<Item = TagId>, DatabaseError> {
+        // Exclude both the relationship tombstone (`entries_v1.deleted`) *and*
+        // tags whose own row is tombstoned (`tags_v1.deleted`): deleting a tag
+        // is distinct from untagging, so the relationship survives, but a
+        // deleted tag must not appear as an applied tag (the UI would then try
+        // to fetch a `MissingTag` and error).
+        //
+        // LEFT JOIN (not INNER): a live relationship can legitimately reference
+        // a tag whose definition hasn't been reconciled yet (`FileTagged` can
+        // arrive before `TagAdded`). Such a tag has no `tags_v1` row — keep it
+        // (`t.deleted IS NULL`); only exclude tags we *know* are tombstoned.
         let mut statement = self
             .connection
             .prepare(
-                "SELECT tag_id FROM entries_v1 WHERE target_id = ?1 AND type = 0 AND deleted = 0",
+                "SELECT e.tag_id FROM entries_v1 AS e
+                 LEFT JOIN tags_v1 AS t ON t.id = e.tag_id
+                 WHERE e.target_id = ?1 AND e.type = 0 AND e.deleted = 0
+                   AND (t.deleted = 0 OR t.deleted IS NULL)",
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
@@ -1741,10 +2000,17 @@ impl FileDatabase {
         collected_tags: &mut BTreeSet<TagId>,
         subtag_rule: SubtagRule,
     ) -> Result<(), DatabaseError> {
+        // Skip subtags whose own tag row is tombstoned (a deleted tag is not a
+        // live subtag), alongside the relationship tombstone. LEFT JOIN so a
+        // subtag whose definition hasn't reconciled yet (no `tags_v1` row) is
+        // still returned; only known-tombstoned tags are excluded.
         let mut statement = self
             .connection
             .prepare(
-                "SELECT target_id FROM entries_v1 WHERE tag_id = ?1 AND type = 1 AND deleted = 0",
+                "SELECT e.target_id FROM entries_v1 AS e
+                 LEFT JOIN tags_v1 AS t ON t.id = e.target_id
+                 WHERE e.tag_id = ?1 AND e.type = 1 AND e.deleted = 0
+                   AND (t.deleted = 0 OR t.deleted IS NULL)",
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
@@ -1787,10 +2053,17 @@ impl FileDatabase {
         collected_tags: &mut BTreeSet<TagId>,
         subtag_rule: SubtagRule,
     ) -> Result<(), DatabaseError> {
+        // Skip parent tags whose own tag row is tombstoned (a deleted tag is not
+        // a live parent), alongside the relationship tombstone. LEFT JOIN so a
+        // parent whose definition hasn't reconciled yet (no `tags_v1` row) is
+        // still returned; only known-tombstoned tags are excluded.
         let mut statement = self
             .connection
             .prepare(
-                "SELECT tag_id FROM entries_v1 WHERE target_id = ?1 AND type = 1 AND deleted = 0",
+                "SELECT e.tag_id FROM entries_v1 AS e
+                 LEFT JOIN tags_v1 AS t ON t.id = e.tag_id
+                 WHERE e.target_id = ?1 AND e.type = 1 AND e.deleted = 0
+                   AND (t.deleted = 0 OR t.deleted IS NULL)",
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
@@ -1826,11 +2099,22 @@ impl FileDatabase {
         Ok(tags)
     }
 
-    /// Get all tags. Excludes soft-deleted (tombstoned) tags.
-    pub fn get_all_tags(&self) -> Result<impl IntoIterator<Item = Tag>, DatabaseError> {
+    /// Get all tags.
+    ///
+    /// `deleted_rule` governs tombstone visibility: `Exclude` hides
+    /// tombstoned tags (the standard behavior), `Include` returns them
+    /// alongside live ones with `Tag::deleted = true`.
+    pub fn get_all_tags(
+        &self,
+        deleted_rule: DeletedRule,
+    ) -> Result<impl IntoIterator<Item = Tag>, DatabaseError> {
+        let sql = format!(
+            "SELECT id, name, color, deleted FROM tags_v1{}",
+            deleted_rule.where_deleted_clause(),
+        );
         let mut statement = self
             .connection
-            .prepare("SELECT id, name, color FROM tags_v1 WHERE deleted = 0")
+            .prepare(&sql)
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let tag_list = statement
@@ -1840,6 +2124,7 @@ impl FileDatabase {
                     name: row.get(1)?,
                     color: row.get(2)?,
                     metadata: None,
+                    deleted: row.get::<_, i64>(3)? != 0,
                 })
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
@@ -1849,12 +2134,23 @@ impl FileDatabase {
         Ok(tag_list)
     }
 
-    /// Get the name of a tag by the id. Excludes soft-deleted (tombstoned) tags
-    /// (a tombstoned tag reads as `MissingTag`).
-    pub fn tag_from_id(&self, tag_id: TagId) -> Result<Tag, DatabaseError> {
+    /// Get the name of a tag by the id.
+    ///
+    /// `deleted_rule` mirrors [`Self::get_all_tags`]: `Exclude` hides
+    /// tombstoned tags (they read as `MissingTag`), `Include` returns them
+    /// with `Tag::deleted = true`.
+    pub fn tag_from_id(
+        &self,
+        tag_id: TagId,
+        deleted_rule: DeletedRule,
+    ) -> Result<Tag, DatabaseError> {
+        let sql = format!(
+            "SELECT name, color, deleted FROM tags_v1 WHERE id = ?1{}",
+            deleted_rule.and_deleted_clause(),
+        );
         let mut statement = self
             .connection
-            .prepare("SELECT name, color FROM tags_v1 WHERE id = ?1 AND deleted = 0")
+            .prepare(&sql)
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let tag = statement
@@ -1864,6 +2160,7 @@ impl FileDatabase {
                     name: row.get(0)?,
                     color: row.get(1)?,
                     metadata: None,
+                    deleted: row.get::<_, i64>(2)? != 0,
                 })
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
@@ -1881,7 +2178,7 @@ impl FileDatabase {
     ) -> Result<FileId, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id FROM files_v1 WHERE logical_path = ?1 AND deleted = 0")
+            .prepare("SELECT id FROM files_v2 WHERE logical_path = ?1 AND deleted = 0")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let file_id = statement
@@ -1905,7 +2202,17 @@ impl FileDatabase {
     /// Returns all matches (deduplicated); an empty result means nothing
     /// matched, which callers treat as "matches no tag" rather than an
     /// error.
-    pub fn tag_ids_matching_token(&self, token: &str) -> Result<Vec<TagId>, DatabaseError> {
+    ///
+    /// `deleted_rule` controls whether tombstoned tags participate in the
+    /// resolution: search callers that want to find deleted tags pass
+    /// [`DeletedRule::Include`] so a token whose only matches are tombstoned
+    /// tags still resolves; every other caller passes
+    /// [`DeletedRule::Exclude`].
+    pub fn tag_ids_matching_token(
+        &self,
+        token: &str,
+        deleted_rule: DeletedRule,
+    ) -> Result<Vec<TagId>, DatabaseError> {
         let mut ids: BTreeSet<TagId> = BTreeSet::new();
 
         // Name substring, case-insensitive. Escape LIKE metacharacters in the
@@ -1916,9 +2223,13 @@ impl FileDatabase {
             .replace('%', "\\%")
             .replace('_', "\\_");
         let pattern = format!("%{escaped}%");
+        let name_sql = format!(
+            "SELECT id FROM tags_v1 WHERE name LIKE ?1 ESCAPE '\\'{}",
+            deleted_rule.and_deleted_clause(),
+        );
         let mut statement = self
             .connection
-            .prepare("SELECT id FROM tags_v1 WHERE name LIKE ?1 ESCAPE '\\' AND deleted = 0")
+            .prepare(&name_sql)
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
         let name_matches = statement
             .query_map([&pattern], |row| row.get::<_, TagId>(0))
@@ -1930,9 +2241,13 @@ impl FileDatabase {
         // Id prefix (only when the token is a valid hex id prefix at all).
         if let Some(prefix) = normalise_id_prefix(token) {
             let id_pattern = format!("{prefix}%");
+            let id_sql = format!(
+                "SELECT id FROM tags_v1 WHERE id LIKE ?1{}",
+                deleted_rule.and_deleted_clause(),
+            );
             let mut statement = self
                 .connection
-                .prepare("SELECT id FROM tags_v1 WHERE id LIKE ?1 AND deleted = 0")
+                .prepare(&id_sql)
                 .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
             let id_matches = statement
                 .query_map([&id_pattern], |row| row.get::<_, TagId>(0))
@@ -1970,7 +2285,7 @@ impl FileDatabase {
     pub fn logical_path_for_file_id(&self, file_id: FileId) -> Result<LogicalPath, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT logical_path FROM files_v1 WHERE id = ?1 AND deleted = 0")
+            .prepare("SELECT logical_path FROM files_v2 WHERE id = ?1 AND deleted = 0")
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let logical_path = statement
@@ -1992,7 +2307,7 @@ impl FileDatabase {
     pub fn logical_path_modified_at(&self, file_id: FileId) -> Result<Option<i64>, DatabaseError> {
         self.connection
             .query_row(
-                "SELECT logical_path_modified_at FROM files_v1 WHERE id = ?1",
+                "SELECT logical_path_modified_at FROM files_v2 WHERE id = ?1",
                 [file_id],
                 |row| row.get::<_, i64>(0),
             )
@@ -2007,21 +2322,36 @@ impl FileDatabase {
     /// with [`Self::shorten_file_id`] (an indexed neighbour lookup, not a full
     /// scan), so this stays cheap per call. Errors with `MissingFile` if the
     /// file has no row, or no version yet.
-    pub fn file_info_from_id(&self, file_id: FileId) -> Result<FileInfo, DatabaseError> {
+    ///
+    /// `deleted_rule` mirrors [`Self::get_all_files`]: `Exclude` hides
+    /// tombstoned files (they read as `MissingFile`), `Include` returns them
+    /// with `FileInfo::deleted = true`.
+    pub fn file_info_from_id(
+        &self,
+        file_id: FileId,
+        deleted_rule: DeletedRule,
+    ) -> Result<FileInfo, DatabaseError> {
+        // f.deleted is aliased; inline the guard rather than using the shared
+        // fragment helpers.
+        let extra_clause = match deleted_rule {
+            DeletedRule::Exclude => " AND f.deleted = 0",
+            DeletedRule::Include => "",
+        };
+        let sql = format!(
+            "SELECT f.logical_path, v.content_hash, v.version_number, v.size, f.deleted
+             FROM files_v2 AS f
+             JOIN file_versions_v1 AS v
+               ON v.file_id = f.id
+              AND v.version_number = (
+                  SELECT MAX(version_number)
+                  FROM file_versions_v1 AS inner
+                  WHERE inner.file_id = f.id
+              )
+             WHERE f.id = ?1{extra_clause}"
+        );
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT f.logical_path, v.content_hash, v.version_number, v.size
-                 FROM files_v1 AS f
-                 JOIN file_versions_v1 AS v
-                   ON v.file_id = f.id
-                  AND v.version_number = (
-                      SELECT MAX(version_number)
-                      FROM file_versions_v1 AS inner
-                      WHERE inner.file_id = f.id
-                  )
-                 WHERE f.id = ?1 AND f.deleted = 0",
-            )
+            .prepare(&sql)
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let mut file = statement
@@ -2034,6 +2364,7 @@ impl FileDatabase {
                     size: row.get::<_, i64>(3)? as u64,
                     // Filled in below.
                     short_id_length: 0,
+                    deleted: row.get::<_, i64>(4)? != 0,
                 })
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?
@@ -2054,21 +2385,33 @@ impl FileDatabase {
     /// `(file_id, version_number)`. Files without any recorded version are
     /// excluded (they should not occur in practice, since every add/change
     /// path records a version, but the inner join makes this defensive).
-    pub fn get_all_files(&self) -> Result<Vec<FileInfo>, DatabaseError> {
+    ///
+    /// `deleted_rule` governs tombstone visibility: under
+    /// [`DeletedRule::Exclude`] tombstoned files are hidden (the standard
+    /// behavior for every non-search caller); under [`DeletedRule::Include`]
+    /// they come back too, and callers can distinguish them by the returned
+    /// `deleted` flag.
+    pub fn get_all_files(&self, deleted_rule: DeletedRule) -> Result<Vec<FileInfo>, DatabaseError> {
+        // f.deleted is aliased, so we cannot use the plain " AND deleted = 0"
+        // fragment. Inline the guard here.
+        let where_clause = match deleted_rule {
+            DeletedRule::Exclude => " WHERE f.deleted = 0",
+            DeletedRule::Include => "",
+        };
+        let sql = format!(
+            "SELECT f.id, f.logical_path, v.content_hash, v.version_number, v.size, f.deleted
+             FROM files_v2 AS f
+             JOIN file_versions_v1 AS v
+               ON v.file_id = f.id
+              AND v.version_number = (
+                  SELECT MAX(version_number)
+                  FROM file_versions_v1 AS inner
+                  WHERE inner.file_id = f.id
+              ){where_clause}"
+        );
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT f.id, f.logical_path, v.content_hash, v.version_number, v.size
-                 FROM files_v1 AS f
-                 JOIN file_versions_v1 AS v
-                   ON v.file_id = f.id
-                  AND v.version_number = (
-                      SELECT MAX(version_number)
-                      FROM file_versions_v1 AS inner
-                      WHERE inner.file_id = f.id
-                  )
-                 WHERE f.deleted = 0",
-            )
+            .prepare(&sql)
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         let mut files = Vec::new();
@@ -2082,6 +2425,7 @@ impl FileDatabase {
                     size: row.get::<_, i64>(4)? as u64,
                     // Filled in below once we have the whole set.
                     short_id_length: 0,
+                    deleted: row.get::<_, i64>(5)? != 0,
                 })
             })
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
@@ -2376,7 +2720,7 @@ mod tests {
             .unwrap();
         assert!(v2 > v1);
 
-        let files = database.get_all_files().unwrap();
+        let files = database.get_all_files(DeletedRule::Exclude).unwrap();
         assert_eq!(files.len(), 1);
         let info = &files[0];
         assert_eq!(info.file_id, file_id);
@@ -2441,13 +2785,23 @@ mod tests {
             .add_file(FileId::new(), &LogicalPath::new("orphan.txt"), 0)
             .unwrap();
 
-        assert!(database.get_all_files().unwrap().is_empty());
+        assert!(
+            database
+                .get_all_files(DeletedRule::Exclude)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn get_all_files_empty_when_no_files() {
         let database = memory_db();
-        assert!(database.get_all_files().unwrap().is_empty());
+        assert!(
+            database
+                .get_all_files(DeletedRule::Exclude)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Build a `FileId` from a 32-char hex string so tests can control the
@@ -2511,7 +2865,7 @@ mod tests {
             database.record_version(id, "hash", "local", 1).unwrap();
         }
 
-        let files = database.get_all_files().unwrap();
+        let files = database.get_all_files(DeletedRule::Exclude).unwrap();
         // Both ids share all but the final character, so the short id must be
         // the full length to disambiguate.
         for info in &files {
@@ -2613,7 +2967,7 @@ mod tests {
         }
 
         // Each file's displayed short id must resolve back to exactly itself.
-        for info in database.get_all_files().unwrap() {
+        for info in database.get_all_files(DeletedRule::Exclude).unwrap() {
             let full = info.file_id.to_string();
             let short = &full[..info.short_id_length];
             assert_eq!(
@@ -2685,7 +3039,7 @@ mod tests {
         }
 
         // Each tag's displayed short id must resolve back to exactly itself.
-        for tag in database.get_all_tags().unwrap() {
+        for tag in database.get_all_tags(DeletedRule::Exclude).unwrap() {
             let full = tag.id.to_string();
             let length = database.shorten_tag_id(tag.id).unwrap();
             let short = &full[..length];
@@ -2824,7 +3178,11 @@ mod tests {
 
         assert!(database.tag_definition(a).unwrap().is_some());
         assert!(database.tag_definition(b).unwrap().is_some());
-        let all: Vec<_> = database.get_all_tags().unwrap().into_iter().collect();
+        let all: Vec<_> = database
+            .get_all_tags(DeletedRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect();
         assert_eq!(all.len(), 2);
     }
 
@@ -2859,6 +3217,70 @@ mod tests {
         assert_eq!(manifest.len(), 1);
         assert!(manifest[0].deleted);
         assert_eq!(manifest[0].modified_at, 200);
+    }
+
+    #[test]
+    fn deleting_a_tag_hides_it_from_applied_tags() {
+        // Regression: tagging a file then deleting the *tag* (not untagging)
+        // leaves the relationship live but the tag row tombstoned. The applied-
+        // tags read must exclude it so the UI doesn't fetch a MissingTag.
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        let tag_id = TagId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("a.txt"), 0)
+            .unwrap();
+        database.add_tag(tag_id, "work", "red", 10).unwrap();
+        database.tag_file(tag_id, file_id, 100).unwrap();
+
+        // Applied while the tag is live.
+        let tags: Vec<_> = database
+            .tag_ids_for_file(file_id, SubtagRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(tags, vec![tag_id]);
+
+        // Delete the tag itself (relationship is untouched).
+        assert!(database.remove_tag(tag_id, 200).unwrap());
+        let tags: Vec<_> = database
+            .tag_ids_for_file(file_id, SubtagRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(tags.is_empty(), "a deleted tag must not appear as applied");
+
+        // Restoring the tag makes it applied again (the relationship survived).
+        database.add_tag(tag_id, "work", "red", 300).unwrap();
+        let tags: Vec<_> = database
+            .tag_ids_for_file(file_id, SubtagRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(tags, vec![tag_id]);
+    }
+
+    #[test]
+    fn applied_tag_without_definition_is_still_returned() {
+        // A `FileTagged` relationship can arrive before the tag's `TagAdded`
+        // definition during reconciliation, so a live relationship may point at
+        // a tag with no `tags_v1` row yet. That tag must still be returned (the
+        // filter only excludes *known-tombstoned* tags).
+        let database = memory_db();
+        let file_id = FileId::new();
+        let tag_id = TagId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("a.txt"), 0)
+            .unwrap();
+        // Tag the file without ever defining the tag.
+        database.tag_file(tag_id, file_id, 100).unwrap();
+
+        let tags: Vec<_> = database
+            .tag_ids_for_file(file_id, SubtagRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(tags, vec![tag_id]);
     }
 
     #[test]
@@ -2982,7 +3404,7 @@ mod tests {
 
         // A different case still matches (case-insensitive substring).
         let matched: BTreeSet<TagId> = database
-            .tag_ids_matching_token("FOO")
+            .tag_ids_matching_token("FOO", DeletedRule::Exclude)
             .unwrap()
             .into_iter()
             .collect();
@@ -3000,7 +3422,10 @@ mod tests {
         database.add_tag(TagId::new(), "alpha", "red", 1).unwrap();
 
         assert!(
-            database.tag_ids_matching_token("nope").unwrap().is_empty(),
+            database
+                .tag_ids_matching_token("nope", DeletedRule::Exclude)
+                .unwrap()
+                .is_empty(),
             "an unmatched token yields an empty set, not an error"
         );
     }
@@ -3027,7 +3452,7 @@ mod tests {
         // `$foo` should match files carrying either tag (union), not require both.
         let terms = vec![QueryTerm::HasTag(vec![foo, foobar])];
         let matched: BTreeSet<FileId> = database
-            .file_ids_for_query(&terms, SubtagRule::Exclude)
+            .file_ids_for_query(&terms, SubtagRule::Exclude, DeletedRule::Exclude)
             .unwrap()
             .into_iter()
             .collect();
@@ -3044,7 +3469,7 @@ mod tests {
         // A `$foo` term that matched no tag (empty set) matches no file.
         let terms = vec![QueryTerm::HasTag(vec![])];
         let matched: Vec<FileId> = database
-            .file_ids_for_query(&terms, SubtagRule::Exclude)
+            .file_ids_for_query(&terms, SubtagRule::Exclude, DeletedRule::Exclude)
             .unwrap()
             .into_iter()
             .collect();
@@ -3075,7 +3500,7 @@ mod tests {
         // `!foo` excludes files carrying either matching tag, leaving only file_c.
         let terms = vec![QueryTerm::NotTag(vec![foo, foobar])];
         let matched: BTreeSet<FileId> = database
-            .file_ids_for_query(&terms, SubtagRule::Exclude)
+            .file_ids_for_query(&terms, SubtagRule::Exclude, DeletedRule::Exclude)
             .unwrap()
             .into_iter()
             .collect();
@@ -3097,13 +3522,25 @@ mod tests {
         // Latest version carries the size.
         assert_eq!(database.latest_version(file_id).unwrap().unwrap().size, 42);
         // FileInfo surfaces it (as u64).
-        assert_eq!(database.file_info_from_id(file_id).unwrap().size, 42);
+        assert_eq!(
+            database
+                .file_info_from_id(file_id, DeletedRule::Exclude)
+                .unwrap()
+                .size,
+            42
+        );
 
         // A new version records its own size; the latest reflects the newest.
         database
             .record_version(file_id, "hash-2", "local", 100)
             .unwrap();
-        assert_eq!(database.file_info_from_id(file_id).unwrap().size, 100);
+        assert_eq!(
+            database
+                .file_info_from_id(file_id, DeletedRule::Exclude)
+                .unwrap()
+                .size,
+            100
+        );
     }
 
     #[test]
@@ -3116,7 +3553,13 @@ mod tests {
         database
             .record_version(file_id, "hash-0", "local", 0)
             .unwrap();
-        assert_eq!(database.file_info_from_id(file_id).unwrap().size, 0);
+        assert_eq!(
+            database
+                .file_info_from_id(file_id, DeletedRule::Exclude)
+                .unwrap()
+                .size,
+            0
+        );
     }
 
     #[test]
@@ -3150,16 +3593,25 @@ mod tests {
         assert!(database.remove_file(file_id, deleted_at).unwrap());
 
         // Hidden from user-facing reads...
-        assert!(database.get_all_files().unwrap().is_empty());
+        assert!(
+            database
+                .get_all_files(DeletedRule::Exclude)
+                .unwrap()
+                .is_empty()
+        );
         assert!(matches!(
-            database.file_info_from_id(file_id),
+            database.file_info_from_id(file_id, DeletedRule::Exclude),
             Err(DatabaseError::MissingFile)
         ));
         // ...but the row (and its history) still exists for reconciliation.
         assert!(database.file_exists(file_id).unwrap());
         assert_eq!(
             database.file_deletion_state(file_id).unwrap(),
-            Some((true, deleted_at))
+            Some(DeletionState {
+                deleted: true,
+                deleted_at,
+                restored_at: 0,
+            })
         );
     }
 
@@ -3179,33 +3631,100 @@ mod tests {
 
         assert!(!database.remove_file(file_id, stale_delete_at).unwrap());
         // File stays visible.
-        assert_eq!(database.get_all_files().unwrap().len(), 1);
+        assert_eq!(
+            database.get_all_files(DeletedRule::Exclude).unwrap().len(),
+            1
+        );
         assert_eq!(
             database.file_deletion_state(file_id).unwrap(),
-            Some((false, 0))
+            Some(DeletionState {
+                deleted: false,
+                deleted_at: 0,
+                restored_at: 0,
+            })
         );
     }
 
     #[test]
-    fn restore_file_clears_tombstone() {
+    fn apply_restore_clears_tombstone() {
+        // An explicit restore whose stamp beats `deleted_at` clears the
+        // tombstone via the `restored_at` clock — no fabricated version.
         let mut database = memory_db();
         let file_id = FileId::new();
         database
             .add_file(file_id, &LogicalPath::new("a.txt"), 0)
             .unwrap();
         database.record_version(file_id, "h1", "local", 1).unwrap();
+        let deleted_at = now_millis() + 10_000;
+        assert!(database.remove_file(file_id, deleted_at).unwrap());
         assert!(
             database
-                .remove_file(file_id, now_millis() + 10_000)
+                .get_all_files(DeletedRule::Exclude)
                 .unwrap()
+                .is_empty()
         );
-        assert!(database.get_all_files().unwrap().is_empty());
 
-        database.restore_file(file_id).unwrap();
-        assert_eq!(database.get_all_files().unwrap().len(), 1);
+        // A restore stamped after the delete wins and makes the file live.
+        let restored_at = deleted_at + 1;
+        assert!(database.apply_restore(file_id, restored_at).unwrap());
+        assert_eq!(
+            database.get_all_files(DeletedRule::Exclude).unwrap().len(),
+            1
+        );
         assert_eq!(
             database.file_deletion_state(file_id).unwrap(),
-            Some((false, 0))
+            Some(DeletionState {
+                deleted: false,
+                deleted_at,
+                restored_at,
+            })
+        );
+    }
+
+    #[test]
+    fn apply_restore_loses_to_newer_delete() {
+        // A restore older than the delete does not resurrect the file.
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("a.txt"), 0)
+            .unwrap();
+        database.record_version(file_id, "h1", "local", 1).unwrap();
+        let deleted_at = now_millis() + 10_000;
+        assert!(database.remove_file(file_id, deleted_at).unwrap());
+
+        // A restore stamped before the delete loses; file stays tombstoned.
+        assert!(!database.apply_restore(file_id, deleted_at - 1).unwrap());
+        assert!(
+            database
+                .get_all_files(DeletedRule::Exclude)
+                .unwrap()
+                .is_empty()
+        );
+
+        // ...and a later delete still wins over that restore stamp.
+        assert!(database.remove_file(file_id, deleted_at + 5).unwrap());
+    }
+
+    #[test]
+    fn delete_loses_to_newer_restore() {
+        // Three-way LWW: a restore newer than a subsequent delete keeps the
+        // file live (the delete is a no-op).
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("a.txt"), 0)
+            .unwrap();
+        database.record_version(file_id, "h1", "local", 1).unwrap();
+        let deleted_at = now_millis() + 10_000;
+        assert!(database.remove_file(file_id, deleted_at).unwrap());
+        // Restore after that delete.
+        assert!(database.apply_restore(file_id, deleted_at + 10).unwrap());
+        // A delete stamped between the two loses to the restore.
+        assert!(!database.remove_file(file_id, deleted_at + 5).unwrap());
+        assert_eq!(
+            database.get_all_files(DeletedRule::Exclude).unwrap().len(),
+            1
         );
     }
 
@@ -3275,10 +3794,12 @@ mod tests {
 
         let entries = database.manifest_entries().unwrap();
         assert_eq!(entries.len(), 1);
-        let (id, history, _observed, _path, _path_modified, deleted, got_deleted_at) = &entries[0];
+        let (id, history, _observed, _path, _path_modified, deleted, got_deleted_at, restored_at) =
+            &entries[0];
         assert_eq!(*id, file_id);
         assert!(*deleted);
         assert_eq!(*got_deleted_at, deleted_at);
+        assert_eq!(*restored_at, 0);
         // History (with sizes) is retained so the file can be restored.
         assert_eq!(history, &vec![(1, "h1".to_owned(), 7)]);
     }
@@ -3295,14 +3816,14 @@ mod tests {
         // Hidden from user-facing reads.
         assert!(
             database
-                .get_all_tags()
+                .get_all_tags(DeletedRule::Exclude)
                 .unwrap()
                 .into_iter()
                 .next()
                 .is_none()
         );
         assert!(matches!(
-            database.tag_from_id(tag_id),
+            database.tag_from_id(tag_id, DeletedRule::Exclude),
             Err(DatabaseError::MissingTag)
         ));
         // But the tombstone is advertised in the manifest with a bumped
@@ -3321,7 +3842,7 @@ mod tests {
 
         // A delete older than the tag's modified_at is a no-op (LWW).
         assert!(!database.remove_tag(tag_id, 50).unwrap());
-        assert!(database.tag_from_id(tag_id).is_ok());
+        assert!(database.tag_from_id(tag_id, DeletedRule::Exclude).is_ok());
     }
 
     #[test]
@@ -3331,11 +3852,177 @@ mod tests {
         let tag_id = TagId::new();
         database.add_tag(tag_id, "work", "red", 10).unwrap();
         assert!(database.remove_tag(tag_id, 20).unwrap());
-        assert!(database.tag_from_id(tag_id).is_err());
+        assert!(database.tag_from_id(tag_id, DeletedRule::Exclude).is_err());
 
         // A newer add (upsert) revives it.
         database.add_tag(tag_id, "work", "blue", 30).unwrap();
-        let tag = database.tag_from_id(tag_id).unwrap();
+        let tag = database.tag_from_id(tag_id, DeletedRule::Exclude).unwrap();
         assert_eq!(tag.color, "blue");
+    }
+
+    #[test]
+    fn restore_tag_preserves_definition() {
+        // `Api::restore_tag` reads the tombstoned tag's current name/color and
+        // re-announces them via `TagAdded` (add_tag) with a fresh timestamp.
+        // This models that round-trip: the revived tag keeps its definition and
+        // becomes live again.
+        let database = memory_db();
+        let tag_id = TagId::new();
+        database.add_tag(tag_id, "work", "#123456", 10).unwrap();
+        assert!(database.remove_tag(tag_id, 20).unwrap());
+
+        // Read the tombstoned definition (as the API does with `Include`)...
+        let deleted = database.tag_from_id(tag_id, DeletedRule::Include).unwrap();
+        assert!(deleted.deleted);
+        assert_eq!(deleted.name, "work");
+        assert_eq!(deleted.color, "#123456");
+
+        // ...and re-announce it with a newer timestamp to restore it.
+        database
+            .add_tag(tag_id, deleted.name, deleted.color, 30)
+            .unwrap();
+        let restored = database.tag_from_id(tag_id, DeletedRule::Exclude).unwrap();
+        assert!(!restored.deleted);
+        assert_eq!(restored.name, "work");
+        assert_eq!(restored.color, "#123456");
+    }
+
+    #[test]
+    fn get_all_files_include_returns_tombstoned_with_flag() {
+        // Under `Exclude` (default), a tombstoned file is invisible. Under
+        // `Include`, it comes back with `FileInfo::deleted = true`, letting
+        // the UI's "show deleted" toggle distinguish it from live rows.
+        let mut database = memory_db();
+        let live = FileId::new();
+        let dead = FileId::new();
+        database
+            .add_file(live, &LogicalPath::new("live.txt"), 0)
+            .unwrap();
+        database
+            .add_file(dead, &LogicalPath::new("dead.txt"), 0)
+            .unwrap();
+        database.record_version(live, "h1", "local", 1).unwrap();
+        database.record_version(dead, "h2", "local", 1).unwrap();
+        let deleted_at = now_millis() + 10_000;
+        assert!(database.remove_file(dead, deleted_at).unwrap());
+
+        let excluded: Vec<_> = database.get_all_files(DeletedRule::Exclude).unwrap();
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0].file_id, live);
+        assert!(!excluded[0].deleted);
+
+        let included: Vec<_> = database.get_all_files(DeletedRule::Include).unwrap();
+        assert_eq!(included.len(), 2);
+        let dead_info = included.iter().find(|f| f.file_id == dead).unwrap();
+        assert!(dead_info.deleted);
+        let live_info = included.iter().find(|f| f.file_id == live).unwrap();
+        assert!(!live_info.deleted);
+    }
+
+    #[test]
+    fn get_all_tags_include_returns_tombstoned_with_flag() {
+        // Sibling of `get_all_files_include_returns_tombstoned_with_flag` on
+        // the tag axis.
+        let database = memory_db();
+        let live = TagId::new();
+        let dead = TagId::new();
+        database.add_tag(live, "live", "red", 10).unwrap();
+        database.add_tag(dead, "dead", "blue", 10).unwrap();
+        assert!(database.remove_tag(dead, 20).unwrap());
+
+        let excluded: Vec<_> = database
+            .get_all_tags(DeletedRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0].id, live);
+        assert!(!excluded[0].deleted);
+
+        let included: Vec<_> = database
+            .get_all_tags(DeletedRule::Include)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(included.len(), 2);
+        let dead_tag = included.iter().find(|t| t.id == dead).unwrap();
+        assert!(dead_tag.deleted);
+    }
+
+    #[test]
+    fn file_ids_for_query_include_returns_tombstoned_candidates() {
+        // A `HasTag` search under `DeletedRule::Include` must surface files
+        // whose row is tombstoned in `files_v1` (they still have live
+        // `entries_v1` rows pointing at them). The caller is expected to
+        // post-filter by `FileInfo::deleted` to keep only the tombstoned
+        // ones; the evaluator does not do that step itself.
+        let mut database = memory_db();
+        let tag_id = TagId::new();
+        database.add_tag(tag_id, "photos", "red", 10).unwrap();
+
+        let live = FileId::new();
+        let dead = FileId::new();
+        database
+            .add_file(live, &LogicalPath::new("live.jpg"), 0)
+            .unwrap();
+        database
+            .add_file(dead, &LogicalPath::new("dead.jpg"), 0)
+            .unwrap();
+        database.record_version(live, "h1", "local", 1).unwrap();
+        database.record_version(dead, "h2", "local", 1).unwrap();
+        database.tag_file(tag_id, live, 20).unwrap();
+        database.tag_file(tag_id, dead, 20).unwrap();
+
+        let deleted_at = now_millis() + 10_000;
+        assert!(database.remove_file(dead, deleted_at).unwrap());
+
+        let terms = vec![QueryTerm::HasTag(vec![tag_id])];
+
+        // Exclude does not drop the tombstoned candidate at the evaluator
+        // layer either; the "hide deleted" filtering happens downstream in
+        // `Api::run_query` (via `file_info_from_id` returning MissingFile).
+        // What we assert here is that both ids reach the caller and the
+        // downstream filter has enough information to distinguish them.
+        let candidates: BTreeSet<FileId> = database
+            .file_ids_for_query(&terms, SubtagRule::Exclude, DeletedRule::Include)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(candidates, BTreeSet::from([live, dead]));
+
+        // Joining under `Include` returns both, tagged with `deleted`.
+        let live_info = database
+            .file_info_from_id(live, DeletedRule::Include)
+            .unwrap();
+        let dead_info = database
+            .file_info_from_id(dead, DeletedRule::Include)
+            .unwrap();
+        assert!(!live_info.deleted);
+        assert!(dead_info.deleted);
+    }
+
+    #[test]
+    fn tag_ids_matching_token_include_covers_tombstoned_tags() {
+        // A search that wants to see deleted tags must still be able to
+        // resolve a name-substring token to a tombstoned tag; otherwise
+        // `run_query` with `DeletedRule::Include` would have no way to walk
+        // back to a deleted tag by name.
+        let database = memory_db();
+        let dead = TagId::new();
+        database.add_tag(dead, "receipts", "red", 10).unwrap();
+        assert!(database.remove_tag(dead, 20).unwrap());
+
+        // Exclude hides the tombstoned tag.
+        assert!(
+            database
+                .tag_ids_matching_token("receipt", DeletedRule::Exclude)
+                .unwrap()
+                .is_empty()
+        );
+        // Include finds it.
+        let matched = database
+            .tag_ids_matching_token("receipt", DeletedRule::Include)
+            .unwrap();
+        assert_eq!(matched, vec![dead]);
     }
 }

@@ -56,6 +56,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
   String? _error;
   bool _deleted = false;
   bool _watching = false;
+  bool _restoring = false;
 
   onisync.OniSyncApp get _app => widget.session.app;
 
@@ -92,7 +93,15 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     try {
       // Fetch the file itself, its applied tag ids, and each applied tag's row.
       // All three stay bounded by "this file"; nothing scans the whole store.
-      final file = await _app.getFileEntry(fileId: widget.fileId);
+      //
+      // For the file itself we pass `Include` so a tombstoned file opened from
+      // the home screen's "show deleted" toggle still loads (with its
+      // `deleted` flag set). Applied tags are always live-only — a
+      // tombstoned tag can't be applied to anything.
+      final file = await _app.getFileEntry(
+        fileId: widget.fileId,
+        deletedRule: onisync.DeletedRule.include,
+      );
       // Direct tags only (Exclude = no subtag recursion) — these are the ones
       // the user can meaningfully add/remove on this file.
       final applied = await _app.tagIdsForFileString(
@@ -100,7 +109,10 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
         subtagRule: onisync.SubtagRule.exclude,
       );
       final entries = await Future.wait(
-        applied.map((id) => _app.getTagEntry(tagId: id)),
+        applied.map((id) => _app.getTagEntry(
+              tagId: id,
+              deletedRule: onisync.DeletedRule.exclude,
+            )),
       );
       // Best-effort: absence (not-synced-here) is expected, not an error. Any
       // hard failure surfaces below as `_error` via the outer catch.
@@ -177,9 +189,12 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     // screen's model. Same TODO applies to TagDetailScreen._pickTag.
     final onisync.QueryEntries all;
     try {
+      // Tag-picker sheets only surface live tags — you can't apply a
+      // tombstoned tag to a file.
       all = await _app.runQuery(
         query: '',
         subtagRule: onisync.SubtagRule.include,
+        deletedRule: onisync.DeletedRule.exclude,
       );
     } catch (error) {
       _snack('Failed to load tags: $error');
@@ -250,6 +265,34 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     }
   }
 
+  /// Restore a soft-deleted file. Best-effort: the daemon only succeeds if the
+  /// bytes are still recoverable (a local `keep_deleted_files` vault or a
+  /// connected peer that still holds them); otherwise it fails and the file
+  /// stays deleted. On success we reload so the view re-renders as live.
+  Future<void> _restoreFile() async {
+    final file = _file;
+    if (file == null) return;
+    setState(() => _restoring = true);
+    try {
+      await _app.restoreFileByString(widget.fileId);
+      if (!mounted) return;
+      _deleted = false;
+      _snack('Restored "${file.path}".');
+      await _load();
+    } catch (error) {
+      if (!mounted) return;
+      // NotFound means no source still holds the bytes — the best-effort
+      // restore failed and the file remains deleted.
+      final message = '$error'.contains('NotFound')
+          ? 'Cannot restore: the file\'s contents are no longer available on '
+              'any device.'
+          : 'Failed to restore file: $error';
+      _snack(message);
+    } finally {
+      if (mounted) setState(() => _restoring = false);
+    }
+  }
+
   void _snack(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
@@ -258,16 +301,40 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
   @override
   Widget build(BuildContext context) {
     final file = _file;
+    // Strike the title through for a tombstoned file, matching the home
+    // screen's list-row treatment so the state stays consistent as the user
+    // navigates.
+    final titleStyle = file?.deleted == true
+        ? const TextStyle(decoration: TextDecoration.lineThrough)
+        : null;
     return Scaffold(
       appBar: AppBar(
-        title: Text(file?.path ?? 'File', overflow: TextOverflow.ellipsis),
+        title: Text(
+          file?.path ?? 'File',
+          overflow: TextOverflow.ellipsis,
+          style: titleStyle,
+        ),
         actions: [
           if (file != null)
-            IconButton(
-              icon: const Icon(Icons.delete_outline),
-              tooltip: 'Delete file',
-              onPressed: _deleteFile,
-            ),
+            // Delete for live files; Restore for tombstoned ones. Restore is
+            // best-effort and disabled while a restore is in flight.
+            (file.deleted
+                ? IconButton(
+                    icon: _restoring
+                        ? const SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.restore_from_trash),
+                    tooltip: 'Restore file',
+                    onPressed: _restoring ? null : _restoreFile,
+                  )
+                : IconButton(
+                    icon: const Icon(Icons.delete_outline),
+                    tooltip: 'Delete file',
+                    onPressed: _deleteFile,
+                  )),
         ],
       ),
       body: _buildBody(context),

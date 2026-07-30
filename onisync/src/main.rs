@@ -9,7 +9,7 @@ use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, ContentArrangement, Table};
 use onisync_core::{FileId, FileInfo, TagId};
 use onisyncd::control::IpcClientBackend;
-use onisyncd::database::{SubtagRule, Tag};
+use onisyncd::database::{DeletedRule, SubtagRule, Tag};
 use onisyncd::operations::{Operation, OperationKind, OperationStatus};
 use onisyncd::transport::TransportBackend;
 use owo_colors::OwoColorize;
@@ -28,16 +28,23 @@ enum OutputMode {
 /// A serializable tag row, shared by every command that prints tags. Mirrors
 /// the human [`tag_table`] columns: the tag's id, name, colour, and the names
 /// of the tags applied to it.
+///
+/// `deleted` mirrors the daemon's tombstone flag and is always `false` for
+/// commands that only surface live rows; commands that can surface deleted
+/// rows (currently `search --deleted`) set it accordingly so scripts can
+/// distinguish tombstones from live tags without a second lookup.
 #[derive(Debug, Serialize)]
 struct TagRow {
     id: TagId,
     name: String,
     color: String,
     tags: Vec<String>,
+    deleted: bool,
 }
 
 /// A serializable file row, shared by every command that prints files. Mirrors
-/// the human [`file_table`] columns plus the raw fields useful to scripts.
+/// the human [`file_table`] columns plus the raw fields useful to scripts. See
+/// [`TagRow`] for the `deleted` field's semantics.
 #[derive(Debug, Serialize)]
 struct FileRow {
     id: FileId,
@@ -46,6 +53,7 @@ struct FileRow {
     content_hash: String,
     size: u64,
     tags: Vec<String>,
+    deleted: bool,
 }
 
 impl TagRow {
@@ -56,6 +64,7 @@ impl TagRow {
             name: tag.name.clone(),
             color: tag.color.clone(),
             tags,
+            deleted: tag.deleted,
         }
     }
 }
@@ -70,6 +79,7 @@ impl FileRow {
             content_hash: file.content_hash.clone(),
             size: file.size,
             tags,
+            deleted: file.deleted,
         }
     }
 }
@@ -114,6 +124,18 @@ fn subtag_rule(include: bool) -> SubtagRule {
         SubtagRule::Include
     } else {
         SubtagRule::Exclude
+    }
+}
+
+/// Translate the `--deleted` flag into a [`DeletedRule`]. `true` means
+/// search-over-tombstones (`Include`, which returns *only* tombstoned rows
+/// per `Api::run_query`'s semantics); `false` is the standard live-only
+/// search.
+fn deleted_rule(deleted: bool) -> DeletedRule {
+    if deleted {
+        DeletedRule::Include
+    } else {
+        DeletedRule::Exclude
     }
 }
 
@@ -369,7 +391,7 @@ async fn resolve_tag_names(
             names.push(name.clone());
             continue;
         }
-        let name = match backend.get_tag(*tag_id).await {
+        let name = match backend.get_tag(*tag_id, DeletedRule::Exclude).await {
             Ok(tag) => tag.name,
             // A referenced tag that no longer resolves: show its id rather than
             // failing the whole listing.
@@ -390,7 +412,7 @@ async fn tags_from_ids(
 ) -> Result<Vec<Tag>, String> {
     let mut tags = Vec::new();
     for tag_id in tag_ids {
-        match backend.get_tag(tag_id).await {
+        match backend.get_tag(tag_id, DeletedRule::Exclude).await {
             Ok(tag) => tags.push(tag),
             Err(onisyncd::api::ApiError::NotFound) => {}
             Err(error) => return Err(error.to_string()),
@@ -542,6 +564,14 @@ enum Commands {
         /// walking the hierarchy transitively.
         #[arg(long)]
         include_subtags: bool,
+        /// Search soft-deleted (tombstoned) files and tags instead of live
+        /// ones. Results contain *only* rows whose own tombstone is set;
+        /// relationships (which tags a deleted file used to carry, etc.) are
+        /// still walked live-only. The daemon's `Api::run_query` under
+        /// `DeletedRule::Include` semantics — same behavior the app's "show
+        /// deleted" toggle exposes.
+        #[arg(long)]
+        deleted: bool,
     },
     /// Edit a file in `$EDITOR`, fetching it from a peer first if it is not
     /// present locally, and writing back any changes.
@@ -565,10 +595,23 @@ enum Commands {
         /// prefix of it (as shown by `list-files`).
         id: String,
     },
+    /// Restore a soft-deleted file (best-effort; fails if no source still holds
+    /// its bytes).
+    RestoreFile {
+        /// The deleted file to restore, given as a full id or any unambiguous
+        /// short-id prefix of it (as shown by `list-files --deleted`).
+        id: String,
+    },
     /// Delete a tag.
     DeleteTag {
         /// The tag to delete (a full id or any unambiguous short-id prefix of
         /// it, as shown by `list-tags`).
+        tag_id: String,
+    },
+    /// Restore a soft-deleted tag.
+    RestoreTag {
+        /// The deleted tag to restore (a full id or any unambiguous short-id
+        /// prefix of it, as shown by `list-tags --deleted`).
         tag_id: String,
     },
     /// Apply one or more tags to an existing file.
@@ -762,6 +805,8 @@ async fn run(
                 size: 0,
                 // Only one id is known locally; highlight the whole id.
                 short_id_length: file_id.to_string().len(),
+                // A freshly-added file is live by construction.
+                deleted: false,
             };
             let mut name_cache = HashMap::new();
             let tag_names = resolve_tag_names(backend, &resolved_tags, &mut name_cache).await?;
@@ -786,18 +831,21 @@ async fn run(
                 name,
                 color,
                 metadata: None,
+                // A freshly-created tag is live by construction.
+                deleted: false,
             };
             emit_tags(output_mode, std::slice::from_ref(&tag), &HashMap::new());
         }
         Commands::Search {
             query,
             include_subtags,
+            deleted,
         } => {
             let query = query.join(" ");
             // The query returns full rows for exactly the matched set (files and
             // tags), so no whole-store listing is needed to render them.
             let result = backend
-                .run_query(query, subtag_rule(include_subtags))
+                .run_query(query, subtag_rule(include_subtags), deleted_rule(deleted))
                 .await
                 .map_err(|error| error.to_string())?;
             let files = result.files;
@@ -857,6 +905,19 @@ async fn run(
                 OutputMode::Json => print_json(&json!({ "deleted": file_id })),
             }
         }
+        Commands::RestoreFile { id } => {
+            let file_id = resolve_file_id(backend, &id).await?;
+
+            backend
+                .restore_file(file_id)
+                .await
+                .map_err(|error| error.to_string())?;
+
+            match output_mode {
+                OutputMode::Human => println!("Restored file {}", file_id.to_string()),
+                OutputMode::Json => print_json(&json!({ "restored": file_id })),
+            }
+        }
         Commands::DeleteTag { tag_id } => {
             let tag_id = resolve_tag_id(backend, &tag_id).await?;
 
@@ -868,6 +929,19 @@ async fn run(
             match output_mode {
                 OutputMode::Human => println!("Deleted tag {}", tag_id.to_string()),
                 OutputMode::Json => print_json(&json!({ "deleted": tag_id })),
+            }
+        }
+        Commands::RestoreTag { tag_id } => {
+            let tag_id = resolve_tag_id(backend, &tag_id).await?;
+
+            backend
+                .restore_tag(tag_id)
+                .await
+                .map_err(|error| error.to_string())?;
+
+            match output_mode {
+                OutputMode::Human => println!("Restored tag {}", tag_id.to_string()),
+                OutputMode::Json => print_json(&json!({ "restored": tag_id })),
             }
         }
         Commands::Tag { id, tag_ids } => {
@@ -1096,7 +1170,7 @@ async fn edit_file(
     // Not local: we need the expected content hash to fetch. It comes from the
     // file's known metadata; if the daemon has never heard of this file there is
     // nothing to fetch. A single by-id lookup (not a full listing).
-    let expected_hash = match backend.get_file(file_id).await {
+    let expected_hash = match backend.get_file(file_id, DeletedRule::Exclude).await {
         Ok(file) => file.content_hash,
         Err(onisyncd::api::ApiError::NotFound) => {
             return Err(format!("unknown file id: {}", file_id.to_string()));
@@ -1177,7 +1251,7 @@ async fn download_file(
     // Pull the file's metadata once (a single by-id lookup): we need its content
     // hash to fetch (if it isn't local) and its logical path to pick a sensible
     // output filename.
-    let file = match backend.get_file(file_id).await {
+    let file = match backend.get_file(file_id, DeletedRule::Exclude).await {
         Ok(file) => file,
         Err(onisyncd::api::ApiError::NotFound) => {
             return Err(format!("unknown file id: {}", file_id.to_string()));

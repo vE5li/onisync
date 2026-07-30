@@ -30,8 +30,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{broadcast, oneshot};
 
-use crate::bus::{DaemonMessage, FetchError, Ingest};
-use crate::database::{DatabaseError, FileDatabase, QueryTerm, SubtagRule, Tag};
+use crate::bus::{DaemonMessage, FetchError, Ingest, RestoreError};
+use crate::database::{DatabaseError, DeletedRule, FileDatabase, QueryTerm, SubtagRule, Tag};
 use crate::directory_manager::SyncDirectoryCommand;
 use crate::fetch::PendingFetches;
 use crate::transfer::ChunkSource;
@@ -107,6 +107,18 @@ impl From<FetchError> for ApiError {
             FetchError::TimedOut | FetchError::ShuttingDown => {
                 ApiError::Internal(error.to_string())
             }
+        }
+    }
+}
+
+impl From<RestoreError> for ApiError {
+    fn from(error: RestoreError) -> Self {
+        match error {
+            // No source held the bytes, or the file was not deleted: surface as
+            // a plain not-found/invalid so the UI can show a clear failure.
+            RestoreError::NotAvailable => ApiError::NotFound,
+            RestoreError::NotDeleted => ApiError::InvalidArgument(error.to_string()),
+            RestoreError::ShuttingDown => ApiError::Internal(error.to_string()),
         }
     }
 }
@@ -299,9 +311,26 @@ impl Api {
     /// render directly without a second whole-store listing. Backed by
     /// `FileDatabase::file_ids_for_query`/`tag_ids_for_query` plus
     /// `file_info_from_id`/`tag_from_id`.
-    pub fn run_query(&self, query: &str, subtag_rule: SubtagRule) -> Result<QueryResult, ApiError> {
+    ///
+    /// `deleted_rule` toggles between the standard live-only view
+    /// ([`DeletedRule::Exclude`]) and the "search deleted rows"
+    /// view ([`DeletedRule::Include`]). Under `Include`, this method
+    /// widens tag-token resolution *and* the candidate pool to include
+    /// tombstoned rows, then post-filters the joined `FileInfo`/`Tag` results
+    /// to keep only the ones whose `deleted` flag is set — an *only deleted*
+    /// result. This lets the UI expose "show deleted" as a toggle without
+    /// requiring a separate query grammar. Tag-hierarchy walks and the
+    /// file↔tag relationship table stay live-only regardless, since users
+    /// searching for deleted files/tags want files whose row itself was
+    /// tombstoned, not files that were merely untagged.
+    pub fn run_query(
+        &self,
+        query: &str,
+        subtag_rule: SubtagRule,
+        deleted_rule: DeletedRule,
+    ) -> Result<QueryResult, ApiError> {
         let database = self.open_read()?;
-        let terms = Self::parse_query(&database, query)?;
+        let terms = Self::parse_query(&database, query, deleted_rule)?;
 
         // A matched id may not resolve to a full listable row: `file_ids_for_query`
         // draws file ids from the tag `entries` table, which can reference a file
@@ -309,18 +338,30 @@ impl Api {
         // materialized). Such a file is not listable, so skip it rather than
         // failing the whole query with `NotFound`. Same tolerance for tags.
         let mut files = Vec::new();
-        for file_id in database.file_ids_for_query(&terms, subtag_rule)? {
-            match database.file_info_from_id(file_id) {
-                Ok(file) => files.push(file),
+        for file_id in database.file_ids_for_query(&terms, subtag_rule, deleted_rule)? {
+            match database.file_info_from_id(file_id, deleted_rule) {
+                Ok(file) => {
+                    // Under `Include` we want only the tombstoned files; the
+                    // live ones are handled by the standard `Exclude` path.
+                    if deleted_rule == DeletedRule::Include && !file.deleted {
+                        continue;
+                    }
+                    files.push(file);
+                }
                 Err(DatabaseError::MissingFile) => {}
                 Err(other) => return Err(other.into()),
             }
         }
 
         let mut tags = Vec::new();
-        for tag_id in database.tag_ids_for_query(&terms, subtag_rule)? {
-            match database.tag_from_id(tag_id) {
-                Ok(tag) => tags.push(tag),
+        for tag_id in database.tag_ids_for_query(&terms, subtag_rule, deleted_rule)? {
+            match database.tag_from_id(tag_id, deleted_rule) {
+                Ok(tag) => {
+                    if deleted_rule == DeletedRule::Include && !tag.deleted {
+                        continue;
+                    }
+                    tags.push(tag);
+                }
                 Err(DatabaseError::MissingTag) => {}
                 Err(other) => return Err(other.into()),
             }
@@ -333,16 +374,27 @@ impl Api {
     /// such file exists. The by-id read that replaces scanning a full listing
     /// (used by `onisync edit`/`download` to find one file's metadata). Backed
     /// by `FileDatabase::file_info_from_id`.
-    pub fn get_file(&self, file_id: FileId) -> Result<FileInfo, ApiError> {
+    ///
+    /// `deleted_rule` governs tombstone visibility: `Exclude` treats a
+    /// tombstoned file as `NotFound` (the standard behavior for pickers and
+    /// operational lookups); `Include` returns it with `FileInfo::deleted =
+    /// true`, so a detail screen opened from a "search deleted" result can
+    /// still render its metadata.
+    pub fn get_file(
+        &self,
+        file_id: FileId,
+        deleted_rule: DeletedRule,
+    ) -> Result<FileInfo, ApiError> {
         let database = self.open_read()?;
-        Ok(database.file_info_from_id(file_id)?)
+        Ok(database.file_info_from_id(file_id, deleted_rule)?)
     }
 
     /// Get a single tag by id, or [`ApiError::NotFound`] if no such tag exists.
-    /// Backed by `FileDatabase::tag_from_id`.
-    pub fn get_tag(&self, tag_id: TagId) -> Result<Tag, ApiError> {
+    /// Backed by `FileDatabase::tag_from_id`. See [`Self::get_file`] for the
+    /// `deleted_rule` semantics.
+    pub fn get_tag(&self, tag_id: TagId, deleted_rule: DeletedRule) -> Result<Tag, ApiError> {
         let database = self.open_read()?;
-        Ok(database.tag_from_id(tag_id)?)
+        Ok(database.tag_from_id(tag_id, deleted_rule)?)
     }
 
     /// Parse a free-form query string into resolved [`QueryTerm`]s.
@@ -361,17 +413,25 @@ impl Api {
     ///
     /// The only remaining fallible step is `tag_ids_matching_token`, which can
     /// surface a real database error; that is propagated as-is.
-    fn parse_query(database: &FileDatabase, query: &str) -> Result<Vec<QueryTerm>, ApiError> {
+    ///
+    /// `deleted_rule` is forwarded to [`FileDatabase::tag_ids_matching_token`]
+    /// so a search that wants to see deleted rows can still resolve tokens
+    /// that only match tombstoned tags.
+    fn parse_query(
+        database: &FileDatabase,
+        query: &str,
+        deleted_rule: DeletedRule,
+    ) -> Result<Vec<QueryTerm>, ApiError> {
         use chunk::{ChunkKind, lex_query};
 
         let mut terms = Vec::new();
         for chunk in lex_query(query) {
             let term = match (chunk.kind, chunk.negated) {
                 (ChunkKind::Tag, false) => {
-                    QueryTerm::HasTag(database.tag_ids_matching_token(&chunk.text)?)
+                    QueryTerm::HasTag(database.tag_ids_matching_token(&chunk.text, deleted_rule)?)
                 }
                 (ChunkKind::Tag, true) => {
-                    QueryTerm::NotTag(database.tag_ids_matching_token(&chunk.text)?)
+                    QueryTerm::NotTag(database.tag_ids_matching_token(&chunk.text, deleted_rule)?)
                 }
                 (ChunkKind::Name, false) => QueryTerm::NameContains(chunk.text),
                 (ChunkKind::Name, true) => QueryTerm::NotNameContains(chunk.text),
@@ -379,11 +439,11 @@ impl Api {
                 (ChunkKind::Logical, true) => QueryTerm::NotLogicalContains(chunk.text),
                 (ChunkKind::Any, false) => QueryTerm::AnyMatch(
                     chunk.text.clone(),
-                    database.tag_ids_matching_token(&chunk.text)?,
+                    database.tag_ids_matching_token(&chunk.text, deleted_rule)?,
                 ),
                 (ChunkKind::Any, true) => QueryTerm::NotAnyMatch(
                     chunk.text.clone(),
-                    database.tag_ids_matching_token(&chunk.text)?,
+                    database.tag_ids_matching_token(&chunk.text, deleted_rule)?,
                 ),
                 // `/p` is reserved but not yet supported — drop the chunk so
                 // the rest of the query still works, matching the "forgiving
@@ -459,6 +519,33 @@ impl Api {
     pub fn delete_tag(&self, tag_id: TagId) -> Result<(), ApiError> {
         self.enqueue(Change::TagRemoved {
             tag_id,
+            modified_at: crate::database::now_millis(),
+        })
+    }
+
+    /// Restore a soft-deleted tag.
+    ///
+    /// Unlike a file, a tag carries no content and reuses `modified_at` as its
+    /// single last-writer-wins clock, so a restore is simply re-announcing the
+    /// tag's current definition with a fresh timestamp: `add_tag` upserts with
+    /// `deleted = 0` and wins LWW over the (older) delete, both locally and on
+    /// every peer. It therefore reuses the `Change::TagAdded` path rather than
+    /// a bespoke wire variant, and is fire-and-forget (no bytes to recover,
+    /// so it cannot "fail to find a source" the way a file restore can).
+    ///
+    /// Returns [`ApiError::NotFound`] if the tag is unknown. Reading it with
+    /// `Include` means an already-live tag is re-announced harmlessly (the LWW
+    /// guard makes it a no-op if nothing changed).
+    pub fn restore_tag(&self, tag_id: TagId) -> Result<(), ApiError> {
+        let tag = {
+            let database = self.open_read()?;
+            database.tag_from_id(tag_id, DeletedRule::Include)?
+        };
+        self.enqueue(Change::TagAdded {
+            tag_id,
+            tag_name: tag.name,
+            color: tag.color,
+            metadata: None,
             modified_at: crate::database::now_millis(),
         })
     }
@@ -567,6 +654,36 @@ impl Api {
             file_id,
             deleted_at: crate::database::now_millis(),
         })
+    }
+
+    /// Restore a soft-deleted file — best-effort.
+    ///
+    /// Sends a [`DaemonMessage::Restore`] and awaits its outcome. The daemon
+    /// checks whether the file's latest version is still recoverable (its own
+    /// `keep_deleted_files` vault first, then a probe flooded across the peer
+    /// tree). Only if the bytes are available does it clear the tombstone,
+    /// record the restored version, announce a `Change::FileRestored` to peers,
+    /// and pull the bytes into whichever local sync directories want them. If
+    /// nothing holds the bytes the tombstone is left in place and this returns
+    /// [`ApiError::NotFound`].
+    ///
+    /// Request-reply (unlike `delete_file`) because the outcome is only known
+    /// after the async availability probe.
+    pub async fn restore_file(&self, file_id: FileId) -> Result<(), ApiError> {
+        let (respond_to, response) = oneshot::channel();
+        self.change_sender
+            .send(DaemonMessage::Restore {
+                file_id,
+                respond_to,
+            })
+            .map_err(|_| ApiError::Internal("runtime is shutting down".to_owned()))?;
+
+        match tokio::time::timeout(Self::FETCH_TIMEOUT, response).await {
+            Ok(Ok(result)) => result.map_err(ApiError::from),
+            // The responder was dropped without sending — treat as shutdown.
+            Ok(Err(_recv_error)) => Err(ApiError::Internal(RestoreError::ShuttingDown.to_string())),
+            Err(_elapsed) => Err(ApiError::Internal(FetchError::TimedOut.to_string())),
+        }
     }
 
     /// Move (rename) a file to a new logical path. Enqueues
