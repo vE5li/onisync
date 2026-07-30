@@ -439,9 +439,9 @@ pub mod state {
         /// `CHUNK_SIZE`. There is no `request_id`: the tuple `(file_id,
         /// content_hash, offset)` is both the request's identity and the
         /// reply's routing key. A holder answers [`Sync::ChunkData`] if its
-        /// local copy verifies against `content_hash`, else [`Sync::ChunkMiss`];
-        /// a relay forwards it to neighbours and fans the reply back to all
-        /// waiters for the key.
+        /// local copy verifies against `content_hash`, else
+        /// [`Sync::ChunkMiss`]; a relay forwards it to neighbours and
+        /// fans the reply back to all waiters for the key.
         ChunkRequest {
             file_id: FileId,
             content_hash: String,
@@ -451,8 +451,8 @@ pub mod state {
         /// is `min(CHUNK_SIZE, size - offset)`, derivable identically by every
         /// node, so it is not carried on the wire. The receiver terminates when
         /// it has written the version's authoritative size; there is no
-        /// per-chunk EOF flag (a zero-length file is one request at `offset = 0`
-        /// returning empty `bytes`).
+        /// per-chunk EOF flag (a zero-length file is one request at `offset =
+        /// 0` returning empty `bytes`).
         ChunkData {
             file_id: FileId,
             content_hash: String,

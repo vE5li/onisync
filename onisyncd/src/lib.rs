@@ -79,8 +79,8 @@ enum ContentTarget {
 /// `placement`. Carried alongside the receive's outcome so the session's
 /// completion handler can dispatch.
 ///
-/// (On-demand fetches — `onisync edit`, deferred placement — do not go through a
-/// peer session; they drive a receive directly via [`fetch_via_relay`] and
+/// (On-demand fetches — `onisync edit`, deferred placement — do not go through
+/// a peer session; they drive a receive directly via [`fetch_via_relay`] and
 /// return the temp file to their waiter.)
 struct ReceiverPurpose {
     file_id: FileId,
@@ -2114,7 +2114,10 @@ async fn answer_local_chunk(
     // (hashing once, then serving from the cache on subsequent chunks).
     let (respond_to, response) = tokio::sync::oneshot::channel();
     if command_sender
-        .send(SyncDirectoryCommand::LocalPath { file_id, respond_to })
+        .send(SyncDirectoryCommand::LocalPath {
+            file_id,
+            respond_to,
+        })
         .is_ok()
         && let Ok(Some(path)) = response.await
     {

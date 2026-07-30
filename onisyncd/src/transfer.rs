@@ -11,12 +11,12 @@
 //!
 //! This module provides:
 //!
-//! - [`receive`] — the single receiver driver. Given a `(file_id,
-//!   content_hash, expected_size)` and a way to send [`Sync::ChunkRequest`]s and
-//!   await [`ChunkReply`]s, it keeps a window of requests in flight, streams
-//!   replies into a temp file with incremental BLAKE3, and verifies the whole
-//!   file at the end. Where each chunk's *first* request goes is a routing
-//!   policy supplied by the caller, not part of the driver.
+//! - [`receive`] — the single receiver driver. Given a `(file_id, content_hash,
+//!   expected_size)` and a way to send [`Sync::ChunkRequest`]s and await
+//!   [`ChunkReply`]s, it keeps a window of requests in flight, streams replies
+//!   into a temp file with incremental BLAKE3, and verifies the whole file at
+//!   the end. Where each chunk's *first* request goes is a routing policy
+//!   supplied by the caller, not part of the driver.
 //! - [`answer_chunk_request`] — the stateless holder side. It answers a single
 //!   `ChunkRequest` from a [`ChunkSource`] after verifying (via a
 //!   [`VerifiedHashCache`]) that the source's content matches `content_hash`.
@@ -61,10 +61,10 @@ pub const CHUNK_SIZE: usize = 64 * 1024;
 pub const WINDOW: u64 = 8;
 
 /// A reply to one of the receiver's outstanding `ChunkRequest`s, demuxed by the
-/// peer session for a specific in-flight receive. The `file_id` / `content_hash`
-/// are fixed for the whole receive, so only the `offset` (and, for `Data`, the
-/// bytes) are carried here — the reply is matched to a pending request by
-/// `offset`.
+/// peer session for a specific in-flight receive. The `file_id` /
+/// `content_hash` are fixed for the whole receive, so only the `offset` (and,
+/// for `Data`, the bytes) are carried here — the reply is matched to a pending
+/// request by `offset`.
 #[derive(Debug)]
 pub enum ChunkReply {
     /// The canonical bytes at `offset`.
@@ -105,15 +105,20 @@ impl std::fmt::Display for TransferError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TransferError::ChunkUnavailable { offset } => {
-                write!(formatter, "chunk at offset {offset} unavailable from any peer")
+                write!(
+                    formatter,
+                    "chunk at offset {offset} unavailable from any peer"
+                )
             }
             TransferError::LivenessTimeout => {
                 write!(formatter, "transfer stalled (liveness timeout)")
             }
-            TransferError::HashMismatch { expected, actual } => write!(
-                formatter,
-                "content hash mismatch: expected {expected}, got {actual}"
-            ),
+            TransferError::HashMismatch { expected, actual } => {
+                write!(
+                    formatter,
+                    "content hash mismatch: expected {expected}, got {actual}"
+                )
+            }
             TransferError::Io(error) => write!(formatter, "transfer I/O error: {error}"),
             TransferError::ChannelClosed => write!(formatter, "transfer channel closed early"),
         }
@@ -135,8 +140,8 @@ pub enum ReceiveOutcome {
 ///
 /// - Keeps up to [`WINDOW`] `ChunkRequest`s in flight, each emitted on
 ///   `requests` (the peer session routes them toward a holder).
-/// - Streams `ChunkReply::Data` into a temp file at `temp_path` in offset
-///   order (buffering out-of-order replies), hashing incrementally.
+/// - Streams `ChunkReply::Data` into a temp file at `temp_path` in offset order
+///   (buffering out-of-order replies), hashing incrementally.
 /// - Terminates and verifies when `expected_size` bytes have been written; a
 ///   zero-length file is one request at `offset = 0` returning empty bytes.
 /// - A `ChunkReply::Miss` for any offset, a closed reply channel, or the
@@ -568,8 +573,8 @@ pub async fn answer_chunk_request<S: ChunkSource>(
     }
 }
 
-/// Stream-hash a [`ChunkSource`] by reading it in `CHUNK_SIZE` windows until the
-/// end. Returns `None` on a read error.
+/// Stream-hash a [`ChunkSource`] by reading it in `CHUNK_SIZE` windows until
+/// the end. Returns `None` on a read error.
 async fn hash_source<S: ChunkSource>(source: &S) -> Option<String> {
     let mut hasher = blake3::Hasher::new();
     let mut offset = 0u64;
@@ -618,7 +623,10 @@ mod tests {
                 let end = (start + CHUNK_SIZE).min(serve_bytes.len());
                 let chunk = serve_bytes[start..end].to_vec();
                 if reply_tx
-                    .send(ChunkReply::Data { offset, bytes: chunk })
+                    .send(ChunkReply::Data {
+                        offset,
+                        bytes: chunk,
+                    })
                     .is_err()
                 {
                     break;
@@ -678,7 +686,10 @@ mod tests {
                     bytes: chunk.clone(),
                 });
                 if offset == 0 {
-                    let _ = reply_tx.send(ChunkReply::Data { offset, bytes: chunk });
+                    let _ = reply_tx.send(ChunkReply::Data {
+                        offset,
+                        bytes: chunk,
+                    });
                 }
             }
         });
@@ -807,8 +818,8 @@ mod tests {
     /// guard for the CLI-upload bug: re-hashing a `ProviderSource` streams the
     /// whole file and fires its `on_complete` at EOF, which released the file
     /// after the first chunk and made later chunks unavailable. With
-    /// `pre_verified`, `on_complete` never fires from serving, and each chunk is
-    /// served independently.
+    /// `pre_verified`, `on_complete` never fires from serving, and each chunk
+    /// is served independently.
     #[tokio::test]
     async fn provider_pre_verified_serves_all_chunks_without_completing() {
         let bytes: Vec<u8> = (0..(CHUNK_SIZE * 3 + 9)).map(|i| i as u8).collect();
@@ -849,8 +860,14 @@ mod tests {
         // (its provider reply carried `last = true`) — not during any earlier
         // verification. Crucially it did not fire before the last chunk, so no
         // chunk was ever unavailable.
-        assert!(done_rx.try_recv().is_ok(), "expected one on_complete at EOF");
-        assert!(done_rx.try_recv().is_err(), "on_complete must fire only once");
+        assert!(
+            done_rx.try_recv().is_ok(),
+            "expected one on_complete at EOF"
+        );
+        assert!(
+            done_rx.try_recv().is_err(),
+            "on_complete must fire only once"
+        );
     }
 
     /// The verified-hash cache invalidates on mtime/size change: a file edited

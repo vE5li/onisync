@@ -33,14 +33,23 @@ pub struct HandshakeMessage {
 pub enum HandshakeError {
     InvalidPublicKeyEncoding(base64::DecodeError),
     InvalidSignatureEncoding(base64::DecodeError),
-    WrongPublicKeyLength { expected: usize, found: usize },
-    WrongSignatureLength { expected: usize, found: usize },
+    WrongPublicKeyLength {
+        expected: usize,
+        found: usize,
+    },
+    WrongSignatureLength {
+        expected: usize,
+        found: usize,
+    },
     InvalidPublicKey(ed25519_dalek::SignatureError),
     SignatureVerificationFailed,
     /// The peer advertised a wire-protocol version different from ours. Since
     /// all devices are updated together there is no compatibility range; a
     /// mismatch is fail-closed.
-    IncompatibleProtocol { ours: u32, theirs: u32 },
+    IncompatibleProtocol {
+        ours: u32,
+        theirs: u32,
+    },
 }
 
 impl std::fmt::Display for HandshakeError {
@@ -66,10 +75,12 @@ impl std::fmt::Display for HandshakeError {
             HandshakeError::SignatureVerificationFailed => {
                 write!(formatter, "signature verification failed")
             }
-            HandshakeError::IncompatibleProtocol { ours, theirs } => write!(
-                formatter,
-                "incompatible protocol version: ours is {ours}, peer's is {theirs}"
-            ),
+            HandshakeError::IncompatibleProtocol { ours, theirs } => {
+                write!(
+                    formatter,
+                    "incompatible protocol version: ours is {ours}, peer's is {theirs}"
+                )
+            }
         }
     }
 }

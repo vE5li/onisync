@@ -9,9 +9,9 @@
 //!
 //! - On a `ChunkRequest` from a downstream link for a key we do not already
 //!   have an entry for, forward it to every neighbour except the sender and
-//!   record them in `upstream_outstanding`; if an entry already exists, just add
-//!   the link to `downstream` (request coalescing — one upstream fetch fanned to
-//!   all waiters).
+//!   record them in `upstream_outstanding`; if an entry already exists, just
+//!   add the link to `downstream` (request coalescing — one upstream fetch
+//!   fanned to all waiters).
 //! - On `ChunkData` from an upstream, fan it to *every* downstream waiter and
 //!   drop the entry (first-writer-wins; later duplicates find no entry).
 //! - On `ChunkMiss` from an upstream, remove it from `upstream_outstanding`;
@@ -34,11 +34,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::time::Instant;
-
 use onisync_core::FileId;
 use onisync_core::state::{Frame, Sync as SyncMessage};
 use tokio::sync::{Mutex, RwLock};
+use tokio::time::Instant;
 
 use crate::configuration::RuntimeConfiguration;
 use crate::transfer::{ChunkReply, ChunkSource};
@@ -145,8 +144,8 @@ impl PendingFetches {
 
     // ---- Peer plumbing ----------------------------------------------------
 
-    /// Snapshot every connected peer's outbound sender, optionally excluding one
-    /// public key (the peer a request came from — never echo it back).
+    /// Snapshot every connected peer's outbound sender, optionally excluding
+    /// one public key (the peer a request came from — never echo it back).
     async fn connected_peers(&self, exclude: Option<&str>) -> Vec<PeerOutbound> {
         self.runtime_configuration
             .read()
@@ -302,7 +301,9 @@ impl PendingFetches {
             let mut table = self.inner.lock().await;
             match table.get_mut(&key) {
                 Some(entry) => {
-                    entry.downstream.push(Waiter::Peer(from_public_key.to_owned()));
+                    entry
+                        .downstream
+                        .push(Waiter::Peer(from_public_key.to_owned()));
                     log::trace!(
                         "relay[{short}]: request offset={offset} from {from_public_key} coalesced ({} downstream)",
                         entry.downstream.len()
@@ -477,13 +478,7 @@ impl PendingFetches {
     }
 
     /// Deliver `ChunkMiss` to every downstream waiter of a dropped entry.
-    async fn fan_miss(
-        &self,
-        file_id: FileId,
-        content_hash: &str,
-        offset: u64,
-        entry: WaiterEntry,
-    ) {
+    async fn fan_miss(&self, file_id: FileId, content_hash: &str, offset: u64, entry: WaiterEntry) {
         for waiter in entry.downstream {
             match waiter {
                 Waiter::Local(reply) => {
@@ -632,7 +627,10 @@ mod tests {
             upstream_rx.recv().await,
             Some(Frame::Sync(SyncMessage::ChunkRequest { offset: 0, .. }))
         ));
-        assert!(upstream_rx.try_recv().is_err(), "second request not coalesced");
+        assert!(
+            upstream_rx.try_recv().is_err(),
+            "second request not coalesced"
+        );
 
         // The upstream answers once; both downstreams get the bytes.
         engine
@@ -724,9 +722,10 @@ mod tests {
         }
     }
 
-    /// A relay holds no byte buffers: the waiter table only tracks link handles,
-    /// never bytes. (`WaiterEntry` has no byte field — this test documents that
-    /// invariant by asserting a relayed request forwards without buffering.)
+    /// A relay holds no byte buffers: the waiter table only tracks link
+    /// handles, never bytes. (`WaiterEntry` has no byte field — this test
+    /// documents that invariant by asserting a relayed request forwards
+    /// without buffering.)
     #[tokio::test]
     async fn relay_holds_no_bytes() {
         let (engine, mut peers) = engine_with_peers(2).await;

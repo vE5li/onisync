@@ -97,9 +97,9 @@ pub enum OperationKind {
     /// Receiving a file's bytes from a peer. "fetching 123 from peer B".
     ///
     /// Note: there is no sender-side counterpart. In the content-addressed
-    /// chunk model a holder answers each `ChunkRequest` statelessly (no transfer
-    /// session), so there is nothing to anchor a "serving file" operation to —
-    /// serving is invisible to the operations UI by design.
+    /// chunk model a holder answers each `ChunkRequest` statelessly (no
+    /// transfer session), so there is nothing to anchor a "serving file"
+    /// operation to — serving is invisible to the operations UI by design.
     ReceivingFile { file_id: String, peer_name: String },
     /// An on-demand fetch originated locally (flooded to peers via the relay).
     Fetching { file_id: String },

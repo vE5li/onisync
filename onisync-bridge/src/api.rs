@@ -207,9 +207,11 @@ impl From<Operation> for OperationEntry {
 /// Flatten an [`OperationKind`] into `(kind, peer_name, file_id)`.
 fn flatten_kind(kind: &OperationKind) -> (String, Option<String>, Option<String>) {
     match kind {
-        OperationKind::ConnectingToPeer { peer_name, .. } => {
-            ("connecting_to_peer".to_owned(), Some(peer_name.clone()), None)
-        }
+        OperationKind::ConnectingToPeer { peer_name, .. } => (
+            "connecting_to_peer".to_owned(),
+            Some(peer_name.clone()),
+            None,
+        ),
         OperationKind::PeerConnected {
             peer_name,
             direction,
@@ -228,9 +230,7 @@ fn flatten_kind(kind: &OperationKind) -> (String, Option<String>, Option<String>
             Some(peer_name.clone()),
             Some(file_id.clone()),
         ),
-        OperationKind::Fetching { file_id } => {
-            ("fetching".to_owned(), None, Some(file_id.clone()))
-        }
+        OperationKind::Fetching { file_id } => ("fetching".to_owned(), None, Some(file_id.clone())),
         OperationKind::ReconcilingManifest { peer_name } => (
             "reconciling_manifest".to_owned(),
             Some(peer_name.clone()),

@@ -98,11 +98,11 @@ pub enum DaemonMessage {
     /// A mutation to apply. Fire-and-forget: no reply.
     Change(Ingest, ChangeOrigin),
     /// An on-demand request for a file's bytes (used by `onisync edit` when
-    /// the file is not present locally). `handle_changes` resolves the version's
-    /// size from the catalog and drives a content-addressed receive that floods
-    /// `Sync::ChunkRequest`s across the live peer tree (via the content-keyed
-    /// relay), resolving `respond_to` when the bytes arrive (or with an error if
-    /// no reachable holder can serve them).
+    /// the file is not present locally). `handle_changes` resolves the
+    /// version's size from the catalog and drives a content-addressed
+    /// receive that floods `Sync::ChunkRequest`s across the live peer tree
+    /// (via the content-keyed relay), resolving `respond_to` when the bytes
+    /// arrive (or with an error if no reachable holder can serve them).
     Fetch {
         file_id: FileId,
         /// The BLAKE3 hex digest the requester expects; a peer's bytes are only
