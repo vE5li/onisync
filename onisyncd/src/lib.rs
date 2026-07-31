@@ -1170,8 +1170,8 @@ async fn run_peer_session<S>(
                         }
                     }
                     Frame::Sync(SyncMessage::Manifest { entries }) => {
-                        // Confirm the peer is registered (so the pull transfers
-                        // below have a live link to drive) before running the
+                        // Confirm the peer is registered (so the content
+                        // receives below have a live link to drive) before running the
                         // synchronous reconciliation. Doing the DB work outside
                         // of any held `RwLockReadGuard` keeps this future `Send`
                         // (FileDatabase isn't Sync).
@@ -1734,7 +1734,7 @@ pub struct WantedMove {
 ///
 /// Returns each wanted file paired with the peer's latest content hash and a
 /// placement describing how the eventual `Materialize` should route the bytes.
-/// The caller starts a pull transfer per returned entry.
+/// The caller starts a content-addressed receive per returned entry.
 ///
 /// Pure synchronous function: no `.await`, no `RwLock`, no channels/transfers.
 /// Lets callers hold `&FileDatabase` (which is `!Sync`) without making their

@@ -108,7 +108,7 @@ pub enum SyncDirectoryCommand {
     },
     /// Read the bytes for `file_id` from whichever sync directory currently
     /// holds it and respond on `respond_to`. Used by peer connection tasks to
-    /// serve a pull transfer (and to answer on-demand `FetchRequest`s).
+    /// answer inbound `ChunkRequest`s (serving verified content by hash).
     ///
     /// Resolve `file_id` to the **absolute** on-disk path where its bytes
     /// currently live in the first sync directory that holds it, without
