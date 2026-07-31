@@ -56,8 +56,8 @@ async fn main() -> Result<(), std::io::Error> {
             let path = paths.identity_path();
             if path.exists() {
                 panic!(
-                    "An identity key already exists at {}. Refusing to overwrite it; delete it manually if you really want to rotate this \
-                     machine's identity.",
+                    "An identity key already exists at {}. Refusing to overwrite it; delete it \
+                     manually if you really want to rotate this machine's identity.",
                     path.display()
                 );
             }

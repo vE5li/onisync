@@ -921,7 +921,8 @@ async fn run_peer_session<S>(
 
     if let Err(error) = tokio::fs::create_dir_all(&transfer_temp_dir).await {
         log::warn!(
-            "Failed to create transfer temp dir for {peer_name}: {error}; transfers to this peer will fail"
+            "Failed to create transfer temp dir for {peer_name}: {error}; transfers to this peer \
+             will fail"
         );
     }
 
@@ -957,7 +958,8 @@ async fn run_peer_session<S>(
                     true
                 } else {
                     log::debug!(
-                        "Peer {peer_name} already has an outbound sender; inbound-only mode for this connection"
+                        "Peer {peer_name} already has an outbound sender; inbound-only mode for \
+                         this connection"
                     );
                     false
                 }
@@ -1802,7 +1804,8 @@ fn reconcile_peer_manifest(
             let ours_restored_at = ours.map(|state| state.restored_at).unwrap_or(0);
             if entry.deleted_at > ours_observed_at.max(ours_restored_at) {
                 log::debug!(
-                    "Applying peer delete for {} from {peer_name} (deleted_at={} > max(ours_observed_at={ours_observed_at}, \
+                    "Applying peer delete for {} from {peer_name} (deleted_at={} > \
+                     max(ours_observed_at={ours_observed_at}, \
                      ours_restored_at={ours_restored_at}))",
                     entry.file_id.to_string(),
                     entry.deleted_at,
@@ -1830,7 +1833,8 @@ fn reconcile_peer_manifest(
             && let Some((hash, size)) = entry.history.last().map(|(_, h, s)| (h.clone(), *s))
         {
             log::debug!(
-                "Applying peer restore for {} from {peer_name} (restored_at={} > ours_deleted_at={})",
+                "Applying peer restore for {} from {peer_name} (restored_at={} > \
+                 ours_deleted_at={})",
                 entry.file_id.to_string(),
                 entry.restored_at,
                 state.deleted_at,
@@ -1879,7 +1883,8 @@ fn reconcile_peer_manifest(
             match database.logical_path_modified_at(entry.file_id) {
                 Ok(Some(ours)) if entry.logical_path_modified_at > ours => {
                     log::debug!(
-                        "Peer {peer_name} has a newer path for {} (theirs={} > ours={ours}); adopting",
+                        "Peer {peer_name} has a newer path for {} (theirs={} > ours={ours}); \
+                         adopting",
                         entry.file_id.to_string(),
                         entry.logical_path_modified_at,
                     );
@@ -1940,7 +1945,8 @@ fn reconcile_peer_manifest(
                 // TODO: When a deadletter / conflict store exists, preserve
                 // the losing version there instead of just logging.
                 log::error!(
-                    "Divergent history for {} between us and {peer_name} (our latest observed_at={ours_observed_at}, theirs={}). {}.",
+                    "Divergent history for {} between us and {peer_name} (our latest \
+                     observed_at={ours_observed_at}, theirs={}). {}.",
                     entry.file_id.to_string(),
                     entry.latest_observed_at,
                     if request {
@@ -2264,14 +2270,16 @@ async fn request_pull_from_origin(
                 .is_err()
             {
                 log::warn!(
-                    "Peer {public_key} command channel closed; cannot pull {}; reconciliation will retry on reconnect",
+                    "Peer {public_key} command channel closed; cannot pull {}; reconciliation \
+                     will retry on reconnect",
                     file_id.to_string()
                 );
             }
         }
         None => {
             log::debug!(
-                "Announcing peer {public_key} has no live session; deferring pull of {} to reconciliation",
+                "Announcing peer {public_key} has no live session; deferring pull of {} to \
+                 reconciliation",
                 file_id.to_string()
             );
         }
@@ -2640,7 +2648,8 @@ async fn fetch_and_place_deferred(
         Ok(false) => return,
         Err(_) => {
             log::warn!(
-                "reconcile_tag_placement: manager dropped responder for {}; cannot tell if a fetch is needed",
+                "reconcile_tag_placement: manager dropped responder for {}; cannot tell if a \
+                 fetch is needed",
                 file_id.to_string()
             );
             return;
@@ -2655,7 +2664,8 @@ async fn fetch_and_place_deferred(
         // No version has ever been recorded. Nothing to fetch by; a future
         // announcement / materialize will place it. Soft deferral.
         log::debug!(
-            "reconcile_tag_placement: no recorded version for {}; leaving placement for a future announcement",
+            "reconcile_tag_placement: no recorded version for {}; leaving placement for a future \
+             announcement",
             file_id.to_string()
         );
         return;
@@ -2695,7 +2705,8 @@ async fn fetch_and_place_deferred(
             // No peer had the bytes. Soft deferral: a later reconnect /
             // announcement retries placement.
             log::debug!(
-                "reconcile_tag_placement: fetch of {} failed ({error:?}); placement deferred until a peer can serve it",
+                "reconcile_tag_placement: fetch of {} failed ({error:?}); placement deferred \
+                 until a peer can serve it",
                 file_id.to_string()
             );
             placing.fail(format!("{error:?}"));
@@ -2723,7 +2734,8 @@ async fn fetch_and_place_deferred(
         },
     }) {
         log::error!(
-            "reconcile_tag_placement: change channel closed; cannot materialize fetched bytes for {}: {error}",
+            "reconcile_tag_placement: change channel closed; cannot materialize fetched bytes for \
+             {}: {error}",
             file_id.to_string()
         );
     }
@@ -3445,16 +3457,18 @@ async fn handle_changes(
                 // version history is retained on soft delete). The catalog is
                 // not mutated here — only once the bytes are confirmed
                 // recoverable (see `ApplyRestore`).
-                let deletion_state = database.file_deletion_state(file_id).unwrap_or_else(
-                    |error| {
-                        log::error!(
-                            "Restore: file_deletion_state failed for {}: {:?}; treating as unknown",
-                            file_id.to_string(),
-                            error
-                        );
-                        None
-                    },
-                );
+                let deletion_state =
+                    database
+                        .file_deletion_state(file_id)
+                        .unwrap_or_else(|error| {
+                            log::error!(
+                                "Restore: file_deletion_state failed for {}: {:?}; treating as \
+                                 unknown",
+                                file_id.to_string(),
+                                error
+                            );
+                            None
+                        });
 
                 let is_deleted = matches!(deletion_state, Some(state) if state.deleted);
                 if !is_deleted {
@@ -3565,7 +3579,8 @@ async fn handle_changes(
                         // should not happen for a user-initiated restore stamped
                         // "now", but stay defensive rather than lie about success.
                         log::warn!(
-                            "ApplyRestore: {} still tombstoned after restore (a newer delete wins); failing",
+                            "ApplyRestore: {} still tombstoned after restore (a newer delete \
+                             wins); failing",
                             file_id.to_string()
                         );
                         let _ = respond_to.send(Err(bus::RestoreError::NotAvailable));
@@ -3754,7 +3769,8 @@ async fn handle_changes(
                             .map(|iter| iter.into_iter().collect::<Vec<TagId>>())
                             .unwrap_or_else(|error| {
                                 log::error!(
-                                    "Materialize: failed to read tags for {}: {:?}; using carried tags only",
+                                    "Materialize: failed to read tags for {}: {:?}; using carried \
+                                     tags only",
                                     file_id.to_string(),
                                     error
                                 );
@@ -5033,7 +5049,8 @@ mod reconcile_tests {
             assert!(wanted.is_empty(), "no bytes to pull for a tombstoned file");
             assert!(
                 deletions.is_empty(),
-                "already-tombstoned file must not schedule another delete (peer_deleted_at={peer_deleted_at})"
+                "already-tombstoned file must not schedule another delete \
+                 (peer_deleted_at={peer_deleted_at})"
             );
             assert!(moves.is_empty());
             assert!(restores.is_empty());

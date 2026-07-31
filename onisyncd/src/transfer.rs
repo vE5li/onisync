@@ -198,7 +198,8 @@ async fn receive_inner(
     let total_chunks = expected_size.max(1).div_ceil(CHUNK_SIZE as u64);
 
     log::debug!(
-        "receive[{short}]: start; expected_size={expected_size} ({total_chunks} chunk(s)), window={WINDOW}"
+        "receive[{short}]: start; expected_size={expected_size} ({total_chunks} chunk(s)), \
+         window={WINDOW}"
     );
 
     let mut next_request_offset: u64 = 0;
@@ -209,7 +210,8 @@ async fn receive_inner(
     // Prime the window, capped so we never request past EOF.
     while in_flight < WINDOW && may_request(next_request_offset) {
         log::trace!(
-            "receive[{short}]: request offset={next_request_offset} (priming, in_flight will be {})",
+            "receive[{short}]: request offset={next_request_offset} (priming, in_flight will be \
+             {})",
             in_flight + 1
         );
         requests
@@ -229,13 +231,15 @@ async fn receive_inner(
             Ok(Some(message)) => message,
             Ok(None) => {
                 log::warn!(
-                    "receive[{short}]: reply channel closed at write_offset={write_offset}/{expected_size}"
+                    "receive[{short}]: reply channel closed at \
+                     write_offset={write_offset}/{expected_size}"
                 );
                 return Err(TransferError::ChannelClosed);
             }
             Err(_) => {
                 log::warn!(
-                    "receive[{short}]: liveness timeout ({:?}) at write_offset={write_offset}/{expected_size}, in_flight={in_flight}",
+                    "receive[{short}]: liveness timeout ({:?}) at \
+                     write_offset={write_offset}/{expected_size}, in_flight={in_flight}",
                     crate::fetch::HOP_TIMEOUT
                 );
                 return Err(TransferError::LivenessTimeout);
@@ -250,12 +254,14 @@ async fn receive_inner(
                 // free — bytes for a key are bit-identical).
                 if offset < write_offset {
                     log::trace!(
-                        "receive[{short}]: duplicate data offset={offset} ({len} bytes) already written; dropping"
+                        "receive[{short}]: duplicate data offset={offset} ({len} bytes) already \
+                         written; dropping"
                     );
                     continue;
                 }
                 log::trace!(
-                    "receive[{short}]: got data offset={offset} ({len} bytes), in_flight now {in_flight}"
+                    "receive[{short}]: got data offset={offset} ({len} bytes), in_flight now \
+                     {in_flight}"
                 );
                 pending.entry(offset).or_insert(bytes);
 
@@ -292,7 +298,8 @@ async fn receive_inner(
                 // Refill the window, capped so we never request past EOF.
                 while in_flight < WINDOW && may_request(next_request_offset) {
                     log::trace!(
-                        "receive[{short}]: request offset={next_request_offset} (refill, in_flight will be {})",
+                        "receive[{short}]: request offset={next_request_offset} (refill, \
+                         in_flight will be {})",
                         in_flight + 1
                     );
                     requests
@@ -315,7 +322,8 @@ async fn receive_inner(
                     continue;
                 }
                 log::warn!(
-                    "receive[{short}]: chunk offset={offset} unavailable from any peer at write_offset={write_offset}/{expected_size}"
+                    "receive[{short}]: chunk offset={offset} unavailable from any peer at \
+                     write_offset={write_offset}/{expected_size}"
                 );
                 return Err(TransferError::ChunkUnavailable { offset });
             }
@@ -523,7 +531,8 @@ pub async fn answer_chunk_request<S: ChunkSource>(
                     }
                     None => {
                         log::debug!(
-                            "answer[{short}]: offset={offset} cache miss; hashing {} ({size} bytes)",
+                            "answer[{short}]: offset={offset} cache miss; hashing {} ({size} \
+                             bytes)",
                             path.display()
                         );
                         let started = std::time::Instant::now();

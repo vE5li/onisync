@@ -323,17 +323,14 @@ impl SyncDirectoryManager {
 
         // TagBased ingestion leaves the file in place: the content is a copy of
         // the on-disk source (`get_file_content` returns `FileToCopy`).
-        self.send_content_change(
-            sync_directory,
-            ContentChange::FileAdded {
-                file_id,
-                logical_path,
-                content,
-                content_hash,
-                size,
-                tags,
-            },
-        )
+        self.send_content_change(sync_directory, ContentChange::FileAdded {
+            file_id,
+            logical_path,
+            content,
+            content_hash,
+            size,
+            tags,
+        })
     }
 
     fn upload_file(
@@ -371,17 +368,14 @@ impl SyncDirectoryManager {
             full_path.to_string_lossy()
         );
 
-        if let Err(error) = self.send_content_change(
-            sync_directory,
-            ContentChange::FileAdded {
-                file_id,
-                logical_path,
-                content: content.into_move(),
-                content_hash,
-                size,
-                tags,
-            },
-        ) {
+        if let Err(error) = self.send_content_change(sync_directory, ContentChange::FileAdded {
+            file_id,
+            logical_path,
+            content: content.into_move(),
+            content_hash,
+            size,
+            tags,
+        }) {
             log::error!(
                 "Failed to add file {}: {:?}",
                 path.as_ref().to_string_lossy(),
@@ -401,15 +395,12 @@ impl SyncDirectoryManager {
         content_hash: String,
         size: u64,
     ) -> Result<(), SyncDirectoryError> {
-        self.send_content_change(
-            sync_directory,
-            ContentChange::FileChanged {
-                file_id,
-                content,
-                content_hash,
-                size,
-            },
-        )
+        self.send_content_change(sync_directory, ContentChange::FileChanged {
+            file_id,
+            content,
+            content_hash,
+            size,
+        })
     }
 
     /// Handle a file being moved/renamed *within* a sync directory on this
@@ -436,17 +427,14 @@ impl SyncDirectoryManager {
             .update_file_physical_path(file_id, &physical_path)
             .map_err(|_| SyncDirectoryError::FailedChangingFile)?;
 
-        self.send_change(
-            sync_directory,
-            Change::FileMoved {
-                file_id,
-                logical_path,
-                // Stamp the move with our wall clock now: this is the path's
-                // last-writer-wins clock, preserved verbatim as the change
-                // propagates so an offline move reconciles on reconnect.
-                modified_at: crate::database::now_millis(),
-            },
-        )
+        self.send_change(sync_directory, Change::FileMoved {
+            file_id,
+            logical_path,
+            // Stamp the move with our wall clock now: this is the path's
+            // last-writer-wins clock, preserved verbatim as the change
+            // propagates so an offline move reconciles on reconnect.
+            modified_at: crate::database::now_millis(),
+        })
     }
 
     fn remove_file_by_id(
@@ -459,13 +447,10 @@ impl SyncDirectoryManager {
             .remove_file_by_id(file_id)
             .map_err(|_| SyncDirectoryError::FailedRemovingFile)?;
 
-        self.send_change(
-            sync_directory,
-            Change::FileDeleted {
-                file_id,
-                deleted_at: crate::database::now_millis(),
-            },
-        )
+        self.send_change(sync_directory, Change::FileDeleted {
+            file_id,
+            deleted_at: crate::database::now_millis(),
+        })
     }
 
     fn get_all_files(
@@ -943,7 +928,8 @@ impl SyncDirectoryManager {
 
                     let Some(source_path) = &source_path else {
                         log::debug!(
-                            "ReconcileTagPlacement: no source copy of {} yet; deferring placement into {} (caller will fetch)",
+                            "ReconcileTagPlacement: no source copy of {} yet; deferring placement \
+                             into {} (caller will fetch)",
                             file_id.to_string(),
                             sync_directory.path.to_string_lossy()
                         );
@@ -1263,8 +1249,8 @@ impl SyncDirectoryManager {
                         std::fs::rename(&old_file_path, &new_file_path)
                             .expect("failed to move file");
 
-                        // If the moved file was in a directory that is now empty, we want to remove the
-                        // directory as well.
+                        // If the moved file was in a directory that is now empty, we want to remove
+                        // the directory as well.
                         if let Some(directory) = PathBuf::from(file.physical_path.as_str()).parent()
                             && !directory.as_os_str().is_empty()
                         {
@@ -1561,7 +1547,8 @@ impl SyncDirectoryManager {
                         // as a delete-here + add-there. For now, ignore rather
                         // than crash.
                         log::warn!(
-                            "Ignoring move of {} out to another location (cross-directory moves not yet handled)",
+                            "Ignoring move of {} out to another location (cross-directory moves \
+                             not yet handled)",
                             from.to_string_lossy()
                         );
                         return Ok(());
@@ -1681,7 +1668,8 @@ impl SyncDirectoryManager {
                         }
                     } else {
                         log::warn!(
-                            "A file that is not a regular file or a directory was detected. This is unsupported at the moment"
+                            "A file that is not a regular file or a directory was detected. This \
+                             is unsupported at the moment"
                         );
                     }
                 } else {

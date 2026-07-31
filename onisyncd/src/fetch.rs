@@ -226,7 +226,8 @@ impl PendingFetches {
                 Some(entry) => {
                     entry.downstream.push(Waiter::Local(reply_tx));
                     log::trace!(
-                        "relay[{short}]: local request offset={offset} coalesced onto existing entry ({} downstream)",
+                        "relay[{short}]: local request offset={offset} coalesced onto existing \
+                         entry ({} downstream)",
                         entry.downstream.len()
                     );
                 }
@@ -234,18 +235,16 @@ impl PendingFetches {
                     let upstream_outstanding: HashSet<String> =
                         targets.iter().map(|peer| peer.public_key.clone()).collect();
                     log::debug!(
-                        "relay[{short}]: local request offset={offset}: new entry, forwarding to {} upstream {:?}",
+                        "relay[{short}]: local request offset={offset}: new entry, forwarding to \
+                         {} upstream {:?}",
                         upstream_outstanding.len(),
                         upstream_outstanding
                     );
-                    table.insert(
-                        key.clone(),
-                        WaiterEntry {
-                            downstream: vec![Waiter::Local(reply_tx)],
-                            upstream_outstanding,
-                            deadline: Instant::now() + HOP_TIMEOUT,
-                        },
-                    );
+                    table.insert(key.clone(), WaiterEntry {
+                        downstream: vec![Waiter::Local(reply_tx)],
+                        upstream_outstanding,
+                        deadline: Instant::now() + HOP_TIMEOUT,
+                    });
                     newly_created = true;
                 }
             }
@@ -284,7 +283,8 @@ impl PendingFetches {
         let peers = self.connected_peers(Some(from_public_key)).await;
         if peers.is_empty() {
             log::debug!(
-                "relay[{short}]: request offset={offset} from {from_public_key}: no other neighbours; miss back"
+                "relay[{short}]: request offset={offset} from {from_public_key}: no other \
+                 neighbours; miss back"
             );
             if let Some(sender) = self.peer_outbound(from_public_key).await {
                 let _ = sender.send(Frame::Sync(SyncMessage::ChunkMiss {
@@ -305,7 +305,8 @@ impl PendingFetches {
                         .downstream
                         .push(Waiter::Peer(from_public_key.to_owned()));
                     log::trace!(
-                        "relay[{short}]: request offset={offset} from {from_public_key} coalesced ({} downstream)",
+                        "relay[{short}]: request offset={offset} from {from_public_key} coalesced \
+                         ({} downstream)",
                         entry.downstream.len()
                     );
                 }
@@ -313,18 +314,16 @@ impl PendingFetches {
                     let upstream_outstanding: HashSet<String> =
                         peers.iter().map(|peer| peer.public_key.clone()).collect();
                     log::debug!(
-                        "relay[{short}]: request offset={offset} from {from_public_key}: forwarding to {} upstream {:?}",
+                        "relay[{short}]: request offset={offset} from {from_public_key}: \
+                         forwarding to {} upstream {:?}",
                         upstream_outstanding.len(),
                         upstream_outstanding
                     );
-                    table.insert(
-                        key.clone(),
-                        WaiterEntry {
-                            downstream: vec![Waiter::Peer(from_public_key.to_owned())],
-                            upstream_outstanding,
-                            deadline: Instant::now() + HOP_TIMEOUT,
-                        },
-                    );
+                    table.insert(key.clone(), WaiterEntry {
+                        downstream: vec![Waiter::Peer(from_public_key.to_owned())],
+                        upstream_outstanding,
+                        deadline: Instant::now() + HOP_TIMEOUT,
+                    });
                     newly_created = true;
                 }
             }
@@ -361,7 +360,8 @@ impl PendingFetches {
         };
         let Some(entry) = entry else {
             log::trace!(
-                "relay[{short}]: data offset={offset} ({} bytes) but no waiter entry (late/duplicate); dropping",
+                "relay[{short}]: data offset={offset} ({} bytes) but no waiter entry \
+                 (late/duplicate); dropping",
                 bytes.len()
             );
             return;
@@ -392,7 +392,8 @@ impl PendingFetches {
             }
         }
         log::debug!(
-            "relay[{short}]: data offset={offset} ({} bytes) fanned to {local} local + {peers} peer waiter(s)",
+            "relay[{short}]: data offset={offset} ({} bytes) fanned to {local} local + {peers} \
+             peer waiter(s)",
             bytes.len()
         );
     }
@@ -416,12 +417,14 @@ impl PendingFetches {
                     entry.upstream_outstanding.remove(from_public_key);
                     if entry.upstream_outstanding.is_empty() {
                         log::debug!(
-                            "relay[{short}]: miss offset={offset} from {from_public_key}: all upstreams exhausted; fanning miss down"
+                            "relay[{short}]: miss offset={offset} from {from_public_key}: all \
+                             upstreams exhausted; fanning miss down"
                         );
                         table.remove(&key)
                     } else {
                         log::trace!(
-                            "relay[{short}]: miss offset={offset} from {from_public_key}: {} upstream(s) still outstanding",
+                            "relay[{short}]: miss offset={offset} from {from_public_key}: {} \
+                             upstream(s) still outstanding",
                             entry.upstream_outstanding.len()
                         );
                         None
@@ -429,7 +432,8 @@ impl PendingFetches {
                 }
                 None => {
                     log::trace!(
-                        "relay[{short}]: miss offset={offset} from {from_public_key} but no waiter entry; ignoring"
+                        "relay[{short}]: miss offset={offset} from {from_public_key} but no \
+                         waiter entry; ignoring"
                     );
                     None
                 }
@@ -518,7 +522,8 @@ impl PendingFetches {
             if let Some(entry) = entry {
                 let (file_id, content_hash, offset) = key;
                 log::debug!(
-                    "relay[{}]: TTL expired for offset={offset}; fanning miss to {} downstream waiter(s)",
+                    "relay[{}]: TTL expired for offset={offset}; fanning miss to {} downstream \
+                     waiter(s)",
                     short_hash(&content_hash),
                     entry.downstream.len()
                 );

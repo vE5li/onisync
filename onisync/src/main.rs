@@ -1291,7 +1291,10 @@ async fn download_file(
             let copied = std::fs::copy(&temp_path, &file_name);
             let _ = std::fs::remove_file(&temp_path);
             copied.map_err(|error| {
-                format!("failed to move downloaded file into {file_name}: {rename_error}; copy fallback also failed: {error}")
+                format!(
+                    "failed to move downloaded file into {file_name}: {rename_error}; copy \
+                     fallback also failed: {error}"
+                )
             })?;
         }
     }

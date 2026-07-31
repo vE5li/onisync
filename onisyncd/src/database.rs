@@ -772,7 +772,10 @@ impl FileDatabase {
         // is acceptable.
         let mut id_statement = self
             .connection
-            .prepare("SELECT id, logical_path, logical_path_modified_at, deleted, deleted_at, restored_at FROM files_v2")
+            .prepare(
+                "SELECT id, logical_path, logical_path_modified_at, deleted, deleted_at, \
+                 restored_at FROM files_v2",
+            )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
         let file_rows: Vec<(FileId, LogicalPath, i64, bool, i64, i64)> = id_statement
             .query_map([], |row| {
@@ -1151,7 +1154,8 @@ impl FileDatabase {
         // `restored_at = 0` (never explicitly restored yet).
         self.connection
             .execute(
-                "INSERT INTO files_v2 (id, logical_path, logical_path_modified_at, deleted, deleted_at, restored_at)
+                "INSERT INTO files_v2 (id, logical_path, logical_path_modified_at, deleted, \
+                 deleted_at, restored_at)
                  VALUES (?1, ?2, ?3, 0, 0, 0)",
                 (file_id, logical_path, logical_path_modified_at),
             )
@@ -3582,10 +3586,10 @@ mod tests {
         database.record_version(file_id, "h2", "local", 20).unwrap();
 
         let history = database.version_history(file_id).unwrap();
-        assert_eq!(
-            history,
-            vec![(1, "h1".to_owned(), 10), (2, "h2".to_owned(), 20),]
-        );
+        assert_eq!(history, vec![
+            (1, "h1".to_owned(), 10),
+            (2, "h2".to_owned(), 20),
+        ]);
     }
 
     #[test]

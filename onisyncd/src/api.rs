@@ -1087,10 +1087,10 @@ pub(crate) mod chunk {
 
         #[test]
         fn quoted_strings_capture_whitespace() {
-            assert_eq!(
-                lex_query(r#""foo bar" baz"#),
-                vec![any("foo bar"), any("baz")],
-            );
+            assert_eq!(lex_query(r#""foo bar" baz"#), vec![
+                any("foo bar"),
+                any("baz")
+            ],);
         }
 
         #[test]
@@ -1150,15 +1150,12 @@ pub(crate) mod chunk {
         fn mixed_query_parses_end_to_end() {
             // A realistic mix: bare word, tag, quoted logical path, negated tag.
             let got = lex_query(r#"foo /t bar /l "my file.txt" ! /t old"#);
-            assert_eq!(
-                got,
-                vec![
-                    any("foo"),
-                    tag("bar"),
-                    logical("my file.txt"),
-                    negate(tag("old")),
-                ],
-            );
+            assert_eq!(got, vec![
+                any("foo"),
+                tag("bar"),
+                logical("my file.txt"),
+                negate(tag("old")),
+            ],);
         }
 
         // The lexer is infallible: it drops the current chunk-in-progress on
@@ -1197,10 +1194,11 @@ pub(crate) mod chunk {
         #[test]
         fn duplicate_negation_drops_that_chunk_only() {
             // `! !` is a duplicate — drop it, keep everything else.
-            assert_eq!(
-                lex_query("first ! ! second third"),
-                vec![any("first"), any("second"), any("third")],
-            );
+            assert_eq!(lex_query("first ! ! second third"), vec![
+                any("first"),
+                any("second"),
+                any("third")
+            ],);
         }
 
         #[test]

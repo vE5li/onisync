@@ -279,7 +279,8 @@ impl FileBytes {
                         // The bytes are safely at `dest`; a leftover source is a
                         // leak, not a correctness problem. Log and continue.
                         log::warn!(
-                            "Cross-device move copied {} -> {} but failed to remove source: {error}",
+                            "Cross-device move copied {} -> {} but failed to remove source: \
+                             {error}",
                             source.display(),
                             dest.display()
                         );

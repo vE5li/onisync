@@ -356,12 +356,9 @@ impl OperationHandle {
     /// Mark the operation failed with a human-readable `reason`.
     pub fn fail(mut self, reason: impl Into<String>) {
         self.finished = true;
-        self.operations.finish(
-            self.id,
-            OperationStatus::Failed {
-                reason: reason.into(),
-            },
-        );
+        self.operations.finish(self.id, OperationStatus::Failed {
+            reason: reason.into(),
+        });
     }
 }
 
@@ -440,10 +437,9 @@ mod tests {
         let snapshot = operations.snapshot();
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].id, handle.id());
-        assert!(matches!(
-            snapshot[0].status,
-            OperationStatus::Active { progress: None }
-        ));
+        assert!(matches!(snapshot[0].status, OperationStatus::Active {
+            progress: None
+        }));
 
         let event = subscriber.try_recv().expect("started event");
         assert!(matches!(event, OperationEvent::Started(_)));
@@ -458,15 +454,12 @@ mod tests {
         handle.progress(50, Some(100));
 
         let snapshot = operations.snapshot();
-        assert_eq!(
-            snapshot[0].status,
-            OperationStatus::Active {
-                progress: Some(Progress {
-                    done: 50,
-                    total: Some(100)
-                })
-            }
-        );
+        assert_eq!(snapshot[0].status, OperationStatus::Active {
+            progress: Some(Progress {
+                done: 50,
+                total: Some(100)
+            })
+        });
         assert!(matches!(
             subscriber.try_recv().expect("update"),
             OperationEvent::Updated(_)

@@ -1,6 +1,6 @@
 [toolchain]
 channel = "nightly-2025-12-01"
-components = [ "rust-src", "rust-analyzer" ]
+components = ["rust-src", "rust-analyzer"]
 targets = [
   "aarch64-linux-android",    # primary
   "armv7-linux-androideabi",  # optional 32-bit
