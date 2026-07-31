@@ -239,8 +239,8 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (_) => AlertDialog(
-        title: const Text('Delete file?'),
-        content: Text('Delete "${file.path}"? This cannot be undone.'),
+        title: const Text('Confirmation'),
+        content: Text('Delete "${file.path}"?'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),

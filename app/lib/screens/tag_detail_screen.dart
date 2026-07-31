@@ -324,8 +324,8 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (_) => AlertDialog(
-        title: const Text('Delete tag?'),
-        content: Text('Delete "${tag.name}"? This cannot be undone.'),
+        title: const Text('Confirmation'),
+        content: Text('Delete "${tag.name}"?'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
