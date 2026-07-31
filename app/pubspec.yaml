@@ -68,6 +68,28 @@ dev_dependencies:
   build_runner: ^2.4.13
   freezed: ^2.5.7
 
+  # Generates launcher icons for each platform from a single source PNG.
+  # Run with `dart run flutter_launcher_icons` (or `flutter pub run
+  # flutter_launcher_icons`) after changing `assets/icon.png`. Config lives
+  # in the `flutter_launcher_icons:` section below.
+  flutter_launcher_icons: ^0.14.4
+
+flutter_launcher_icons:
+  image_path: "assets/icon.png"
+
+  android: true
+  min_sdk_android: 21
+  # Adaptive icon (Android 8+). The launcher masks the foreground into a
+  # circle/squircle/etc., so keep the logo inside the inner ~66% of the
+  # canvas. Using the same 1024x1024 as the foreground for now; swap in a
+  # padded version if the logo gets clipped.
+  adaptive_icon_background: "#FFFFFF"
+  adaptive_icon_foreground: "assets/icon.png"
+
+  linux:
+    generate: true
+    image_path: "assets/icon.png"
+
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
 

@@ -222,7 +222,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final publicKey = widget.session?.publicKey;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('onisync'),
+        title: const Text('OniSync'),
         actions: [
           _OperationsButton(session: widget.session),
           if (publicKey != null) _CopyPublicKeyButton(publicKey: publicKey),

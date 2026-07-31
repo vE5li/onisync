@@ -74,7 +74,7 @@ class _OniSyncAppState extends State<OniSyncApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'onisync',
+      title: 'OniSync',
       scaffoldMessengerKey: _messengerKey,
       home: HomeScreen(session: _session),
     );
