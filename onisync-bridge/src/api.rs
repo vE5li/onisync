@@ -524,9 +524,15 @@ impl OniSyncApp {
         Ok(TagEntry::from(backend.get_tag(tag_id, deleted_rule).await?))
     }
 
-    /// Create a tag; returns the freshly-minted id.
-    pub async fn create_tag(&self, name: String, color: String) -> Result<TagId, ApiError> {
-        self.try_backend()?.create_tag(name, color).await
+    /// Create a tag; returns the freshly-minted id as a string.
+    ///
+    /// Returns the id *string* (not the opaque [`TagId`] handle) so the Dart
+    /// UI can round-trip it through the usual `*_string` methods — e.g. resolve
+    /// it back for `upload_file`, or fetch its flattened [`TagEntry`] to render
+    /// a chip. Matches the string-id convention used by the other UI-facing
+    /// methods here (see [`Self::tag_ids_for_file_string`]).
+    pub async fn create_tag(&self, name: String, color: String) -> Result<String, ApiError> {
+        Ok(self.try_backend()?.create_tag(name, color).await?.to_string())
     }
 
     /// Delete a tag.
@@ -559,14 +565,28 @@ impl OniSyncApp {
     /// buffered whole. `path_name` is the file's logical identity; `path`
     /// is where the bytes currently live (e.g. the shared-file path the
     /// platform hands us).
+    ///
+    /// `tags` are the string ids (full-or-short prefixes, as carried by
+    /// `TagEntry.tag_id`) to apply to the new file; they are resolved to
+    /// [`TagId`] handles here. Taking strings — rather than the opaque
+    /// handles — matches the string-id convention of the other UI-facing
+    /// methods and, crucially, lets the Dart caller upload several files in a
+    /// row with the same tags: an opaque [`TagId`] handle is consumed when it
+    /// crosses the bridge, so it cannot be reused across calls, whereas an id
+    /// string can.
     pub async fn upload_file(
         &self,
         path: String,
         path_name: String,
-        tags: Vec<TagId>,
+        tags: Vec<String>,
     ) -> Result<FileId, ApiError> {
-        self.try_backend()?
-            .upload_file(std::path::PathBuf::from(path), path_name, tags)
+        let backend = self.try_backend()?;
+        let mut tag_ids = Vec::with_capacity(tags.len());
+        for tag in tags {
+            tag_ids.push(backend.resolve_tag_id(tag).await?);
+        }
+        backend
+            .upload_file(std::path::PathBuf::from(path), path_name, tag_ids)
             .await
     }
 

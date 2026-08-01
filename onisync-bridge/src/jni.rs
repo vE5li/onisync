@@ -11,9 +11,9 @@
 
 #![cfg(target_os = "android")]
 
-use jni::JNIEnv;
 use jni::objects::{JClass, JString};
 use jni::sys::jstring;
+use jni::{Env, EnvUnowned};
 use onisyncd::paths::Paths;
 
 /// `OniSyncService.nativeStart(dataDir, identityFile, configJson): String?`
@@ -22,38 +22,32 @@ use onisyncd::paths::Paths;
 /// public key, or `null` on failure (the error is logged to logcat).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_example_onisync_1app_OniSyncService_nativeStart<'local>(
-    mut env: JNIEnv<'local>,
+    mut env: EnvUnowned<'local>,
     _class: JClass<'local>,
     data_dir: JString<'local>,
     identity_file: JString<'local>,
     config_json: JString<'local>,
 ) -> jstring {
-    let data_dir = match string_arg(&mut env, &data_dir) {
-        Some(value) => value,
-        None => return std::ptr::null_mut(),
-    };
-    let identity_file = match string_arg(&mut env, &identity_file) {
-        Some(value) => value,
-        None => return std::ptr::null_mut(),
-    };
-    let config_json = match string_arg(&mut env, &config_json) {
-        Some(value) => value,
-        None => return std::ptr::null_mut(),
-    };
+    // In jni 0.22 a native method receives an FFI-safe `EnvUnowned`, which
+    // lacks the full JNI API. Upgrade it to a real `Env` for the duration of
+    // the call via `with_env`; the closure returns a `jni::Result` and the
+    // `LogErrorAndDefault` policy logs any error/panic and returns the
+    // default (a null `jstring`), preserving the previous "null on failure,
+    // logged to logcat" contract.
+    env.with_env(|env| -> jni::errors::Result<jstring> {
+        let data_dir = string_arg(env, &data_dir)?;
+        let identity_file = string_arg(env, &identity_file)?;
+        let config_json = string_arg(env, &config_json)?;
 
-    match crate::service::start(&config_json, Paths::new(data_dir, identity_file)) {
-        Ok(public_key) => match env.new_string(&public_key) {
-            Ok(java_string) => java_string.into_raw(),
+        match crate::service::start(&config_json, Paths::new(data_dir, identity_file)) {
+            Ok(public_key) => Ok(env.new_string(&public_key)?.into_raw()),
             Err(error) => {
-                log::error!("nativeStart: failed to build return string: {error}");
-                std::ptr::null_mut()
+                log::error!("nativeStart: failed to start runtime: {error}");
+                Ok(std::ptr::null_mut())
             }
-        },
-        Err(error) => {
-            log::error!("nativeStart: failed to start runtime: {error}");
-            std::ptr::null_mut()
         }
-    }
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
 /// `OniSyncService.nativeStop()`
@@ -62,19 +56,14 @@ pub extern "system" fn Java_com_example_onisync_1app_OniSyncService_nativeStart<
 /// `onDestroy`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_example_onisync_1app_OniSyncService_nativeStop<'local>(
-    _env: JNIEnv<'local>,
+    _env: EnvUnowned<'local>,
     _class: JClass<'local>,
 ) {
     crate::service::stop();
 }
 
-/// Decode a Java string argument, logging and returning `None` on failure.
-fn string_arg(env: &mut JNIEnv<'_>, value: &JString<'_>) -> Option<String> {
-    match env.get_string(value) {
-        Ok(java_string) => Some(java_string.into()),
-        Err(error) => {
-            log::error!("JNI: failed to decode string argument: {error}");
-            None
-        }
-    }
+/// Decode a Java string argument. The error is propagated to the caller's
+/// error policy (which logs it) rather than handled here.
+fn string_arg(env: &mut Env<'_>, value: &JString<'_>) -> jni::errors::Result<String> {
+    value.try_to_string(env)
 }
