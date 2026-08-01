@@ -24,14 +24,12 @@ flutter_rust_bridge = ["dep:flutter_rust_bridge"]
 generated = ["flutter_rust_bridge"]
 
 [dependencies]
-onisyncd = { path = "../onisyncd" }
+onisyncd = { workspace = true }
 onisync-core = { workspace = true }
-tokio = { version = "1.48", features = ["rt-multi-thread", "sync"] }
-log = "0.4"
+tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+log = { workspace = true }
 
-# Pinned to the exact version of `flutter_rust_bridge_codegen` in the dev shell
-# (flake.nix); the runtime crate and the generator must match.
-flutter_rust_bridge = { version = "=2.12.0", optional = true }
+flutter_rust_bridge = { workspace = true, optional = true }
 
 # Route the core's `log` output to logcat on Android instead of `env_logger`
 # (which targets a shell/stderr that Android does not have). Only compiled for
@@ -40,14 +38,14 @@ flutter_rust_bridge = { version = "=2.12.0", optional = true }
 # `jni` lets the foreground service (Kotlin) start/stop the process-global
 # runtime directly, so sync survives the UI being closed (plan section 8).
 [target.'cfg(target_os = "android")'.dependencies]
-android_logger = "0.15"
-jni = "0.21"
+android_logger = { workspace = true }
+jni = { workspace = true }
 
 # Desktop (non-Android): the app process loads the bridge .so but has no
 # env_logger of its own (unlike the daemon binary), so client-side `log` output
 # from the IPC backend was previously silent. Install env_logger here.
 [target.'cfg(not(target_os = "android"))'.dependencies]
-env_logger = "0.11"
+env_logger = { workspace = true }
 
 [lints.rust]
 # `flutter_rust_bridge`'s `#[frb]` macro emits code gated on `cfg(frb_expand)`,

@@ -4,8 +4,7 @@ use std::path::Path;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand::RngCore;
-use rand::rngs::OsRng;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 /// The handshake each peer sends to prove it controls the private key behind
@@ -100,7 +99,7 @@ impl Identity {
     /// [`save`]: Identity::save
     pub fn generate() -> Self {
         let mut seed = [0u8; 32];
-        OsRng.fill_bytes(&mut seed);
+        rand::rng().fill_bytes(&mut seed);
         Identity {
             signing_key: SigningKey::from_bytes(&seed),
         }
