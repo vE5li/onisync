@@ -55,7 +55,18 @@ class AndroidBootstrap extends OniSyncBootstrap {
       identityFile: identityFile,
     );
 
-    return OniSyncSession(app: app, publicKey: app.publicKey());
+    // The device's public Downloads dir, resolved Kotlin-side via Environment
+    // (same mechanism as the sync dir). Best-effort: a null just hides the
+    // download button.
+    final downloadsDir = await _configChannel.invokeMethod<String>(
+      'getDownloadsDir',
+    );
+
+    return OniSyncSession(
+      app: app,
+      publicKey: app.publicKey(),
+      downloadsDir: downloadsDir,
+    );
   }
 
   /// Wire up the Android share sheet ("Share to onisync"). Two cases:

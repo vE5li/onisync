@@ -62,6 +62,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
   bool _watching = false;
   bool _restoring = false;
   bool _sharing = false;
+  bool _downloading = false;
 
   onisync.OniSyncApp get _app => widget.session.app;
 
@@ -372,6 +373,81 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     }
   }
 
+  /// Copy this file into the device's public Downloads directory (Android only
+  /// — the button is gated on the mobile-only [OniSyncSession.downloadsDir]).
+  ///
+  /// A locally-held copy is copied out (the original stays in its sync
+  /// directory). A file not present locally is fetched to a daemon-owned temp
+  /// file (from a peer if needed) and *moved* into Downloads. The destination
+  /// keeps the file's logical name, de-duplicated (`name (2).ext`) if a file by
+  /// that name already exists in Downloads.
+  Future<void> _downloadFile() async {
+    final file = _file;
+    final downloadsDir = widget.session.downloadsDir;
+    if (file == null || downloadsDir == null) return;
+    setState(() => _downloading = true);
+    String? tempPath;
+    try {
+      final localPath = _localPath;
+      final source = localPath ??
+          (tempPath = await _app.fetchFileByString(
+            fileId: widget.fileId,
+            expectedHash: file.contentHash,
+          ));
+
+      final name = file.path.split('/').last;
+      final dir = Directory(downloadsDir);
+      await dir.create(recursive: true);
+      final dest = _uniqueDestination(downloadsDir, name);
+
+      if (localPath != null) {
+        // Local file: copy out, leaving the synced original in place.
+        await File(source).copy(dest);
+      } else {
+        // Fetched temp file (move semantics): relink into Downloads, falling
+        // back to copy+delete across filesystems.
+        final fetched = File(source);
+        try {
+          await fetched.rename(dest);
+          tempPath = null; // consumed by the move
+        } on FileSystemException {
+          await fetched.copy(dest);
+        }
+      }
+      _snack('Saved "${dest.split('/').last}" to Downloads.');
+    } catch (error) {
+      final message = '$error'.contains('NotFound')
+          ? 'Cannot download: the file\'s contents are not available on any '
+              'device.'
+          : 'Failed to download file: $error';
+      _snack(message);
+    } finally {
+      // Clean up a fetched temp file we didn't move; best-effort.
+      if (tempPath != null) {
+        try {
+          await File(tempPath).delete();
+        } catch (_) {
+          // Nothing to do; it lives in a temp dir.
+        }
+      }
+      if (mounted) setState(() => _downloading = false);
+    }
+  }
+
+  /// Build a destination path in [dir] for [name] that does not collide with an
+  /// existing file, inserting ` (n)` before the extension as needed
+  /// (`report.pdf` -> `report (2).pdf`).
+  static String _uniqueDestination(String dir, String name) {
+    if (!File('$dir/$name').existsSync()) return '$dir/$name';
+    final dot = name.lastIndexOf('.');
+    final stem = dot <= 0 ? name : name.substring(0, dot);
+    final ext = dot <= 0 ? '' : name.substring(dot);
+    for (var n = 2;; n++) {
+      final candidate = '$dir/$stem ($n)$ext';
+      if (!File(candidate).existsSync()) return candidate;
+    }
+  }
+
   void _snack(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
@@ -414,6 +490,24 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
                     tooltip: 'Delete file',
                     onPressed: _deleteFile,
                   )),
+          // Download to the device's public Downloads dir, between delete and
+          // share. Mobile-only (gated on the session's downloads-dir hint,
+          // non-null only on Android) and only for live files. Disabled while a
+          // fetch-then-download is in flight.
+          if (file != null &&
+              !file.deleted &&
+              widget.session.downloadsDir != null)
+            IconButton(
+              icon: _downloading
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.download_outlined),
+              tooltip: 'Download file',
+              onPressed: _downloading ? null : _downloadFile,
+            ),
           // Share to the OS share sheet, to the right of delete/restore.
           // Mobile-only (gated on the session's public-key hint, which is
           // non-null only on Android), and only for live files. Disabled while

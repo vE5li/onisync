@@ -44,6 +44,22 @@ object OniSyncConfig {
     /** Method on [CHANNEL_NAME] that returns a Map of the fields above. */
     const val METHOD_GET_STARTUP_INPUTS = "getStartupInputs"
 
+    /**
+     * Method on [CHANNEL_NAME] returning the device's public Downloads
+     * directory path (a plain String). Resolved via [Environment] exactly like
+     * the sync dir's public Documents path, so the "download" button in the
+     * file detail screen can copy a file somewhere the user can browse to.
+     * Writing here relies on the same "All files access" the app already gates
+     * on before starting the runtime (see MainActivity).
+     */
+    const val METHOD_GET_DOWNLOADS_DIR = "getDownloadsDir"
+
+    /** Resolve the device's public Downloads directory path. */
+    fun downloadsDir(): String =
+        Environment
+            .getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            .absolutePath
+
     /** Path of the bundled config asset inside the APK's `assets/` tree. */
     private const val CONFIG_ASSET = "onisync_config.json"
 

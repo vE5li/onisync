@@ -47,6 +47,9 @@ class MainActivity : FlutterActivity() {
                             )
                         )
                     }
+                    OniSyncConfig.METHOD_GET_DOWNLOADS_DIR -> {
+                        result.success(OniSyncConfig.downloadsDir())
+                    }
                     else -> result.notImplemented()
                 }
             }

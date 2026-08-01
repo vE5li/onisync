@@ -26,7 +26,17 @@ class OniSyncSession {
   /// identity to show (Linux, where the daemon owns the identity).
   final String? publicKey;
 
-  const OniSyncSession({required this.app, this.publicKey});
+  /// Absolute path of the device's public Downloads directory, or `null` when
+  /// the platform has no such concept exposed to the app (Linux/desktop). Used
+  /// by the file detail screen's mobile-only "download" button; its nullness
+  /// doubles as the mobile-only gate, like [publicKey].
+  final String? downloadsDir;
+
+  const OniSyncSession({
+    required this.app,
+    this.publicKey,
+    this.downloadsDir,
+  });
 }
 
 /// Produces a [OniSyncSession] and wires any platform-only side channels.
