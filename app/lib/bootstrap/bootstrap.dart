@@ -44,11 +44,15 @@ abstract class OniSyncBootstrap {
   /// share sheet uploading files. Called once after [connect] succeeds.
   ///
   /// [showMessage] surfaces user feedback (snackbars) from callbacks that fire
-  /// outside a build context. [onChanged] is invoked after any mutation so the
-  /// UI can refresh. The default is a no-op (Linux has nothing to wire).
+  /// outside a build context. [navigate] pushes a route onto the app's
+  /// navigator from those same out-of-context callbacks (the share handler
+  /// uses it to open the share-review screen). [onChanged] is invoked after
+  /// any mutation so the UI can refresh. The default is a no-op (Linux has
+  /// nothing to wire).
   void attachInputs(
     OniSyncSession session, {
     required void Function(String message) showMessage,
+    required void Function(Route<dynamic> route) navigate,
     required VoidCallback onChanged,
   }) {}
 

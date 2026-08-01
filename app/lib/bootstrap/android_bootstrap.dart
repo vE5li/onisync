@@ -9,11 +9,13 @@
 
 import 'dart:async';
 
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 
 import '../rust/frb_generated.dart';
 import '../rust/api.dart' as onisync;
+import '../screens/share_review_screen.dart';
 import 'bootstrap.dart';
 
 /// MethodChannel exposed by [MainActivity] returning the JSON config + paths
@@ -59,55 +61,44 @@ class AndroidBootstrap extends OniSyncBootstrap {
   /// Wire up the Android share sheet ("Share to onisync"). Two cases:
   ///   1. app already running  -> getMediaStream() pushes new shares,
   ///   2. app launched by share -> getInitialMedia() returns the first batch.
-  /// Both funnel into [_uploadSharedFiles].
+  /// Both funnel into [_reviewSharedFiles], which opens the share-review
+  /// screen so the user can tag the file(s) before they are uploaded.
   @override
   void attachInputs(
     OniSyncSession session, {
     required void Function(String message) showMessage,
+    required void Function(Route<dynamic> route) navigate,
     required VoidCallback onChanged,
   }) {
     _shareSub = ReceiveSharingIntent.instance.getMediaStream().listen(
-      (files) => _uploadSharedFiles(session.app, files, showMessage, onChanged),
+      (files) => _reviewSharedFiles(session, files, navigate),
       onError: (Object error) => showMessage('Share error: $error'),
     );
 
     ReceiveSharingIntent.instance.getInitialMedia().then((files) {
       if (files.isEmpty) return;
-      _uploadSharedFiles(session.app, files, showMessage, onChanged);
+      _reviewSharedFiles(session, files, navigate);
       // Tell the plugin we consumed the initial intent so it is not redelivered.
       ReceiveSharingIntent.instance.reset();
     });
   }
 
-  /// Hand each shared file's *path* to the sync engine via
-  /// [onisync.OniSyncApp.uploadFile]. The engine streams the bytes from disk
-  /// (hash then serve-on-demand); they are never buffered whole, matching the
-  /// CLI's upload path.
-  Future<void> _uploadSharedFiles(
-    onisync.OniSyncApp app,
+  /// Open the share-review screen for the shared file(s). Rather than upload
+  /// immediately, the user first attaches tags there; the actual
+  /// [onisync.OniSyncApp.uploadFile] call (which streams the bytes from disk,
+  /// never buffering them whole) happens when they confirm.
+  void _reviewSharedFiles(
+    OniSyncSession session,
     List<SharedMediaFile> files,
-    void Function(String) showMessage,
-    VoidCallback onChanged,
-  ) async {
+    void Function(Route<dynamic> route) navigate,
+  ) {
     if (files.isEmpty) return;
-
-    var uploaded = 0;
-    for (final shared in files) {
-      try {
-        // Derive a display/logical name from the source path. The engine treats
-        // this as the file's logical identity at the ingestion boundary.
-        final name = shared.path.split('/').last;
-        await app.uploadFile(path: shared.path, pathName: name, tags: const []);
-        uploaded++;
-      } catch (error) {
-        showMessage('Failed to upload ${shared.path}: $error');
-      }
-    }
-
-    if (uploaded > 0) {
-      showMessage('Uploaded $uploaded file${uploaded == 1 ? '' : 's'} to onisync');
-      onChanged();
-    }
+    final paths = files.map((f) => f.path).toList();
+    navigate(
+      MaterialPageRoute<void>(
+        builder: (_) => ShareReviewScreen(session: session, paths: paths),
+      ),
+    );
   }
 
   @override

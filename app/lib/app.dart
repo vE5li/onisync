@@ -26,6 +26,11 @@ class OniSyncApp extends StatefulWidget {
 final GlobalKey<ScaffoldMessengerState> _messengerKey =
     GlobalKey<ScaffoldMessengerState>();
 
+// Lets callbacks that fire outside a build context (the Android share-intent
+// handler) push routes onto the app's navigator — e.g. the share-review
+// screen that collects tags before uploading a shared file.
+final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
+
 class _OniSyncAppState extends State<OniSyncApp> {
   OniSyncSession? _session;
 
@@ -48,6 +53,7 @@ class _OniSyncAppState extends State<OniSyncApp> {
       widget.bootstrap.attachInputs(
         session,
         showMessage: _showMessage,
+        navigate: (route) => _navigatorKey.currentState?.push(route),
         onChanged: () {},
       );
     } catch (error) {
@@ -76,6 +82,7 @@ class _OniSyncAppState extends State<OniSyncApp> {
     return MaterialApp(
       title: 'OniSync',
       scaffoldMessengerKey: _messengerKey,
+      navigatorKey: _navigatorKey,
       home: HomeScreen(session: _session),
     );
   }
