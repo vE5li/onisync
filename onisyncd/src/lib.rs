@@ -3856,6 +3856,25 @@ async fn handle_changes(
                             );
                             continue;
                         }
+                        // Persist the upload's tags into the local catalog. The
+                        // outgoing `FileMetadataAdded` carries them to peers, but
+                        // the local DB is only updated here — without this a
+                        // locally-uploaded file would appear untagged on this
+                        // device (its tags only materializing on peers, or on a
+                        // later byte-pull placement). Stamp them with the same
+                        // creation clock as the file so LWW orders consistently.
+                        for tag_id in &tags {
+                            if let Err(error) =
+                                database.tag_file(*tag_id, file_id, logical_path_modified_at)
+                            {
+                                log::error!(
+                                    "AnnounceProvided: failed to tag file {} with {}: {:?}",
+                                    file_id.to_string(),
+                                    tag_id.to_string(),
+                                    error
+                                );
+                            }
+                        }
                         Change::FileMetadataAdded {
                             file_id,
                             logical_path,
@@ -3955,6 +3974,27 @@ async fn handle_changes(
                             error
                         );
                         continue;
+                    }
+                    // Persist the tags carried on the announcement into our
+                    // catalog. Downstream this same list also drives placement
+                    // (`MaterializePlacement::Create`), but placement only
+                    // *filters* sync directories — it never writes the
+                    // relationships. Without this write a peer would know the
+                    // file but show it untagged, since the upload path carries
+                    // tags on the creation change rather than as separate
+                    // `FileTagged` messages. Stamp with the file's creation
+                    // clock so LWW orders identically on every device.
+                    for tag_id in tags {
+                        if let Err(error) =
+                            database.tag_file(*tag_id, *file_id, *logical_path_modified_at)
+                        {
+                            log::error!(
+                                "FileMetadataAdded: failed to tag file {} with {}: {:?}",
+                                file_id.to_string(),
+                                tag_id.to_string(),
+                                error
+                            );
+                        }
                     }
                 } else {
                     // Skip only if this is the version we already hold as latest
