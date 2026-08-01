@@ -50,6 +50,11 @@ dependencies:
   # project builds with Kotlin 2.2.20 (android/settings.gradle.kts). 1.8.1
   # exposes the same Dart API (getMediaStream / getInitialMedia / reset).
   receive_sharing_intent: ">=1.8.1 <1.9.0"
+  # Outgoing share: hands a file to the Android share sheet (the reverse of
+  # receive_sharing_intent). Used by the file detail screen's share button.
+  # On Android it registers its own FileProvider via manifest merger, so no
+  # manual <provider> is needed here.
+  share_plus: ^10.1.4
   flutter_markdown_plus: ^1.0.3
 
 dev_dependencies:

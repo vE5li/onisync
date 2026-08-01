@@ -7,7 +7,11 @@
 // Keyed by [fileId] rather than by a captured [FileEntry] so the display
 // always reflects the current state of the store on rebuild.
 
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 
 import '../bootstrap/bootstrap.dart';
 import '../rust/api.dart' as onisync;
@@ -57,6 +61,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
   bool _deleted = false;
   bool _watching = false;
   bool _restoring = false;
+  bool _sharing = false;
 
   onisync.OniSyncApp get _app => widget.session.app;
 
@@ -293,6 +298,80 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     }
   }
 
+  /// Hand this file to the OS share sheet (Android only — the button is gated
+  /// on the mobile-only session hint). If a local sync directory already holds
+  /// the bytes we share that path directly; otherwise we fetch the content to a
+  /// daemon-owned temp file first (from a peer if needed) and share that.
+  ///
+  /// A locally-held path is shared in place. A fetched temp file is handed to
+  /// us with move semantics: we rename it under a dedicated share dir so its
+  /// filename matches the logical name (see below), then delete that dir after
+  /// the share sheet returns.
+  Future<void> _shareFile() async {
+    final file = _file;
+    if (file == null) return;
+    setState(() => _sharing = true);
+    // A temp directory we fully own for this share, deleted in `finally`. Only
+    // created when we fetch (a local file is shared in place, untouched).
+    Directory? shareDir;
+    // The logical file name — its extension is what receiving apps use to infer
+    // the type, so the shared file on disk MUST carry it (an `XFile.name`
+    // override is not enough: many targets read the path's extension, and the
+    // daemon's fetched temp file is named with an extension-less UUID).
+    final name = file.path.split('/').last;
+    try {
+      var path = _localPath;
+      if (path == null) {
+        // Not present locally: fetch the bytes to a daemon-owned temp file...
+        final fetched = await _app.fetchFileByString(
+          fileId: widget.fileId,
+          expectedHash: file.contentHash,
+        );
+        // ...then move it to `<temp>/onisync_share/<logicalName>` so the shared
+        // file has the correct name + extension. A per-share subdir avoids
+        // collisions when the logical name repeats across shares.
+        final base = await getTemporaryDirectory();
+        shareDir = Directory(
+          '${base.path}/onisync_share/${DateTime.now().microsecondsSinceEpoch}',
+        );
+        await shareDir.create(recursive: true);
+        final named = '${shareDir.path}/$name';
+        final fetchedFile = File(fetched);
+        try {
+          // Cheap path: same filesystem, just relink.
+          await fetchedFile.rename(named);
+        } on FileSystemException {
+          // The daemon's fetch temp dir may be on a different mount than the
+          // app temp dir; rename can't cross filesystems, so copy then delete.
+          await fetchedFile.copy(named);
+          try {
+            await fetchedFile.delete();
+          } catch (_) {
+            // Best-effort; the original still lives in the daemon temp dir.
+          }
+        }
+        path = named;
+      }
+      await Share.shareXFiles([XFile(path, name: name)]);
+    } catch (error) {
+      final message = '$error'.contains('NotFound')
+          ? 'Cannot share: the file\'s contents are not available on any '
+              'device.'
+          : 'Failed to share file: $error';
+      _snack(message);
+    } finally {
+      // Clean up the fetched copy (move semantics); best-effort.
+      if (shareDir != null) {
+        try {
+          await shareDir.delete(recursive: true);
+        } catch (_) {
+          // Nothing to do if cleanup fails; it lives in a temp dir.
+        }
+      }
+      if (mounted) setState(() => _sharing = false);
+    }
+  }
+
   void _snack(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
@@ -335,6 +414,24 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
                     tooltip: 'Delete file',
                     onPressed: _deleteFile,
                   )),
+          // Share to the OS share sheet, to the right of delete/restore.
+          // Mobile-only (gated on the session's public-key hint, which is
+          // non-null only on Android), and only for live files. Disabled while
+          // a fetch-then-share is in flight.
+          if (file != null &&
+              !file.deleted &&
+              widget.session.publicKey != null)
+            IconButton(
+              icon: _sharing
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.share_outlined),
+              tooltip: 'Share file',
+              onPressed: _sharing ? null : _shareFile,
+            ),
         ],
       ),
       body: _buildBody(context),

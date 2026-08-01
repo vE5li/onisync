@@ -511,6 +511,30 @@ impl OniSyncApp {
             .map(|path| path.to_string_lossy().into_owned()))
     }
 
+    /// Fetch `file_id`'s content on demand (from a peer if no local sync
+    /// directory holds it) and return the path to a **daemon-owned temp file**
+    /// holding the bytes.
+    ///
+    /// `expected_hash` gates which content is accepted; the caller passes the
+    /// file's known `FileEntry.content_hash`. The returned path lives under the
+    /// daemon's fetch temp dir and is handed over with **move semantics** — the
+    /// caller must consume it (e.g. hand it to the OS share sheet) and delete it
+    /// afterwards. The UI uses this to share a file that is not present locally;
+    /// for a locally-held file prefer [`Self::local_path_for_file_by_string`].
+    pub async fn fetch_file_by_string(
+        &self,
+        file_id: String,
+        expected_hash: String,
+    ) -> Result<String, ApiError> {
+        let backend = self.try_backend()?;
+        let file_id = backend.resolve_file_id(file_id).await?;
+        Ok(backend
+            .fetch_file(file_id, expected_hash)
+            .await?
+            .to_string_lossy()
+            .into_owned())
+    }
+
     /// Get a single tag's flattened [`TagEntry`] by id string (a full or short
     /// id prefix). Errors `NotFound` if unknown. See
     /// [`Self::get_file_entry`] for the `deleted_rule` semantics.
