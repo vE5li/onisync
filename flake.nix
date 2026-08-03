@@ -212,6 +212,37 @@
           ${buildNativeForAbisBody}
         '';
 
+        # Regenerate the legacy square launcher icons (mipmap-*/ic_launcher.png)
+        # from icon/icon.png. These are the pre-Android-8 raster icons; each
+        # density just needs icon.png downscaled to its px size. The adaptive
+        # icon (mipmap-anydpi-v26 + drawable*/ic_launcher_foreground) is a
+        # separate hand-authored vector glyph and is intentionally NOT touched
+        # here. `magick` is referenced by absolute store path (like git/adb
+        # elsewhere) so it doesn't have to be added to every app's PATH.
+        rebuildAndroidIconsBody = ''
+          src="icon/icon.png"
+          if [ ! -f "$src" ]; then
+            echo "Source icon $src not found." >&2
+            exit 1
+          fi
+          res="app/android/app/src/main/res"
+          # density -> launcher icon edge length in px.
+          declare -A sizes=(
+            [mdpi]=48
+            [hdpi]=72
+            [xhdpi]=96
+            [xxhdpi]=144
+            [xxxhdpi]=192
+          )
+          for density in "''${!sizes[@]}"; do
+            size="''${sizes[$density]}"
+            out="$res/mipmap-$density/ic_launcher.png"
+            echo "Generating $out (''${size}x''${size})"
+            "${pkgs.imagemagick}/bin/magick" "$src" \
+              -resize "''${size}x''${size}" "$out"
+          done
+        '';
+
         # Resolve the target android device AND its ABI. Flutter's `-d` matches a
         # device *id/name*, not a platform, and android device ids are serial
         # numbers (no stable "android" alias), so resolve the first connected
@@ -351,6 +382,10 @@
           # Individual build step, exposed for manual use / overriding ABIs
           # (defaults to arm64-v8a; set ONISYNC_ANDROID_ABIS for a release build).
           build-native-android = buildNativeAndroidBody;
+          # Regenerate the legacy square launcher icons under
+          # app/android/app/src/main/res/mipmap-*/ic_launcher.png from
+          # icon/icon.png. Run after changing the source icon; commit the result.
+          rebuild-android-icons = rebuildAndroidIconsBody;
 
           # Full build-and-run: regenerate bindings, then launch (the native
           # library is built by the CMake hook during `flutter run`). Safe to
