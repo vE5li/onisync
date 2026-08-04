@@ -1669,6 +1669,18 @@ async fn run_peer_session<S>(
                         // (and its use of `can_generate_previews` /
                         // `command_sender`) lives outside this match arm and
                         // compiles away entirely without the feature.
+                        //
+                        // The extension (a type-detection hint) is looked up
+                        // here from the session's DB handle; only meaningful
+                        // when we can generate.
+                        #[cfg(feature = "preview-generation")]
+                        let extension = if can_generate_previews {
+                            preview_extension_for(&database, file_id)
+                        } else {
+                            None
+                        };
+                        #[cfg(not(feature = "preview-generation"))]
+                        let extension: Option<String> = None;
                         let served = try_serve_generated_preview(
                             &our_sender,
                             &command_sender,
@@ -1676,6 +1688,7 @@ async fn run_peer_session<S>(
                             peer_name,
                             file_id,
                             &content_hash,
+                            extension,
                         )
                         .await;
 
@@ -2293,6 +2306,10 @@ async fn resolve_preview(
     file_id: FileId,
     content_hash: &str,
     can_generate: bool,
+    // The file's lowercase extension (from its logical name), a type-detection
+    // hint for local generation. Looked up by the caller (which holds a DB
+    // handle) and unused when we cannot generate locally.
+    extension: Option<String>,
 ) -> Preview {
     let short = content_hash.get(..8).unwrap_or(content_hash);
 
@@ -2317,7 +2334,7 @@ async fn resolve_preview(
         );
 
         if let Some(file_bytes) = local {
-            match generate_preview_from_local(file_id, file_bytes).await {
+            match generate_preview_from_local(file_id, file_bytes, extension.clone()).await {
                 Some(preview) => return preview,
                 // Read failed (row present but bytes gone/racing): fall through
                 // to asking peers rather than failing outright.
@@ -2331,7 +2348,7 @@ async fn resolve_preview(
     // Without the feature, local generation is compiled out, so these are dead;
     // silence the unused warnings.
     #[cfg(not(feature = "preview-generation"))]
-    let _ = (can_generate, command_sender);
+    let _ = (can_generate, command_sender, &extension);
 
     // 2. Not present locally: ask peers. First responder wins; exhaustion or
     // timeout resolves to `None`.
@@ -2363,25 +2380,47 @@ async fn resolve_preview(
 ///
 /// Only compiled with the `preview-generation` feature; all call sites are
 /// guarded by `can_generate`, which is `false` without it.
+/// Look up a file's lowercase extension (no dot, e.g. `"jpg"`) from its logical
+/// name in the main DB, for use as a preview type-detection hint.
+///
+/// Returns `None` if the file is unknown, has no extension, or the DB read
+/// fails — the generator then relies on magic-byte sniffing alone.
 #[cfg(feature = "preview-generation")]
-async fn generate_preview_from_local(file_id: FileId, file_bytes: FileBytes) -> Option<Preview> {
+fn preview_extension_for(database: &FileDatabase, file_id: FileId) -> Option<String> {
+    let logical_path = database.logical_path_for_file_id(file_id).ok()?;
+    std::path::Path::new(logical_path.as_str())
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_lowercase())
+}
+
+#[cfg(feature = "preview-generation")]
+async fn generate_preview_from_local(
+    file_id: FileId,
+    file_bytes: FileBytes,
+    extension: Option<String>,
+) -> Option<Preview> {
     const MAX_PREVIEW_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 
     let read_start = std::time::Instant::now();
     match file_bytes.read_all_bounded(MAX_PREVIEW_SOURCE_BYTES).await {
         Ok((bytes, _complete)) => {
             log::debug!(
-                "generate_preview_from_local: read {} source bytes for {} in {:?}",
+                "generate_preview_from_local: read {} source bytes for {} in {:?} (ext={:?})",
                 bytes.len(),
                 file_id.to_string(),
-                read_start.elapsed()
+                read_start.elapsed(),
+                extension.as_deref()
             );
             // Time the whole blocking hop separately from the read: this
             // includes any wait for a free blocking-pool thread *plus* the
             // decode/resize/encode itself (which `preview::generate` logs
             // internally).
             let blocking_start = std::time::Instant::now();
-            match tokio::task::spawn_blocking(move || crate::preview::generate(&bytes)).await {
+            match tokio::task::spawn_blocking(move || {
+                crate::preview::generate(&bytes, extension.as_deref())
+            })
+            .await
+            {
                 Ok(preview) => {
                     log::debug!(
                         "generate_preview_from_local: spawn_blocking(generate) for {} took {:?}",
@@ -2428,6 +2467,7 @@ async fn try_serve_generated_preview(
     peer_name: &str,
     file_id: FileId,
     content_hash: &str,
+    extension: Option<String>,
 ) -> bool {
     if !can_generate {
         return false;
@@ -2436,7 +2476,7 @@ async fn try_serve_generated_preview(
     else {
         return false;
     };
-    let Some(preview) = generate_preview_from_local(file_id, file_bytes).await else {
+    let Some(preview) = generate_preview_from_local(file_id, file_bytes, extension).await else {
         return false;
     };
     log::debug!(
@@ -2462,6 +2502,7 @@ async fn try_serve_generated_preview(
     _peer_name: &str,
     _file_id: FileId,
     _content_hash: &str,
+    _extension: Option<String>,
 ) -> bool {
     false
 }
@@ -4100,6 +4141,17 @@ async fn handle_changes(
                 // locally; otherwise `resolve_preview` goes straight to peers.
                 let can_generate = PREVIEW_GENERATION_COMPILED
                     && configuration.preview_generation_policy.generates();
+                // The file's extension is a type-detection hint for local
+                // generation; look it up here while we hold the DB handle (the
+                // spawned task has none). Only meaningful when we can generate.
+                #[cfg(feature = "preview-generation")]
+                let extension = if can_generate {
+                    preview_extension_for(&database, file_id)
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "preview-generation"))]
+                let extension: Option<String> = None;
                 let command_sender_preview = command_sender.clone();
                 let pending_previews_preview = pending_previews.clone();
                 let change_sender_preview = change_sender.clone();
@@ -4111,6 +4163,7 @@ async fn handle_changes(
                         file_id,
                         &content_hash,
                         can_generate,
+                        extension,
                     )
                     .await;
                     log::debug!(

@@ -705,6 +705,15 @@ impl OniSyncApp {
         self.try_backend()?.restore_file(file_id).await
     }
 
+    /// Purge the daemon's cached file previews, returning how many were removed.
+    ///
+    /// Previews are hash-keyed and regenerated on demand, so this only forces
+    /// re-evaluation on the next request (useful after the set of previewable
+    /// file types changes). Surfaced in the UI as a toolbar action.
+    pub async fn purge_previews(&self) -> Result<usize, ApiError> {
+        self.try_backend()?.purge_previews().await
+    }
+
     /// Move (rename) a file to a new logical path. String-id variant of the
     /// underlying `move_file` call — the Dart UI passes the `FileEntry.fileId`
     /// string it already has.

@@ -50,11 +50,18 @@ const TEXT_SNIFF_BYTES: usize = 1024;
 
 /// Generate a preview from a file's raw `bytes`.
 ///
+/// `extension` is the file's lowercase extension (no dot, e.g. `"jpg"`) taken
+/// from its *logical* name, when known. It is used as a fallback (and a
+/// tie-breaker) for type detection: the bytes on disk are content-addressed and
+/// stored without an extension, and magic-byte sniffing occasionally misses
+/// (unusual leading bytes, truncated reads), so the extension is a valuable
+/// second signal.
+///
 /// Never fails: anything we can't turn into an image or text snippet becomes
 /// [`Preview::None`], which is itself a cacheable ("no preview for this
 /// content") result. Synchronous and CPU-bound — invoke via `spawn_blocking`.
-pub fn generate(bytes: &[u8]) -> Preview {
-    match classify(bytes) {
+pub fn generate(bytes: &[u8], extension: Option<&str>) -> Preview {
+    match classify(bytes, extension) {
         Kind::Image => generate_image(bytes).unwrap_or(Preview::None),
         Kind::Pdf => generate_pdf(bytes).unwrap_or(Preview::None),
         Kind::Video => generate_video(bytes).unwrap_or(Preview::None),
@@ -63,6 +70,7 @@ pub fn generate(bytes: &[u8]) -> Preview {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum Kind {
     Image,
     Pdf,
@@ -71,9 +79,14 @@ enum Kind {
     Other,
 }
 
-/// Decide what kind of preview `bytes` warrant, sniffing magic bytes (never
-/// trusting a filename — we don't have one here anyway).
-fn classify(bytes: &[u8]) -> Kind {
+/// Decide what kind of preview `bytes` warrant.
+///
+/// Magic-byte sniffing (`infer`) is tried first; on a hit its verdict wins. If
+/// it does not recognize the content, we fall back to the file's `extension`
+/// (from its logical name), then to a text heuristic. The extension fallback is
+/// what makes previews work for the content-addressed on-disk store (files are
+/// named by id, with no extension) when magic detection is inconclusive.
+fn classify(bytes: &[u8], extension: Option<&str>) -> Kind {
     if let Some(kind) = infer::get(bytes) {
         if kind.matcher_type() == infer::MatcherType::Image {
             return Kind::Image;
@@ -89,13 +102,39 @@ fn classify(bytes: &[u8]) -> Kind {
         return Kind::Other;
     }
 
-    // `infer` didn't recognize a magic signature. Treat it as text if a leading
-    // window is valid, mostly-printable UTF-8; otherwise give up.
+    // Magic detection was inconclusive. Try the extension.
+    if let Some(kind) = classify_by_extension(extension) {
+        return kind;
+    }
+
+    // Last resort: treat it as text if a leading window is valid, mostly-
+    // printable UTF-8; otherwise give up.
     if looks_like_text(bytes) {
         Kind::Text
     } else {
         Kind::Other
     }
+}
+
+/// Map a lowercase file extension to a preview [`Kind`], or `None` for an
+/// unknown/absent extension.
+fn classify_by_extension(extension: Option<&str>) -> Option<Kind> {
+    let extension = extension?;
+    let kind = match extension {
+        // Raster images the `image` crate can decode.
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "tif" | "tiff" | "ico" => Kind::Image,
+        "pdf" => Kind::Pdf,
+        // Containers ffmpeg can pull a frame from.
+        "mp4" | "m4v" | "mov" | "mkv" | "webm" | "avi" | "wmv" | "flv" | "mpg" | "mpeg" | "3gp"
+        | "ogv" => Kind::Video,
+        // Common text / code / markup.
+        "txt" | "md" | "markdown" | "log" | "json" | "yaml" | "yml" | "toml" | "ini" | "cfg"
+        | "conf" | "csv" | "tsv" | "xml" | "html" | "htm" | "css" | "rs" | "py" | "js" | "ts"
+        | "tsx" | "jsx" | "c" | "h" | "cpp" | "hpp" | "cc" | "java" | "kt" | "go" | "rb" | "php"
+        | "sh" | "bash" | "zsh" | "sql" | "swift" | "dart" | "lua" | "pl" => Kind::Text,
+        _ => return None,
+    };
+    Some(kind)
 }
 
 /// Heuristic: is the leading window of `bytes` valid UTF-8 with no NUL bytes and
@@ -518,7 +557,7 @@ mod tests {
 
     #[test]
     fn plain_text_becomes_text_preview() {
-        let preview = generate(b"hello world\nsecond line");
+        let preview = generate(b"hello world\nsecond line", None);
         match preview {
             Preview::Text(text) => {
                 assert!(text.starts_with("hello world"));
@@ -533,7 +572,7 @@ mod tests {
         // A long multi-byte string; ensure we never panic and stay within the
         // byte cap.
         let source = "é".repeat(1000);
-        let preview = generate(source.as_bytes());
+        let preview = generate(source.as_bytes(), None);
         match preview {
             Preview::Text(text) => assert!(text.len() <= MAX_TEXT_BYTES),
             other => panic!("expected text, got {other:?}"),
@@ -543,19 +582,19 @@ mod tests {
     #[test]
     fn binary_with_nul_has_no_preview() {
         let bytes = [0u8, 1, 2, 3, 255, 254, 0, 42];
-        assert_eq!(generate(&bytes), Preview::None);
+        assert_eq!(generate(&bytes, None), Preview::None);
     }
 
     #[test]
     fn empty_input_is_empty_text() {
-        assert_eq!(generate(b""), Preview::Text(String::new()));
+        assert_eq!(generate(b"", None), Preview::Text(String::new()));
     }
 
     #[test]
     fn pdf_is_classified_as_pdf() {
         // Minimal but valid-enough PDF header; classification is by magic bytes.
         let pdf = b"%PDF-1.4\n1 0 obj<<>>endobj\n";
-        assert!(matches!(classify(pdf), Kind::Pdf));
+        assert!(matches!(classify(pdf, None), Kind::Pdf));
     }
 
     #[test]
@@ -570,7 +609,7 @@ mod tests {
 3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>endobj\n\
 trailer<</Root 1 0 R>>\n%%EOF";
 
-        match generate(ONE_PAGE_PDF) {
+        match generate(ONE_PAGE_PDF, None) {
             Preview::Image {
                 bytes,
                 width,
@@ -594,7 +633,7 @@ trailer<</Root 1 0 R>>\n%%EOF";
             0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm', 0x00, 0x00,
             0x02, 0x00, b'i', b's', b'o', b'm', b'i', b's', b'o', b'2',
         ];
-        assert!(matches!(classify(mp4), Kind::Video));
+        assert!(matches!(classify(mp4, None), Kind::Video));
     }
 
     #[test]
@@ -608,7 +647,7 @@ trailer<</Root 1 0 R>>\n%%EOF";
             0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm', 0x00, 0x00,
             0x02, 0x00, b'i', b's', b'o', b'm', b'i', b's', b'o', b'2',
         ];
-        match generate(mp4) {
+        match generate(mp4, None) {
             Preview::None => {}
             Preview::Image { .. } => {} // real ffmpeg somehow decoded it — fine
             other => panic!("unexpected preview kind for video: {other:?}"),
@@ -624,7 +663,7 @@ trailer<</Root 1 0 R>>\n%%EOF";
             .write_to(&mut Cursor::new(&mut source), image::ImageFormat::Png)
             .unwrap();
 
-        match generate(&source) {
+        match generate(&source, None) {
             Preview::Image {
                 bytes,
                 width,
@@ -637,5 +676,38 @@ trailer<</Root 1 0 R>>\n%%EOF";
             }
             other => panic!("expected image, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn extension_classifies_when_magic_bytes_are_inconclusive() {
+        // Bytes that `infer` does not recognize, but whose extension does.
+        let bytes = b"\x01\x02\x03not a known magic\x04\x05";
+        assert!(matches!(classify(bytes, Some("mp4")), Kind::Video));
+        assert!(matches!(classify(bytes, Some("pdf")), Kind::Pdf));
+        assert!(matches!(classify(bytes, Some("jpg")), Kind::Image));
+        assert!(matches!(classify(bytes, Some("json")), Kind::Text));
+        // Unknown extension + unknown bytes → Other (not text, since NUL-free
+        // but not clearly text either; falls through to the text heuristic).
+        assert!(matches!(classify(bytes, Some("bin")), Kind::Other));
+    }
+
+    #[test]
+    fn magic_bytes_win_over_extension() {
+        // A real PNG whose extension lies ("txt"); magic detection must win so
+        // we still produce an image preview, not a text snippet.
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(10, 10, image::Rgb([1, 2, 3])))
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        assert!(matches!(classify(&png, Some("txt")), Kind::Image));
+    }
+
+    #[test]
+    fn extension_is_case_insensitive_via_caller() {
+        // `classify` expects a lowercase extension; the helper that extracts it
+        // lowercases. Verify the table matches lowercase.
+        assert!(matches!(classify_by_extension(Some("jpeg")), Some(Kind::Image)));
+        assert!(classify_by_extension(Some("JPEG")).is_none());
+        assert!(classify_by_extension(None).is_none());
     }
 }

@@ -225,6 +225,7 @@ class _HomeScreenState extends State<HomeScreen> {
         title: const Text('OniSync'),
         actions: [
           _OperationsButton(session: widget.session),
+          _PurgePreviewsButton(session: widget.session),
           if (publicKey != null) _CopyPublicKeyButton(publicKey: publicKey),
         ],
       ),
@@ -627,6 +628,59 @@ class _OperationsButtonState extends State<_OperationsButton> {
           ),
         ),
       ],
+    );
+  }
+}
+
+/// AppBar action that purges the daemon's cached file previews, forcing them to
+/// regenerate on demand. Useful after the set of previewable file types changes
+/// (e.g. new PDF/video support). Disabled while no session is attached and while
+/// a purge is in flight.
+class _PurgePreviewsButton extends StatefulWidget {
+  const _PurgePreviewsButton({required this.session});
+
+  final OniSyncSession? session;
+
+  @override
+  State<_PurgePreviewsButton> createState() => _PurgePreviewsButtonState();
+}
+
+class _PurgePreviewsButtonState extends State<_PurgePreviewsButton> {
+  bool _purging = false;
+
+  Future<void> _purge() async {
+    final session = widget.session;
+    if (session == null || _purging) return;
+
+    setState(() => _purging = true);
+    try {
+      final purged = await session.app.purgePreviews();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Purged $purged cached previews')),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Failed to purge previews: $error')),
+      );
+    } finally {
+      if (mounted) setState(() => _purging = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      icon: _purging
+          ? const SizedBox(
+              width: 18,
+              height: 18,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            )
+          : const Icon(Icons.image_not_supported_outlined),
+      tooltip: 'Purge cached previews',
+      onPressed: widget.session == null || _purging ? null : _purge,
     );
   }
 }
