@@ -243,6 +243,11 @@ pub trait TransportBackend {
         subtag_id: TagId,
     ) -> impl Future<Output = Result<(), ApiError>> + Send;
 
+    /// Purge the entire preview cache, returning how many cached previews were
+    /// removed. Previews are hash-keyed and regenerated on demand, so this only
+    /// forces re-evaluation on the next request.
+    fn purge_previews(&self) -> impl Future<Output = Result<usize, ApiError>> + Send;
+
     /// Subscribe to the live change stream. Returns an [`EventStream`] whose
     /// [`recv`](EventStream::recv) yields [`ApiEvent`]s.
     fn subscribe(&self) -> EventStream;
@@ -544,6 +549,10 @@ impl TransportBackend for InProcessBackend {
         self.api.untag_tag(parent_id, subtag_id)
     }
 
+    async fn purge_previews(&self) -> Result<usize, ApiError> {
+        self.api.purge_previews().await
+    }
+
     fn subscribe(&self) -> EventStream {
         EventStream::InProcess(self.api.subscribe())
     }
@@ -795,6 +804,13 @@ impl TransportBackend for Backend {
         match self {
             Backend::InProcess(backend) => backend.untag_tag(parent_id, subtag_id).await,
             Backend::Ipc(backend) => backend.untag_tag(parent_id, subtag_id).await,
+        }
+    }
+
+    async fn purge_previews(&self) -> Result<usize, ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.purge_previews().await,
+            Backend::Ipc(backend) => backend.purge_previews().await,
         }
     }
 

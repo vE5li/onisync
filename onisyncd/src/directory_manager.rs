@@ -152,11 +152,12 @@ pub struct SyncDirectoryManager {
     // TODO: Make this a more robust messaging framework instead of a ref cell.
     self_writes: RefCell<HashMap<PathBuf, SelfWrite>>,
     /// Whether this device eagerly warms the preview cache. Mirrors
-    /// [`Configuration::eager_previews`]; consulted during `run_initial_sync`
-    /// so that files which were *unchanged* while the daemon was off (and so
-    /// produce no `ContentChange` on startup) still get a preview generated
-    /// retroactively. Live changes already flow through `handle_content_change`,
-    /// which warms them itself.
+    /// [`Configuration::preview_generation_policy`] being
+    /// [`Eager`](crate::configuration::PreviewGenerationPolicy::Eager);
+    /// consulted during `run_initial_sync` so that files which were *unchanged*
+    /// while the daemon was off (and so produce no `ContentChange` on startup)
+    /// still get a preview generated retroactively. Live changes already flow
+    /// through `handle_content_change`, which warms them itself.
     eager_previews: bool,
 }
 
@@ -171,7 +172,7 @@ impl SyncDirectoryManager {
             .await
             .expect("Failed to set up debouncer");
 
-        let eager_previews = configuration.eager_previews;
+        let eager_previews = configuration.preview_generation_policy.is_eager();
 
         let sync_directories = configuration
             .sync_directories
@@ -1872,7 +1873,7 @@ mod tests {
             listen_port: None,
             peers: Vec::new(),
             tags: Vec::new(),
-            eager_previews: false,
+            preview_generation_policy: crate::configuration::PreviewGenerationPolicy::Lazy,
         };
         let paths = Paths::new(data_dir, data_dir.join("identity"));
         let (change_sender, _change_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -2055,7 +2056,7 @@ mod tests {
             listen_port: None,
             peers: Vec::new(),
             tags: Vec::new(),
-            eager_previews: false,
+            preview_generation_policy: crate::configuration::PreviewGenerationPolicy::Lazy,
         };
         let paths = Paths::new(&data_dir, data_dir.join("identity"));
         let (change_sender, mut change_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -2123,7 +2124,7 @@ mod tests {
             listen_port: None,
             peers: Vec::new(),
             tags: Vec::new(),
-            eager_previews: false,
+            preview_generation_policy: crate::configuration::PreviewGenerationPolicy::Lazy,
         };
         let paths = Paths::new(data_dir, data_dir.join("identity"));
         let (change_sender, change_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -2290,7 +2291,7 @@ mod tests {
             listen_port: None,
             peers: Vec::new(),
             tags: Vec::new(),
-            eager_previews: false,
+            preview_generation_policy: crate::configuration::PreviewGenerationPolicy::Lazy,
         };
         let paths = Paths::new(&data_dir, data_dir.join("identity"));
         let (change_sender, _change_receiver) = tokio::sync::mpsc::unbounded_channel();

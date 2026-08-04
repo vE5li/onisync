@@ -54,6 +54,7 @@ pub mod file_bytes;
 pub mod identity;
 pub mod operations;
 pub mod paths;
+#[cfg(feature = "preview-generation")]
 pub mod preview;
 pub mod preview_fetch;
 pub mod transfer;
@@ -135,6 +136,11 @@ struct PeerContext {
     pending_previews: PendingPreviews,
     change_sender: UnboundedSender<DaemonMessage>,
     command_sender: UnboundedSender<SyncDirectoryCommand>,
+    /// Whether this device may *generate* previews locally (its policy permits
+    /// it and the `preview-generation` feature is compiled in). When `false`, a
+    /// peer `PreviewRequest` is answered only from our preview cache, never by
+    /// decoding local bytes.
+    can_generate_previews: bool,
     /// Node-wide cache of verified content hashes (`path -> (mtime, size,
     /// hash)`), so a holder answering repeated `ChunkRequest`s for the same
     /// unchanged file hashes it once. Shared across all peer sessions.
@@ -305,6 +311,34 @@ pub async fn run(
 > {
     let runtime_configuration = Arc::new(RwLock::new(RuntimeConfiguration::new(&configuration)));
 
+    // Reconcile the preview-generation policy against what this binary can
+    // actually do. A policy that wants to generate (`Lazy`/`Eager`) needs the
+    // `preview-generation` feature compiled in; if it is not, we cannot honor
+    // the policy, so we log an error and fall back to behaving as `Never`
+    // (cache + serve + relay only). This is a soft fallback, not a fatal error:
+    // the daemon still runs and still participates in the preview network.
+    let policy = configuration.preview_generation_policy;
+    let can_generate_previews = if policy.generates() && !PREVIEW_GENERATION_COMPILED {
+        log::error!(
+            "preview_generation_policy is {:?} but this build was compiled without the \
+             `preview-generation` feature; falling back to no local generation (Never). This \
+             device will only cache and serve previews obtained from peers.",
+            policy
+        );
+        false
+    } else {
+        policy.generates() && PREVIEW_GENERATION_COMPILED
+    };
+    log::info!(
+        "Preview generation policy: {:?} (local generation {})",
+        policy,
+        if can_generate_previews {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+
     // Shared content-keyed chunk relay. Every peer session and `handle_changes`
     // holds a clone: requests forwarded on one session and replies arriving on
     // another share one waiter table, so multi-source pulls and relay coalescing
@@ -330,6 +364,7 @@ pub async fn run(
     // hash per file so `SyncDirectoryManager` can detect files that changed on
     // disk while we were offline without ever touching the main DB itself.
     let database = FileDatabase::initialize(&main_db_path).map_err(RunError::Database)?;
+
     let last_known_hashes = database
         .latest_content_hashes()
         .map_err(RunError::Database)?;
@@ -437,6 +472,7 @@ pub async fn run(
         pending_previews: pending_previews.clone(),
         change_sender: change_sender.clone(),
         command_sender: command_sender.clone(),
+        can_generate_previews,
         verified_hashes: VerifiedHashCache::new(),
         operations: operations.clone(),
     };
@@ -820,6 +856,7 @@ async fn run_peer_session<S>(
         pending_previews,
         change_sender,
         command_sender,
+        can_generate_previews,
         verified_hashes,
         operations,
     } = context;
@@ -1586,24 +1623,36 @@ async fn run_peer_session<S>(
                         file_id,
                         content_hash,
                     }) => {
-                        // Serve if we hold the content locally (generating the
-                        // preview off the runtime), else relay across the tree.
+                        // Answer a peer's preview request in three tiers:
+                        //   1. Cache hit — serve it. Always available (a DB read,
+                        //      no generation support needed), so even a `Never`
+                        //      device serves previews it fetched earlier.
+                        //   2. Cache miss + we can generate + bytes are local —
+                        //      generate, serve (and it gets cached when we, or
+                        //      the requester, next resolve it).
+                        //   3. Otherwise — relay across the tree.
                         // We answer `PreviewData` even for `Preview::None`: a
                         // holder that has the bytes but they are un-previewable
-                        // is authoritative, so downstream should cache that
-                        // negative result rather than keep asking.
+                        // is authoritative, so downstream caches that negative
+                        // result rather than re-asking.
                         let short = content_hash.get(..8).unwrap_or(&content_hash);
-                        let local = read_local_if_hash_matches(
-                            &command_sender,
-                            file_id,
-                            &content_hash,
-                        )
-                        .await;
 
-                        if let Some(file_bytes) = local {
-                            let preview = generate_preview_from_local(file_id, file_bytes).await;
+                        // Tier 1: our cache. `preview_for` is a read on this
+                        // session's read-only DB handle.
+                        let cached = match database.preview_for(file_id, &content_hash) {
+                            Ok(cached) => cached,
+                            Err(error) => {
+                                log::debug!(
+                                    "peer[{peer_name}]: [{short}] preview cache lookup failed: \
+                                     {error:?}; treating as miss"
+                                );
+                                None
+                            }
+                        };
+
+                        if let Some(preview) = cached {
                             log::debug!(
-                                "peer[{peer_name}]: served PreviewData {} [{short}]",
+                                "peer[{peer_name}]: served cached PreviewData {} [{short}]",
                                 file_id.to_string()
                             );
                             let _ = our_sender.send(Frame::Sync(SyncMessage::PreviewData {
@@ -1611,7 +1660,27 @@ async fn run_peer_session<S>(
                                 content_hash,
                                 preview,
                             }));
-                        } else {
+                            continue;
+                        }
+
+                        // Tier 2: generate from local bytes, if this device may
+                        // generate and holds the content. Delegated to a
+                        // `cfg`-gated helper so the feature-specific machinery
+                        // (and its use of `can_generate_previews` /
+                        // `command_sender`) lives outside this match arm and
+                        // compiles away entirely without the feature.
+                        let served = try_serve_generated_preview(
+                            &our_sender,
+                            &command_sender,
+                            can_generate_previews,
+                            peer_name,
+                            file_id,
+                            &content_hash,
+                        )
+                        .await;
+
+                        // Tier 3: relay to other neighbours.
+                        if !served {
                             log::debug!(
                                 "peer[{peer_name}]: [{short}] preview not served locally; relaying"
                             );
@@ -2156,9 +2225,13 @@ async fn read_local_if_hash_matches(
     }
 }
 
-/// If this device is configured for eager previews, kick off preview generation
-/// for `file_id` now (fire-and-forget), so the preview is warm in the cache
-/// before anyone requests it.
+/// Whether this build can generate previews at all: the `preview-generation`
+/// feature (and its `image`/`pdfium` deps) is compiled in.
+const PREVIEW_GENERATION_COMPILED: bool = cfg!(feature = "preview-generation");
+
+/// If this device is configured for **eager** previews, kick off preview
+/// generation for `file_id` now (fire-and-forget), so the preview is warm in
+/// the cache before anyone requests it.
 ///
 /// Implemented by enqueuing a fire-and-forget [`DaemonMessage::GetPreview`]
 /// (the reply is discarded): it reuses the exact resolve-and-cache path, runs
@@ -2168,13 +2241,13 @@ async fn read_local_if_hash_matches(
 /// locally-observed file), so the local-first `resolve_preview` generates from
 /// disk rather than fetching from a peer.
 ///
-/// A no-op unless `configuration.eager_previews` is set.
+/// A no-op unless the policy is [`PreviewGenerationPolicy::Eager`].
 fn maybe_eager_preview(
     configuration: &Configuration,
     change_sender: &UnboundedSender<DaemonMessage>,
     file_id: FileId,
 ) {
-    if !configuration.eager_previews {
+    if !configuration.preview_generation_policy.is_eager() {
         return;
     }
     // Throwaway responder: we don't consume the result here, we only want the
@@ -2201,12 +2274,16 @@ fn maybe_eager_preview(
 
 /// Resolve the preview for `(file_id, content_hash)` when it is not cached.
 ///
-/// Presence-first, mirroring the byte-fetch policy: if the file is present
-/// locally (its bytes are on disk and hash-match), generate the preview here
-/// (off the async runtime, via `spawn_blocking`); otherwise flood a
-/// `PreviewRequest` across the peer tree and take the first responder. A file
-/// that no reachable peer holds resolves to [`Preview::None`] — a valid,
-/// cacheable "no preview" result, not an error.
+/// Presence-first, mirroring the byte-fetch policy: if this device *can
+/// generate* (`can_generate`) and the file is present locally (its bytes are on
+/// disk and hash-match), generate the preview here (off the async runtime, via
+/// `spawn_blocking`); otherwise flood a `PreviewRequest` across the peer tree
+/// and take the first responder. A file that no reachable peer holds resolves
+/// to [`Preview::None`] — a valid, cacheable "no preview" result, not an error.
+///
+/// `can_generate` is `false` on a `Never`-policy device (or a build without the
+/// `preview-generation` feature); such a device skips local generation and only
+/// ever obtains previews from peers.
 ///
 /// Runs off the DB-writer loop; the caller re-enters via
 /// [`DaemonMessage::ApplyPreview`] to cache the result.
@@ -2215,70 +2292,46 @@ async fn resolve_preview(
     pending_previews: &PendingPreviews,
     file_id: FileId,
     content_hash: &str,
+    can_generate: bool,
 ) -> Preview {
-    // Bound how many source bytes we pull into memory for generation. Large
-    // enough for the image decoder's needs and any text snippet, capped so a
-    // huge file can't blow up the blocking task.
-    const MAX_PREVIEW_SOURCE_BYTES: usize = 32 * 1024 * 1024;
-
     let short = content_hash.get(..8).unwrap_or(content_hash);
 
-    // 1. Present locally? Generate from our own bytes.
-    //
-    // NOTE: `read_local_if_hash_matches` issues `SyncDirectoryCommand::ReadFile`,
-    // which reads *and hashes the whole file* to verify it matches
-    // `content_hash`. For a large file that hash is O(size) and is a prime
-    // suspect for a slow first preview — the timing below isolates it.
-    let local_read_start = std::time::Instant::now();
-    let local = read_local_if_hash_matches(command_sender, file_id, content_hash).await;
-    log::debug!(
-        "resolve_preview[{short}]: local ReadFile+verify for {} took {:?} (present={})",
-        file_id.to_string(),
-        local_read_start.elapsed(),
-        local.is_some()
-    );
+    // 1. Can we generate locally? Only if this device's policy permits it and
+    // the generation stack is compiled in. If so, and the file is present
+    // locally, generate from our own bytes. The block is `cfg`-gated because it
+    // references `generate_preview_from_local`, which only exists with the
+    // feature; `can_generate` is always `false` without it, so this is a no-op
+    // either way.
+    #[cfg(feature = "preview-generation")]
+    if can_generate {
+        // NOTE: `read_local_if_hash_matches` issues
+        // `SyncDirectoryCommand::ReadFile`, which reads *and hashes the whole
+        // file* to verify it matches `content_hash` (O(size)).
+        let local_read_start = std::time::Instant::now();
+        let local = read_local_if_hash_matches(command_sender, file_id, content_hash).await;
+        log::debug!(
+            "resolve_preview[{short}]: local ReadFile+verify for {} took {:?} (present={})",
+            file_id.to_string(),
+            local_read_start.elapsed(),
+            local.is_some()
+        );
 
-    if let Some(file_bytes) = local {
-        let read_bytes_start = std::time::Instant::now();
-        match file_bytes.read_all_bounded(MAX_PREVIEW_SOURCE_BYTES).await {
-            Ok((bytes, _complete)) => {
-                log::debug!(
-                    "resolve_preview[{short}]: read {} source bytes for generation in {:?}",
-                    bytes.len(),
-                    read_bytes_start.elapsed()
-                );
-                // Decoding/resizing/encoding is CPU-bound: run it on the
-                // blocking pool so the async runtime keeps serving other work.
-                let generate_start = std::time::Instant::now();
-                match tokio::task::spawn_blocking(move || crate::preview::generate(&bytes)).await {
-                    Ok(preview) => {
-                        log::debug!(
-                            "resolve_preview[{short}]: local generation for {} took {:?}",
-                            file_id.to_string(),
-                            generate_start.elapsed()
-                        );
-                        return preview;
-                    }
-                    Err(error) => {
-                        log::error!(
-                            "resolve_preview: generation task panicked for {}: {error}",
-                            file_id.to_string()
-                        );
-                        return Preview::None;
-                    }
-                }
-            }
-            Err(error) => {
-                // Row said present but the read failed (deleted/racing). Fall
-                // through to asking peers rather than failing outright.
-                log::debug!(
-                    "resolve_preview: local read failed for {}: {:?}; asking peers",
-                    file_id.to_string(),
-                    error
-                );
+        if let Some(file_bytes) = local {
+            match generate_preview_from_local(file_id, file_bytes).await {
+                Some(preview) => return preview,
+                // Read failed (row present but bytes gone/racing): fall through
+                // to asking peers rather than failing outright.
+                None => log::debug!(
+                    "resolve_preview[{short}]: local read failed for {}; asking peers",
+                    file_id.to_string()
+                ),
             }
         }
     }
+    // Without the feature, local generation is compiled out, so these are dead;
+    // silence the unused warnings.
+    #[cfg(not(feature = "preview-generation"))]
+    let _ = (can_generate, command_sender);
 
     // 2. Not present locally: ask peers. First responder wins; exhaustion or
     // timeout resolves to `None`.
@@ -2301,9 +2354,17 @@ async fn resolve_preview(
 }
 
 /// Read `file_bytes` fully (bounded) and generate a [`Preview`] off the async
-/// runtime. Used by the holder side of a peer `PreviewRequest`. A read failure
-/// yields [`Preview::None`] (the requester falls back to other holders).
-async fn generate_preview_from_local(file_id: FileId, file_bytes: FileBytes) -> Preview {
+/// runtime.
+///
+/// Returns `Some(preview)` on success (including `Some(Preview::None)` for
+/// un-previewable content — an authoritative negative result), or `None` if the
+/// bytes could not be read (row present but file gone/racing), so the caller can
+/// fall back to asking peers.
+///
+/// Only compiled with the `preview-generation` feature; all call sites are
+/// guarded by `can_generate`, which is `false` without it.
+#[cfg(feature = "preview-generation")]
+async fn generate_preview_from_local(file_id: FileId, file_bytes: FileBytes) -> Option<Preview> {
     const MAX_PREVIEW_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 
     let read_start = std::time::Instant::now();
@@ -2327,14 +2388,16 @@ async fn generate_preview_from_local(file_id: FileId, file_bytes: FileBytes) -> 
                         file_id.to_string(),
                         blocking_start.elapsed()
                     );
-                    preview
+                    Some(preview)
                 }
                 Err(error) => {
                     log::error!(
                         "generate_preview_from_local: task panicked for {}: {error}",
                         file_id.to_string()
                     );
-                    Preview::None
+                    // A panic in generation is not a read failure; treat it as a
+                    // (negative) result rather than triggering a peer fetch.
+                    Some(Preview::None)
                 }
             }
         }
@@ -2344,9 +2407,63 @@ async fn generate_preview_from_local(file_id: FileId, file_bytes: FileBytes) -> 
                 file_id.to_string(),
                 error
             );
-            Preview::None
+            None
         }
     }
+}
+
+/// Tier-2 of the peer `PreviewRequest` handler: try to *generate* a preview
+/// from local bytes and send it as `PreviewData`. Returns `true` if a
+/// `PreviewData` was sent, `false` if the caller should relay instead.
+///
+/// Two implementations by feature: with `preview-generation`, it generates when
+/// `can_generate` and the content is present locally; without the feature it is
+/// a no-op that always returns `false` (so the request is relayed), consuming
+/// its arguments so the call site needs no `cfg`.
+#[cfg(feature = "preview-generation")]
+async fn try_serve_generated_preview(
+    our_sender: &UnboundedSender<Frame>,
+    command_sender: &UnboundedSender<SyncDirectoryCommand>,
+    can_generate: bool,
+    peer_name: &str,
+    file_id: FileId,
+    content_hash: &str,
+) -> bool {
+    if !can_generate {
+        return false;
+    }
+    let Some(file_bytes) = read_local_if_hash_matches(command_sender, file_id, content_hash).await
+    else {
+        return false;
+    };
+    let Some(preview) = generate_preview_from_local(file_id, file_bytes).await else {
+        return false;
+    };
+    log::debug!(
+        "peer[{peer_name}]: served generated PreviewData {} [{}]",
+        file_id.to_string(),
+        content_hash.get(..8).unwrap_or(content_hash)
+    );
+    let _ = our_sender.send(Frame::Sync(SyncMessage::PreviewData {
+        file_id,
+        content_hash: content_hash.to_owned(),
+        preview,
+    }));
+    true
+}
+
+/// See the feature-enabled variant. Without `preview-generation` this device
+/// cannot generate, so it never serves a generated preview.
+#[cfg(not(feature = "preview-generation"))]
+async fn try_serve_generated_preview(
+    _our_sender: &UnboundedSender<Frame>,
+    _command_sender: &UnboundedSender<SyncDirectoryCommand>,
+    _can_generate: bool,
+    _peer_name: &str,
+    _file_id: FileId,
+    _content_hash: &str,
+) -> bool {
+    false
 }
 
 /// Answer a content-addressed `ChunkRequest` from a **local** source, if this
@@ -3977,6 +4094,12 @@ async fn handle_changes(
                 // re-enter via `ApplyPreview` to cache it and reply. This
                 // mirrors `Fetch`→`Materialize`: generation (`spawn_blocking`)
                 // and any peer round-trip must never block the sole DB writer.
+                //
+                // `can_generate` gates *local* generation: only a device whose
+                // policy generates (and whose build has the feature) decodes
+                // locally; otherwise `resolve_preview` goes straight to peers.
+                let can_generate = PREVIEW_GENERATION_COMPILED
+                    && configuration.preview_generation_policy.generates();
                 let command_sender_preview = command_sender.clone();
                 let pending_previews_preview = pending_previews.clone();
                 let change_sender_preview = change_sender.clone();
@@ -3987,6 +4110,7 @@ async fn handle_changes(
                         &pending_previews_preview,
                         file_id,
                         &content_hash,
+                        can_generate,
                     )
                     .await;
                     log::debug!(
@@ -4039,6 +4163,18 @@ async fn handle_changes(
                     cache_write_start.elapsed()
                 );
                 let _ = respond_to.send(Ok(preview));
+                continue;
+            }
+            DaemonMessage::PurgePreviews { respond_to } => {
+                // Operator-initiated wipe of the whole preview cache, handled on
+                // the sole DB writer. Previews are hash-keyed and regenerated on
+                // demand, so this only forces re-evaluation on the next request.
+                let result = database.purge_previews();
+                match &result {
+                    Ok(purged) => log::info!("PurgePreviews: purged {purged} cached previews"),
+                    Err(error) => log::error!("PurgePreviews: failed to purge previews: {error:?}"),
+                }
+                let _ = respond_to.send(result);
                 continue;
             }
             DaemonMessage::ReconcilePlacement { file_id } => {

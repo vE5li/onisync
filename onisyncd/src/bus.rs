@@ -23,6 +23,7 @@ use onisync_core::state::{Change, ChangeOrigin};
 use onisync_core::{FileId, LogicalPath, Preview, TagId};
 use tokio::sync::oneshot;
 
+use crate::database::DatabaseError;
 use crate::file_bytes::FileBytes;
 
 /// A change carried on the daemon ingest bus.
@@ -240,6 +241,15 @@ pub enum DaemonMessage {
         content_hash: String,
         preview: Preview,
         respond_to: oneshot::Sender<Result<Preview, PreviewError>>,
+    },
+    /// Operator-initiated purge of the whole preview cache (`previews_v1`).
+    /// Request-reply, handled on the writer loop because the preview cache is
+    /// part of the main DB (sole-writer). Replies with the number of cached
+    /// previews removed. Previews are hash-keyed and regenerated on demand, so
+    /// this only forces re-evaluation; it is never required for correctness.
+    /// Exposed via the `onisync purge-previews` CLI command.
+    PurgePreviews {
+        respond_to: oneshot::Sender<Result<usize, DatabaseError>>,
     },
 }
 

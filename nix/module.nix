@@ -17,10 +17,36 @@ self: {
       description = "Group under which onisync runs.";
     };
 
+    enable-preview-generation = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Whether this host's daemon is built with the `preview-generation`
+        cargo feature (the image + pdfium thumbnail-generation stack).
+
+        A host whose `preview_generation_policy` (set in the JSON
+        configuration file) is `Lazy` or `Eager` needs this enabled — the
+        daemon otherwise cannot generate previews and falls back to `Never`
+        at startup (logging an error). A host that only ever caches/serves
+        previews obtained from peers (`Never`) can disable this to drop the
+        image/pdfium dependencies from its build.
+
+        Ignored if `package` is set explicitly.
+      '';
+    };
+
     package = mkOption {
       type = types.package;
-      default = self.packages.${pkgs.system}.onisyncd;
-      defaultText = literalExpression "onisync.packages.\${system}.onisyncd";
+      # Build the daemon with the feature selected by
+      # `enable-preview-generation`. Uses `callPackage` on the package
+      # definition directly so it works whether or not the host applies the
+      # flake overlay.
+      default = pkgs.callPackage ../nix/onisyncd.nix {
+        withPreviewGeneration = config.services.onisync.enable-preview-generation;
+      };
+      defaultText = literalExpression ''
+        pkgs.callPackage ./nix/onisyncd.nix { withPreviewGeneration = <enable-preview-generation>; }
+      '';
       description = "The onisync daemon package to use.";
     };
 

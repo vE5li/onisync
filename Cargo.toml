@@ -15,6 +15,14 @@ ed25519-dalek = "3.0.0"
 env_logger = "0.11"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
 infer = { version = "0.16", default-features = false }
+# PDF first-page rasterization for previews. Binds to libpdfium at *runtime*
+# via libloading (dynamic), so the build does not link pdfium; the daemon
+# locates `libpdfium.so` at runtime (its path is provided by the Nix wrapper /
+# ONISYNC_PDFIUM_LIB_PATH; see flake.nix). Only ever compiled into a build with
+# onisyncd's `preview-generation` feature. `image_latest` pins the same `image`
+# crate version we use elsewhere (0.25) so `PdfBitmap::as_image()` yields a
+# compatible `DynamicImage`.
+pdfium-render = { version = "0.9", default-features = false, features = ["image_latest", "pdfium_latest", "thread_safe"] }
 # Pinned to the exact version of `flutter_rust_bridge_codegen` in the dev shell
 # (flake.nix); the runtime crate and the generator must match.
 flutter_rust_bridge = "=2.12.0"

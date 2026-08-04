@@ -203,6 +203,10 @@ pub enum ControlRequest {
     /// emitting [`ControlFrame::Event`]s on this connection; the response is
     /// [`ControlResponse::Subscribed`].
     Subscribe,
+    /// Purge the entire preview cache. Answered with
+    /// [`ControlResponse::PurgedPreviews`] carrying the number of cached
+    /// previews removed.
+    PurgePreviews,
     /// Snapshot every currently-active sync operation. Answered with
     /// [`ControlResponse::Operations`].
     ListOperations,
@@ -247,6 +251,9 @@ pub enum ControlResponse {
     Ok,
     /// The subscription was established; events will follow on this connection.
     Subscribed,
+    /// The number of cached previews removed (answer to
+    /// [`ControlRequest::PurgePreviews`]).
+    PurgedPreviews(usize),
     /// A snapshot of currently-active sync operations (answer to
     /// [`ControlRequest::ListOperations`]).
     Operations(Vec<crate::operations::Operation>),
@@ -735,6 +742,10 @@ async fn dispatch(
             *events = Some(EventStream::InProcess(api.subscribe()));
             ControlResponse::Subscribed
         }
+        ControlRequest::PurgePreviews => match api.purge_previews().await {
+            Ok(purged) => ControlResponse::PurgedPreviews(purged),
+            Err(error) => ControlResponse::Error(error),
+        },
         ControlRequest::ListOperations => ControlResponse::Operations(api.list_operations()),
         ControlRequest::SubscribeOperations => {
             *operation_events = Some(OperationStream::InProcess(api.subscribe_operations()));
@@ -1404,6 +1415,13 @@ impl TransportBackend for IpcClientBackend {
             .await?
         {
             ControlResponse::Ok => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn purge_previews(&self) -> Result<usize, ApiError> {
+        match self.call(ControlRequest::PurgePreviews).await? {
+            ControlResponse::PurgedPreviews(purged) => Ok(purged),
             other => Err(unexpected(other)),
         }
     }

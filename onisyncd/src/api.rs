@@ -801,6 +801,28 @@ impl Api {
         result
     }
 
+    /// Purge the entire preview cache, returning how many cached previews were
+    /// removed.
+    ///
+    /// Enqueues a [`DaemonMessage::PurgePreviews`] onto the ingest bus so the
+    /// wipe runs on the sole main-DB writer (`handle_changes`). Previews are
+    /// hash-keyed and regenerated on demand, so this never affects correctness;
+    /// it forces every file to be re-evaluated on its next preview request.
+    /// Exposed to operators via the `onisync purge-previews` CLI command.
+    pub async fn purge_previews(&self) -> Result<usize, ApiError> {
+        let (respond_to, response) = oneshot::channel();
+        self.change_sender
+            .send(DaemonMessage::PurgePreviews { respond_to })
+            .map_err(|_| ApiError::Internal("runtime is shutting down".to_owned()))?;
+
+        match tokio::time::timeout(Self::FETCH_TIMEOUT, response).await {
+            Ok(Ok(result)) => result.map_err(ApiError::from),
+            // The responder was dropped without sending — treat as shutdown.
+            Ok(Err(_recv_error)) => Err(ApiError::Internal("runtime is shutting down".to_owned())),
+            Err(_elapsed) => Err(ApiError::Internal(FetchError::TimedOut.to_string())),
+        }
+    }
+
     /// Resolve `file_id` to the absolute on-disk path where its bytes currently
     /// live locally, or `None` if no sync directory holds it. Read-only.
     ///

@@ -693,6 +693,10 @@ enum Commands {
     /// sending/receiving files, reconciling, ...).
     #[command(visible_alias = "ops")]
     ListOperations,
+    /// Purge the daemon's cached file previews, forcing them to regenerate on
+    /// demand. Useful after the set of previewable file types changes (e.g. new
+    /// PDF/video support). Prints how many cached previews were removed.
+    PurgePreviews,
 }
 
 #[tokio::main]
@@ -1118,6 +1122,17 @@ async fn run(
                 .map_err(|error| error.to_string())?;
 
             emit_operations(output_mode, &operations);
+        }
+        Commands::PurgePreviews => {
+            let purged = backend
+                .purge_previews()
+                .await
+                .map_err(|error| error.to_string())?;
+
+            match output_mode {
+                OutputMode::Human => println!("Purged {purged} cached previews"),
+                OutputMode::Json => print_json(&json!({ "purged": purged })),
+            }
         }
     }
     Ok(())

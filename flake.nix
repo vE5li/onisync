@@ -412,6 +412,13 @@
               ];
 
               RUST_SRC_PATH = pkgs.rustPlatform.rustLibSrc;
+
+              # Where the daemon (run via `cargo run` in dev) finds its preview
+              # generation tools: libpdfium.so for PDF, ffmpeg/ffprobe for video.
+              # The packaged daemon (nix/onisyncd.nix) sets these itself via a
+              # wrapper; these cover the dev-shell workflow. Pinned nixpkgs builds.
+              ONISYNC_PDFIUM_LIB_PATH = "${pkgs.pdfium-binaries}/lib";
+              ONISYNC_FFMPEG_PATH = "${pkgs.ffmpeg}/bin";
             }
             // androidEnv);
       }

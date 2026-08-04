@@ -721,6 +721,20 @@ impl FileDatabase {
         Ok(())
     }
 
+    /// Delete *every* cached preview, returning how many rows were removed.
+    ///
+    /// Wipes the whole `previews_v1` cache — successful image/text previews as
+    /// well as negative (`Preview::None`) results. Previews are hash-keyed and
+    /// regenerated on demand, so this is never required for correctness; it
+    /// forces every file to be re-evaluated on its next preview request. Exposed
+    /// to operators via the `onisync purge-previews` CLI command (useful after
+    /// changing what the daemon can preview, e.g. new PDF/video support).
+    pub fn purge_previews(&self) -> Result<usize, DatabaseError> {
+        self.connection
+            .execute("DELETE FROM previews_v1", [])
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)
+    }
+
     /// Append a new version row for `file_id`.
     ///
     /// The `version_number` is computed as `MAX(version_number) + 1` for this

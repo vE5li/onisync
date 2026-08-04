@@ -114,24 +114,64 @@ pub struct Configuration {
     /// semantics.
     #[serde(default)]
     pub tags: Vec<TagDeclaration>,
-    /// Whether this device eagerly generates file previews as soon as it holds
-    /// a file's bytes locally (a completed peer transfer, or a locally-observed
-    /// new/changed file), rather than lazily on the first `get_preview`
-    /// request.
+    /// How (and whether) this device *generates* file previews locally. See
+    /// [`PreviewGenerationPolicy`].
     ///
-    /// Preview generation for a large image is CPU-heavy (a full decode; see
-    /// `preview`), so doing it lazily makes the *first* detail-screen open of an
-    /// uncached file wait seconds. Because previews are content-addressed and
-    /// served peer-to-peer, one always-on device (e.g. a home server) with this
-    /// enabled will have every preview pre-warmed in its cache; other devices
-    /// leave it `false` and fetch the ready-made preview from that server on
-    /// demand — turning the interactive wait into a fast cache hit over the
-    /// network instead of a local decode.
-    ///
-    /// Only ever generates for files whose bytes are present locally; it never
-    /// triggers a byte fetch from a peer just to build a preview.
+    /// This governs **generation** only — the CPU-heavy decode/rasterize of a
+    /// file's bytes into a thumbnail. Serving an already-cached preview to a
+    /// peer, caching a preview fetched from a peer, and relaying preview
+    /// requests are *always* available regardless of this setting (and require
+    /// no generation support compiled in). So a `Never` device still
+    /// participates in the preview network: it caches previews it fetches and
+    /// can serve them onward.
     #[serde(default)]
-    pub eager_previews: bool,
+    pub preview_generation_policy: PreviewGenerationPolicy,
+}
+
+/// How a device generates file previews.
+///
+/// Preview generation (image decode/resize, PDF rasterization) is CPU-heavy and
+/// pulls in the optional generation stack (the `image` and `pdfium` crates)
+/// behind the `preview-generation` cargo feature. This policy lets each device
+/// choose its role independently of how it was compiled — with the constraint
+/// that a non-`Never` policy requires a binary built *with* that feature (a
+/// mismatch is a fail-closed startup error, since a lazy/eager device that
+/// cannot actually generate would silently never produce previews).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PreviewGenerationPolicy {
+    /// Never generate. This device produces no previews itself; it only caches
+    /// and serves previews obtained from peers. Requires no generation support
+    /// compiled in, so a minimal client can drop the `image`/`pdfium` deps
+    /// entirely by building without the `preview-generation` feature and
+    /// setting this policy.
+    #[default]
+    #[serde(alias="never")]
+    Never,
+    /// Generate on demand: the first `get_preview` for an uncached file (or a
+    /// peer's `PreviewRequest` we can serve from local bytes) triggers
+    /// generation, which is then cached. The default.
+    #[serde(alias="lazy")]
+    Lazy,
+    /// Everything `Lazy` does, plus pre-warm: generate as soon as a file's bytes
+    /// land locally (a completed peer transfer, a locally-observed new/changed
+    /// file) and for every local file during the startup catch-up sweep. Best
+    /// for an always-on device (e.g. a home server) so other devices fetch
+    /// ready-made previews from its cache instead of decoding locally.
+    #[serde(alias="eager")]
+    Eager,
+}
+
+impl PreviewGenerationPolicy {
+    /// Whether this policy ever generates previews (i.e. requires the
+    /// `preview-generation` feature to be compiled in).
+    pub fn generates(self) -> bool {
+        !matches!(self, PreviewGenerationPolicy::Never)
+    }
+
+    /// Whether this policy eagerly pre-warms previews at ingest / startup.
+    pub fn is_eager(self) -> bool {
+        matches!(self, PreviewGenerationPolicy::Eager)
+    }
 }
 
 /// Why a [`Configuration`] could not be produced from its serialized form.
