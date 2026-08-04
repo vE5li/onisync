@@ -234,9 +234,10 @@ impl SyncDirectoryManager {
     /// preview via `handle_content_change`; a file that was untouched while the
     /// daemon was off produces no such change, so on an eager-preview device we
     /// nudge it here. Fire-and-forget `GetPreview` (reply discarded): it reuses
-    /// the resolve-and-cache path, generates off the writer loop, and is a cheap
-    /// no-op when the preview is already cached — so re-running the initial sync
-    /// does not re-decode. A no-op unless `eager_previews` is set.
+    /// the resolve-and-cache path, generates off the writer loop, and is a
+    /// cheap no-op when the preview is already cached — so re-running the
+    /// initial sync does not re-decode. A no-op unless `eager_previews` is
+    /// set.
     fn maybe_eager_preview(&self, file_id: FileId) {
         if !self.eager_previews {
             return;

@@ -23,11 +23,11 @@
 //! `tokio::task::spawn_blocking`; it is a plain synchronous function operating
 //! on an owned byte buffer for exactly that reason.
 
-use image::ImageReader;
-use onisync_core::Preview;
 use std::io::Cursor;
 use std::sync::OnceLock;
 
+use image::ImageReader;
+use onisync_core::Preview;
 use pdfium_render::prelude::{PdfRenderConfig, Pdfium};
 
 /// Longest edge, in pixels, of a generated image preview. Small on purpose: a
@@ -130,15 +130,15 @@ fn classify_by_extension(extension: Option<&str>) -> Option<Kind> {
         // Common text / code / markup.
         "txt" | "md" | "markdown" | "log" | "json" | "yaml" | "yml" | "toml" | "ini" | "cfg"
         | "conf" | "csv" | "tsv" | "xml" | "html" | "htm" | "css" | "rs" | "py" | "js" | "ts"
-        | "tsx" | "jsx" | "c" | "h" | "cpp" | "hpp" | "cc" | "java" | "kt" | "go" | "rb" | "php"
-        | "sh" | "bash" | "zsh" | "sql" | "swift" | "dart" | "lua" | "pl" => Kind::Text,
+        | "tsx" | "jsx" | "c" | "h" | "cpp" | "hpp" | "cc" | "java" | "kt" | "go" | "rb"
+        | "php" | "sh" | "bash" | "zsh" | "sql" | "swift" | "dart" | "lua" | "pl" => Kind::Text,
         _ => return None,
     };
     Some(kind)
 }
 
-/// Heuristic: is the leading window of `bytes` valid UTF-8 with no NUL bytes and
-/// few control characters? Empty input counts as text (an empty snippet).
+/// Heuristic: is the leading window of `bytes` valid UTF-8 with no NUL bytes
+/// and few control characters? Empty input counts as text (an empty snippet).
 fn looks_like_text(bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return true;
@@ -328,16 +328,16 @@ fn pdfium() -> Option<&'static Pdfium> {
     PDFIUM
         .get_or_init(|| {
             let bindings = match std::env::var("ONISYNC_PDFIUM_LIB_PATH") {
-                Ok(dir) => Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(
-                    &dir,
-                ))
-                .or_else(|error| {
-                    log::warn!(
-                        "preview: ONISYNC_PDFIUM_LIB_PATH set but binding failed ({error:?}); \
-                         trying system library"
-                    );
-                    Pdfium::bind_to_system_library()
-                }),
+                Ok(dir) => {
+                    Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(&dir))
+                        .or_else(|error| {
+                            log::warn!(
+                                "preview: ONISYNC_PDFIUM_LIB_PATH set but binding failed \
+                                 ({error:?}); trying system library"
+                            );
+                            Pdfium::bind_to_system_library()
+                        })
+                }
                 Err(_) => Pdfium::bind_to_system_library(),
             };
 
@@ -510,10 +510,8 @@ impl TempVideo {
         // concurrent generations.
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "onisync-preview-{}-{n}.video",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("onisync-preview-{}-{n}.video", std::process::id()));
         let mut file = std::fs::File::create(&path).ok()?;
         file.write_all(bytes).ok()?;
         file.flush().ok()?;
@@ -706,7 +704,10 @@ trailer<</Root 1 0 R>>\n%%EOF";
     fn extension_is_case_insensitive_via_caller() {
         // `classify` expects a lowercase extension; the helper that extracts it
         // lowercases. Verify the table matches lowercase.
-        assert!(matches!(classify_by_extension(Some("jpeg")), Some(Kind::Image)));
+        assert!(matches!(
+            classify_by_extension(Some("jpeg")),
+            Some(Kind::Image)
+        ));
         assert!(classify_by_extension(Some("JPEG")).is_none());
         assert!(classify_by_extension(None).is_none());
     }

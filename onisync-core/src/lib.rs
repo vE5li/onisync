@@ -504,9 +504,10 @@ pub mod state {
         ///
         /// The `content_hash` is part of the request identity: a holder answers
         /// [`Sync::PreviewData`] **only** if it can produce a preview of that
-        /// exact content, else [`Sync::PreviewMiss`]. A holder still on an older
-        /// (or newer) version than the requested hash therefore misses rather
-        /// than substituting a preview of different bytes.
+        /// exact content, else [`Sync::PreviewMiss`]. A holder still on an
+        /// older (or newer) version than the requested hash therefore
+        /// misses rather than substituting a preview of different
+        /// bytes.
         ///
         /// Previews are deterministic *in kind* but not required to be
         /// byte-identical across peers (image encoders may differ by library
@@ -525,9 +526,10 @@ pub mod state {
             preview: Preview,
         },
         /// This direction cannot serve a preview of `(file_id, content_hash)`:
-        /// it lacks the content locally (only metadata-known) and every upstream
-        /// it forwarded to also missed. A key missing from *all* directions
-        /// resolves the request as [`Preview::None`] to the caller.
+        /// it lacks the content locally (only metadata-known) and every
+        /// upstream it forwarded to also missed. A key missing from
+        /// *all* directions resolves the request as [`Preview::None`]
+        /// to the caller.
         PreviewMiss {
             file_id: FileId,
             content_hash: String,
@@ -562,8 +564,9 @@ pub enum Preview {
         width: u32,
         height: u32,
     },
-    /// A short UTF-8 snippet from the start of a text file, already truncated on
-    /// a character boundary and sanitized. Bounded to a few hundred bytes.
+    /// A short UTF-8 snippet from the start of a text file, already truncated
+    /// on a character boundary and sanitized. Bounded to a few hundred
+    /// bytes.
     Text(String),
     /// The content has no preview (un-previewable type, or generation failed).
     /// A cacheable negative result.

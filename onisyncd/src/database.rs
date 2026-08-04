@@ -596,14 +596,14 @@ impl FileDatabase {
         // `invalidate_previews`) is therefore about bounding table growth and
         // clearing tombstoned files, not correctness.
         //
-        // - `kind` is the discriminant of `onisync_core::Preview`
-        //   (0 = Image, 1 = Text, 2 = None). The `None` kind is a *cached
-        //   negative result* ("this content has no preview"), so an
-        //   un-previewable file is not re-generated on every request.
-        // - `data` holds the encoded image bytes (kind = Image) or the UTF-8
-        //   snippet (kind = Text); NULL for kind = None.
-        // - `width`/`height` are the image's pixel dimensions (kind = Image),
-        //   NULL otherwise.
+        // - `kind` is the discriminant of `onisync_core::Preview` (0 = Image, 1 = Text,
+        //   2 = None). The `None` kind is a *cached negative result* ("this content has
+        //   no preview"), so an un-previewable file is not re-generated on every
+        //   request.
+        // - `data` holds the encoded image bytes (kind = Image) or the UTF-8 snippet
+        //   (kind = Text); NULL for kind = None.
+        // - `width`/`height` are the image's pixel dimensions (kind = Image), NULL
+        //   otherwise.
         // - `generated_at` is unix-millis at insert, for eventual eviction / UI.
         //
         // No `FOREIGN KEY` on `file_id`, matching `file_versions_v1`: a preview
@@ -701,7 +701,15 @@ impl FileDatabase {
                 "INSERT OR REPLACE INTO previews_v1
                     (file_id, content_hash, kind, data, width, height, generated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                (file_id, content_hash, kind, data, width, height, generated_at),
+                (
+                    file_id,
+                    content_hash,
+                    kind,
+                    data,
+                    width,
+                    height,
+                    generated_at,
+                ),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
@@ -726,9 +734,10 @@ impl FileDatabase {
     /// Wipes the whole `previews_v1` cache — successful image/text previews as
     /// well as negative (`Preview::None`) results. Previews are hash-keyed and
     /// regenerated on demand, so this is never required for correctness; it
-    /// forces every file to be re-evaluated on its next preview request. Exposed
-    /// to operators via the `onisync purge-previews` CLI command (useful after
-    /// changing what the daemon can preview, e.g. new PDF/video support).
+    /// forces every file to be re-evaluated on its next preview request.
+    /// Exposed to operators via the `onisync purge-previews` CLI command
+    /// (useful after changing what the daemon can preview, e.g. new
+    /// PDF/video support).
     pub fn purge_previews(&self) -> Result<usize, DatabaseError> {
         self.connection
             .execute("DELETE FROM previews_v1", [])

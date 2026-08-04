@@ -74,7 +74,8 @@ impl From<FileInfo> for FileEntry {
 /// Which kind of content a [`PreviewEntry`] carries. Mirrors the variants of
 /// the core [`Preview`] enum as a flat tag the Dart UI can switch on.
 pub enum PreviewKind {
-    /// A small raster image; `PreviewEntry.image_bytes`/`width`/`height` are set.
+    /// A small raster image; `PreviewEntry.image_bytes`/`width`/`height` are
+    /// set.
     Image,
     /// A short text snippet; `PreviewEntry.text` is set.
     Text,
@@ -581,10 +582,7 @@ impl OniSyncApp {
     /// know which. A file whose content has no preview comes back with
     /// `PreviewEntry.kind == PreviewKind::None` (a successful result). Errors
     /// `NotFound` only if the id itself is unknown.
-    pub async fn get_preview_by_string(
-        &self,
-        file_id: String,
-    ) -> Result<PreviewEntry, ApiError> {
+    pub async fn get_preview_by_string(&self, file_id: String) -> Result<PreviewEntry, ApiError> {
         let backend = self.try_backend()?;
         let file_id = backend.resolve_file_id(file_id).await?;
         Ok(PreviewEntry::from(backend.get_preview(file_id).await?))
@@ -597,9 +595,10 @@ impl OniSyncApp {
     /// `expected_hash` gates which content is accepted; the caller passes the
     /// file's known `FileEntry.content_hash`. The returned path lives under the
     /// daemon's fetch temp dir and is handed over with **move semantics** — the
-    /// caller must consume it (e.g. hand it to the OS share sheet) and delete it
-    /// afterwards. The UI uses this to share a file that is not present locally;
-    /// for a locally-held file prefer [`Self::local_path_for_file_by_string`].
+    /// caller must consume it (e.g. hand it to the OS share sheet) and delete
+    /// it afterwards. The UI uses this to share a file that is not present
+    /// locally; for a locally-held file prefer
+    /// [`Self::local_path_for_file_by_string`].
     pub async fn fetch_file_by_string(
         &self,
         file_id: String,
@@ -635,7 +634,11 @@ impl OniSyncApp {
     /// a chip. Matches the string-id convention used by the other UI-facing
     /// methods here (see [`Self::tag_ids_for_file_string`]).
     pub async fn create_tag(&self, name: String, color: String) -> Result<String, ApiError> {
-        Ok(self.try_backend()?.create_tag(name, color).await?.to_string())
+        Ok(self
+            .try_backend()?
+            .create_tag(name, color)
+            .await?
+            .to_string())
     }
 
     /// Delete a tag.
@@ -705,7 +708,8 @@ impl OniSyncApp {
         self.try_backend()?.restore_file(file_id).await
     }
 
-    /// Purge the daemon's cached file previews, returning how many were removed.
+    /// Purge the daemon's cached file previews, returning how many were
+    /// removed.
     ///
     /// Previews are hash-keyed and regenerated on demand, so this only forces
     /// re-evaluation on the next request (useful after the set of previewable

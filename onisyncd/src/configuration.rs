@@ -145,19 +145,20 @@ pub enum PreviewGenerationPolicy {
     /// entirely by building without the `preview-generation` feature and
     /// setting this policy.
     #[default]
-    #[serde(alias="never")]
+    #[serde(alias = "never")]
     Never,
     /// Generate on demand: the first `get_preview` for an uncached file (or a
     /// peer's `PreviewRequest` we can serve from local bytes) triggers
     /// generation, which is then cached. The default.
-    #[serde(alias="lazy")]
+    #[serde(alias = "lazy")]
     Lazy,
-    /// Everything `Lazy` does, plus pre-warm: generate as soon as a file's bytes
-    /// land locally (a completed peer transfer, a locally-observed new/changed
-    /// file) and for every local file during the startup catch-up sweep. Best
-    /// for an always-on device (e.g. a home server) so other devices fetch
-    /// ready-made previews from its cache instead of decoding locally.
-    #[serde(alias="eager")]
+    /// Everything `Lazy` does, plus pre-warm: generate as soon as a file's
+    /// bytes land locally (a completed peer transfer, a locally-observed
+    /// new/changed file) and for every local file during the startup
+    /// catch-up sweep. Best for an always-on device (e.g. a home server) so
+    /// other devices fetch ready-made previews from its cache instead of
+    /// decoding locally.
+    #[serde(alias = "eager")]
     Eager,
 }
 

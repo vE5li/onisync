@@ -38,9 +38,9 @@ use crate::database::FileDatabase;
 use crate::directory_manager::{SyncDirectoryCommand, SyncDirectoryManager};
 use crate::fetch::PendingFetches;
 use crate::file_bytes::FileBytes;
-use crate::preview_fetch::{PendingPreviews, PreviewReply};
 use crate::identity::{HandshakeMessage, Identity};
 use crate::paths::Paths;
+use crate::preview_fetch::{PendingPreviews, PreviewReply};
 use crate::transfer::{ChunkAnswer, ChunkReply, ChunkRequest, ReceiveOutcome, VerifiedHashCache};
 
 pub mod api;
@@ -131,8 +131,9 @@ struct PeerContext {
     runtime_configuration: Arc<RwLock<RuntimeConfiguration>>,
     pending_fetches: PendingFetches,
     /// Content-keyed preview relay, sibling to `pending_fetches`. Every peer
-    /// session holds a clone so a `PreviewRequest` forwarded on one link and its
-    /// `PreviewData`/`PreviewMiss` arriving on another share one waiter table.
+    /// session holds a clone so a `PreviewRequest` forwarded on one link and
+    /// its `PreviewData`/`PreviewMiss` arriving on another share one waiter
+    /// table.
     pending_previews: PendingPreviews,
     change_sender: UnboundedSender<DaemonMessage>,
     command_sender: UnboundedSender<SyncDirectoryCommand>,
@@ -349,7 +350,8 @@ pub async fn run(
     // Sibling of `pending_fetches` for previews: a content-keyed waiter table
     // shared by every peer session and `handle_changes`, so a preview requested
     // on one link and answered on another resolve together. Cheap to clone.
-    let pending_previews = crate::preview_fetch::PendingPreviews::new(runtime_configuration.clone());
+    let pending_previews =
+        crate::preview_fetch::PendingPreviews::new(runtime_configuration.clone());
 
     let identity = Identity::load(paths.identity_path()).map_err(|source| RunError::Identity {
         path: paths.identity_path().to_path_buf(),
@@ -2375,8 +2377,8 @@ async fn resolve_preview(
 ///
 /// Returns `Some(preview)` on success (including `Some(Preview::None)` for
 /// un-previewable content — an authoritative negative result), or `None` if the
-/// bytes could not be read (row present but file gone/racing), so the caller can
-/// fall back to asking peers.
+/// bytes could not be read (row present but file gone/racing), so the caller
+/// can fall back to asking peers.
 ///
 /// Only compiled with the `preview-generation` feature; all call sites are
 /// guarded by `can_generate`, which is `false` without it.

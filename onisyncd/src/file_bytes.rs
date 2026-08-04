@@ -199,11 +199,12 @@ impl FileBytes {
 
     /// Read the entire content into memory, up to `max_len` bytes.
     ///
-    /// Returns `(bytes, complete)` where `complete` is `true` iff the whole file
-    /// fit within `max_len` (i.e. it was not truncated). Used by preview
-    /// generation, which needs the full bytes in memory to decode/snippet but
-    /// must be bounded so an enormous file cannot exhaust memory — the caller
-    /// decides what a truncated read means for each preview kind.
+    /// Returns `(bytes, complete)` where `complete` is `true` iff the whole
+    /// file fit within `max_len` (i.e. it was not truncated). Used by
+    /// preview generation, which needs the full bytes in memory to
+    /// decode/snippet but must be bounded so an enormous file cannot
+    /// exhaust memory — the caller decides what a truncated read means for
+    /// each preview kind.
     pub async fn read_all_bounded(
         &self,
         max_len: usize,

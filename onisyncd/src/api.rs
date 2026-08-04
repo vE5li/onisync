@@ -768,15 +768,18 @@ impl Api {
     /// wins), caching the result in `previews_v1` before replying.
     ///
     /// A file with no previewable content resolves to [`Preview::None`] — that
-    /// is a successful result, not an error. `ApiError::NotFound` means the file
-    /// id itself is unknown to the catalog.
+    /// is a successful result, not an error. `ApiError::NotFound` means the
+    /// file id itself is unknown to the catalog.
     pub async fn get_preview(&self, file_id: FileId) -> Result<Preview, ApiError> {
         // End-to-end stopwatch for the whole daemon-side request (bus enqueue →
         // handle_changes resolution → reply). Combined with the finer-grained
         // logs inside `handle_changes`, this shows how much time is the actual
         // work vs. queueing behind other messages on the single-writer bus.
         let api_start = std::time::Instant::now();
-        log::debug!("Api::get_preview: requesting preview for {}", file_id.to_string());
+        log::debug!(
+            "Api::get_preview: requesting preview for {}",
+            file_id.to_string()
+        );
 
         let (respond_to, response) = oneshot::channel();
         self.change_sender

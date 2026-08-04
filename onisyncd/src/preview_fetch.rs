@@ -14,8 +14,8 @@
 //! - On `PreviewData` from an upstream, fan it to every downstream waiter and
 //!   drop the entry (first-responder-wins; previews of the same content need
 //!   not be byte-identical, so later duplicates are simply discarded).
-//! - On `PreviewMiss`, remove that upstream from `upstream_outstanding`; when it
-//!   empties, fan `PreviewMiss` down and drop.
+//! - On `PreviewMiss`, remove that upstream from `upstream_outstanding`; when
+//!   it empties, fan `PreviewMiss` down and drop.
 //! - On link drop or TTL expiry, prune / fan `PreviewMiss` accordingly.
 //!
 //! A missed preview is *not* an error to the caller: a local request that
@@ -260,8 +260,8 @@ impl PendingPreviews {
     }
 
     /// Handle an inbound `PreviewMiss` from `from_public_key`. Remove it from
-    /// the entry's `upstream_outstanding`; if that empties, fan `PreviewMiss` to
-    /// all downstream waiters and drop the entry.
+    /// the entry's `upstream_outstanding`; if that empties, fan `PreviewMiss`
+    /// to all downstream waiters and drop the entry.
     pub async fn handle_preview_miss(
         &self,
         from_public_key: &str,
@@ -290,8 +290,8 @@ impl PendingPreviews {
     }
 
     /// Prune a dropped link from every entry, applying the same emptying rules
-    /// as the chunk relay (an entry whose upstreams all vanished, or that has no
-    /// remaining downstream, fans `PreviewMiss` down and is dropped).
+    /// as the chunk relay (an entry whose upstreams all vanished, or that has
+    /// no remaining downstream, fans `PreviewMiss` down and is dropped).
     pub async fn prune_link(&self, public_key: &str) {
         let mut exhausted: Vec<(PreviewKey, WaiterEntry)> = Vec::new();
         {

@@ -223,15 +223,17 @@ pub enum DaemonMessage {
     ///    off-loop (`spawn_blocking`), caches it via `ApplyPreview`, and
     ///    replies;
     /// 3. else floods a `PreviewRequest` across the peer tree and caches +
-    ///    replies with the first response (or `Preview::None` if none holds it).
+    ///    replies with the first response (or `Preview::None` if none holds
+    ///    it).
     GetPreview {
         file_id: FileId,
         respond_to: oneshot::Sender<Result<Preview, PreviewError>>,
     },
     /// Internal follow-up to [`DaemonMessage::GetPreview`], enqueued by the
-    /// off-loop generation / peer-fetch task once a preview is resolved. Handled
-    /// on the writer loop so the cache write (`record_preview`) happens on the
-    /// sole DB writer, then the caller's `respond_to` is fulfilled.
+    /// off-loop generation / peer-fetch task once a preview is resolved.
+    /// Handled on the writer loop so the cache write (`record_preview`)
+    /// happens on the sole DB writer, then the caller's `respond_to` is
+    /// fulfilled.
     ///
     /// Split out from `GetPreview` (mirroring `Fetch`→`Materialize` and
     /// `Restore`→`ApplyRestore`) so slow generation / network work never blocks
