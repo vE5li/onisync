@@ -114,6 +114,24 @@ pub struct Configuration {
     /// semantics.
     #[serde(default)]
     pub tags: Vec<TagDeclaration>,
+    /// Whether this device eagerly generates file previews as soon as it holds
+    /// a file's bytes locally (a completed peer transfer, or a locally-observed
+    /// new/changed file), rather than lazily on the first `get_preview`
+    /// request.
+    ///
+    /// Preview generation for a large image is CPU-heavy (a full decode; see
+    /// `preview`), so doing it lazily makes the *first* detail-screen open of an
+    /// uncached file wait seconds. Because previews are content-addressed and
+    /// served peer-to-peer, one always-on device (e.g. a home server) with this
+    /// enabled will have every preview pre-warmed in its cache; other devices
+    /// leave it `false` and fetch the ready-made preview from that server on
+    /// demand — turning the interactive wait into a fast cache hit over the
+    /// network instead of a local decode.
+    ///
+    /// Only ever generates for files whose bytes are present locally; it never
+    /// triggers a byte fetch from a peer just to build a preview.
+    #[serde(default)]
+    pub eager_previews: bool,
 }
 
 /// Why a [`Configuration`] could not be produced from its serialized form.

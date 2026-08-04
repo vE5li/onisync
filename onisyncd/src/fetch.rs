@@ -549,6 +549,7 @@ mod tests {
             listen_port: None,
             peers: Vec::new(),
             tags: Vec::new(),
+            eager_previews: false,
         };
         let runtime = Arc::new(RwLock::new(RuntimeConfiguration::new(&configuration)));
         PendingFetches::new(runtime)

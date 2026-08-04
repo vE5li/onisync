@@ -39,7 +39,7 @@ use std::future::Future;
 use std::path::PathBuf;
 
 use onisync_core::state::Change;
-use onisync_core::{FileId, FileInfo, TagId};
+use onisync_core::{FileId, FileInfo, Preview, TagId};
 use tokio::sync::broadcast;
 
 use crate::api::{Api, ApiError, ApiEvent, QueryResult};
@@ -187,6 +187,13 @@ pub trait TransportBackend {
         file_id: FileId,
         expected_hash: String,
     ) -> impl Future<Output = Result<PathBuf, ApiError>> + Send;
+
+    /// Get the preview for a file's current content (cached, generated locally,
+    /// or fetched from a peer). [`Preview::None`] is a valid result.
+    fn get_preview(
+        &self,
+        file_id: FileId,
+    ) -> impl Future<Output = Result<Preview, ApiError>> + Send;
 
     /// Resolve a file's absolute on-disk path if present locally, else `None`.
     fn local_path_for_file(
@@ -501,6 +508,10 @@ impl TransportBackend for InProcessBackend {
         self.api.fetch_file(file_id, expected_hash).await
     }
 
+    async fn get_preview(&self, file_id: FileId) -> Result<Preview, ApiError> {
+        self.api.get_preview(file_id).await
+    }
+
     async fn local_path_for_file(&self, file_id: FileId) -> Result<Option<PathBuf>, ApiError> {
         self.api.local_path_for_file(file_id).await
     }
@@ -721,6 +732,13 @@ impl TransportBackend for Backend {
         match self {
             Backend::InProcess(backend) => backend.fetch_file(file_id, expected_hash).await,
             Backend::Ipc(backend) => backend.fetch_file(file_id, expected_hash).await,
+        }
+    }
+
+    async fn get_preview(&self, file_id: FileId) -> Result<Preview, ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.get_preview(file_id).await,
+            Backend::Ipc(backend) => backend.get_preview(file_id).await,
         }
     }
 

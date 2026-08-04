@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use onisync_core::state::{RelationshipKind, RelationshipManifestEntry, TagManifestEntry};
 use onisync_core::tag::MetadataFormat;
-use onisync_core::{FileId, FileInfo, LogicalPath, PhysicalPath, TagId};
+use onisync_core::{FileId, FileInfo, LogicalPath, PhysicalPath, Preview, TagId};
 use rusqlite::types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, ToSql};
 use serde::{Deserialize, Serialize};
@@ -351,6 +351,7 @@ impl FileDatabase {
         Self::create_tags_v1(&connection)?;
         Self::create_entries_v1(&connection)?;
         Self::create_file_versions_v1(&connection)?;
+        Self::create_previews_v1(&connection)?;
 
         Ok(Self { connection })
     }
@@ -586,6 +587,140 @@ impl FileDatabase {
         Ok(())
     }
 
+    fn create_previews_v1(connection: &Connection) -> Result<(), DatabaseError> {
+        // Per-peer preview cache, keyed by `(file_id, content_hash)`. Coupling
+        // to `content_hash` (not just `file_id`) is what makes the cache
+        // self-invalidating across content changes: a new version's hash simply
+        // won't match any cached row, so a stale preview can never be served for
+        // fresh content. Invalidation on version change / deletion (see
+        // `invalidate_previews`) is therefore about bounding table growth and
+        // clearing tombstoned files, not correctness.
+        //
+        // - `kind` is the discriminant of `onisync_core::Preview`
+        //   (0 = Image, 1 = Text, 2 = None). The `None` kind is a *cached
+        //   negative result* ("this content has no preview"), so an
+        //   un-previewable file is not re-generated on every request.
+        // - `data` holds the encoded image bytes (kind = Image) or the UTF-8
+        //   snippet (kind = Text); NULL for kind = None.
+        // - `width`/`height` are the image's pixel dimensions (kind = Image),
+        //   NULL otherwise.
+        // - `generated_at` is unix-millis at insert, for eventual eviction / UI.
+        //
+        // No `FOREIGN KEY` on `file_id`, matching `file_versions_v1`: a preview
+        // may be cached from a peer before the local catalog row exists.
+        connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS previews_v1 (
+                    file_id       TEXT    NOT NULL,
+                    content_hash  TEXT    NOT NULL,
+                    kind          INTEGER NOT NULL,
+                    data          BLOB,
+                    width         INTEGER,
+                    height        INTEGER,
+                    generated_at  INTEGER NOT NULL,
+                    PRIMARY KEY (file_id, content_hash)
+                )",
+                (),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    /// Look up a cached preview for `(file_id, content_hash)`.
+    ///
+    /// Returns `Ok(Some(_))` for any cached result — including a cached
+    /// [`Preview::None`] (an un-previewable file whose negative result we
+    /// remember). `Ok(None)` means nothing is cached and the caller must
+    /// generate it locally or request it from peers.
+    pub fn preview_for(
+        &self,
+        file_id: FileId,
+        content_hash: &str,
+    ) -> Result<Option<Preview>, DatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT kind, data, width, height
+                 FROM previews_v1
+                 WHERE file_id = ?1 AND content_hash = ?2",
+                (file_id, content_hash),
+                |row| {
+                    let kind: i64 = row.get(0)?;
+                    let data: Option<Vec<u8>> = row.get(1)?;
+                    let width: Option<i64> = row.get(2)?;
+                    let height: Option<i64> = row.get(3)?;
+                    Ok((kind, data, width, height))
+                },
+            )
+            .optional()
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?
+            .map(|(kind, data, width, height)| match kind {
+                0 => Ok(Preview::Image {
+                    bytes: data.unwrap_or_default(),
+                    width: width.unwrap_or(0) as u32,
+                    height: height.unwrap_or(0) as u32,
+                }),
+                1 => Ok(Preview::Text(
+                    data.and_then(|bytes| String::from_utf8(bytes).ok())
+                        .unwrap_or_default(),
+                )),
+                _ => Ok(Preview::None),
+            })
+            .transpose()
+    }
+
+    /// Cache `preview` for `(file_id, content_hash)`, replacing any existing
+    /// row for that key. Idempotent; safe to call whether the preview was
+    /// generated locally or received from a peer.
+    pub fn record_preview(
+        &mut self,
+        file_id: FileId,
+        content_hash: &str,
+        preview: &Preview,
+    ) -> Result<(), DatabaseError> {
+        let generated_at = now_millis();
+
+        let (kind, data, width, height): (i64, Option<Vec<u8>>, Option<i64>, Option<i64>) =
+            match preview {
+                Preview::Image {
+                    bytes,
+                    width,
+                    height,
+                } => (
+                    0,
+                    Some(bytes.clone()),
+                    Some(*width as i64),
+                    Some(*height as i64),
+                ),
+                Preview::Text(text) => (1, Some(text.clone().into_bytes()), None, None),
+                Preview::None => (2, None, None, None),
+            };
+
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO previews_v1
+                    (file_id, content_hash, kind, data, width, height, generated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (file_id, content_hash, kind, data, width, height, generated_at),
+            )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
+    /// Drop every cached preview for `file_id`, regardless of content hash.
+    ///
+    /// Called when a file's content identity changes (`record_version`) or the
+    /// file is deleted. Not required for correctness (previews are hash-keyed)
+    /// but bounds table growth and clears previews for tombstoned files.
+    pub fn invalidate_previews(&self, file_id: FileId) -> Result<(), DatabaseError> {
+        self.connection
+            .execute("DELETE FROM previews_v1 WHERE file_id = ?1", [file_id])
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        Ok(())
+    }
+
     /// Append a new version row for `file_id`.
     ///
     /// The `version_number` is computed as `MAX(version_number) + 1` for this
@@ -640,6 +775,16 @@ impl FileDatabase {
                     size,
                 ),
             )
+            .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        // The file's content identity just changed: drop every cached preview
+        // for it (of any prior hash) in the same transaction. Correctness does
+        // not depend on this — previews are keyed by `content_hash`, so a stale
+        // one could never match the new version — but it bounds `previews_v1`
+        // growth. This is the single choke point for content change (local
+        // edits, peer edits, reconciliation, restore all funnel through here).
+        transaction
+            .execute("DELETE FROM previews_v1 WHERE file_id = ?1", [file_id])
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
 
         transaction
@@ -1346,6 +1491,15 @@ impl FileDatabase {
                 (file_id, deleted_at),
             )
             .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+
+        if affected > 0 {
+            // The file is now tombstoned; drop any cached previews for it. Its
+            // version history is intentionally retained, but a preview of a
+            // deleted file serves no purpose.
+            self.connection
+                .execute("DELETE FROM previews_v1 WHERE file_id = ?1", [file_id])
+                .map_err(|_| DatabaseError::FailedToExecuteCommand)?;
+        }
 
         Ok(affected > 0)
     }
@@ -4037,5 +4191,96 @@ mod tests {
             .tag_ids_matching_token("receipt", DeletedRule::Include)
             .unwrap();
         assert_eq!(matched, vec![dead]);
+    }
+
+    #[test]
+    fn preview_cache_roundtrips_each_kind() {
+        let mut database = memory_db();
+        let file_id = FileId::new();
+
+        // Miss before anything is cached.
+        assert!(database.preview_for(file_id, "h").unwrap().is_none());
+
+        // Image round-trips including dimensions.
+        let image = Preview::Image {
+            bytes: vec![1, 2, 3],
+            width: 12,
+            height: 34,
+        };
+        database.record_preview(file_id, "h", &image).unwrap();
+        assert_eq!(database.preview_for(file_id, "h").unwrap(), Some(image));
+
+        // Text under a different hash coexists.
+        let text = Preview::Text("hello".to_owned());
+        database.record_preview(file_id, "h2", &text).unwrap();
+        assert_eq!(database.preview_for(file_id, "h2").unwrap(), Some(text));
+
+        // A cached `None` is a real (negative) hit, distinct from a miss.
+        database
+            .record_preview(file_id, "h3", &Preview::None)
+            .unwrap();
+        assert_eq!(
+            database.preview_for(file_id, "h3").unwrap(),
+            Some(Preview::None)
+        );
+    }
+
+    #[test]
+    fn record_preview_replaces_same_key() {
+        let mut database = memory_db();
+        let file_id = FileId::new();
+
+        database
+            .record_preview(file_id, "h", &Preview::Text("first".to_owned()))
+            .unwrap();
+        database
+            .record_preview(file_id, "h", &Preview::Text("second".to_owned()))
+            .unwrap();
+
+        assert_eq!(
+            database.preview_for(file_id, "h").unwrap(),
+            Some(Preview::Text("second".to_owned()))
+        );
+    }
+
+    #[test]
+    fn record_version_invalidates_previews() {
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("a.txt"), 0)
+            .unwrap();
+        database
+            .record_version(file_id, "hash-v1", "local", 1)
+            .unwrap();
+        database
+            .record_preview(file_id, "hash-v1", &Preview::Text("v1".to_owned()))
+            .unwrap();
+
+        // Recording a new version drops every cached preview for the file.
+        database
+            .record_version(file_id, "hash-v2", "local", 1)
+            .unwrap();
+        assert!(database.preview_for(file_id, "hash-v1").unwrap().is_none());
+    }
+
+    #[test]
+    fn remove_file_invalidates_previews() {
+        let mut database = memory_db();
+        let file_id = FileId::new();
+        database
+            .add_file(file_id, &LogicalPath::new("a.txt"), 0)
+            .unwrap();
+        database
+            .record_version(file_id, "hash-v1", "local", 1)
+            .unwrap();
+        database
+            .record_preview(file_id, "hash-v1", &Preview::Text("v1".to_owned()))
+            .unwrap();
+
+        // A delete stamped after the version wins and clears the cache.
+        let deleted_at = now_millis() + 1_000;
+        assert!(database.remove_file(file_id, deleted_at).unwrap());
+        assert!(database.preview_for(file_id, "hash-v1").unwrap().is_none());
     }
 }

@@ -12,7 +12,7 @@ use uuid::Uuid;
 /// which every node derives identically). Since all devices are operated by the
 /// same user and updated together, there is no compatibility range — a mismatch
 /// is fail-closed.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 pub mod tag {
     use std::collections::HashMap;
@@ -84,7 +84,7 @@ pub mod state {
     use serde::{Deserialize, Serialize};
 
     use crate::tag::{MetadataFormat, MetadataValues};
-    use crate::{FileId, LogicalPath, TagId};
+    use crate::{FileId, LogicalPath, Preview, TagId};
 
     pub enum ChangeOrigin {
         Local { directory_path: PathBuf },
@@ -496,6 +496,42 @@ pub mod state {
         TagNotFound {
             tag_id: TagId,
         },
+
+        /// Ask any holder for the canonical preview of `file_id` at exactly
+        /// `content_hash`. Like tag reconciliation (and unlike chunk transfers)
+        /// this is a small, explicit request/response with no byte-streaming:
+        /// the whole preview fits in one reply.
+        ///
+        /// The `content_hash` is part of the request identity: a holder answers
+        /// [`Sync::PreviewData`] **only** if it can produce a preview of that
+        /// exact content, else [`Sync::PreviewMiss`]. A holder still on an older
+        /// (or newer) version than the requested hash therefore misses rather
+        /// than substituting a preview of different bytes.
+        ///
+        /// Previews are deterministic *in kind* but not required to be
+        /// byte-identical across peers (image encoders may differ by library
+        /// version); any valid preview of the requested content is acceptable,
+        /// so the first responder wins and later duplicates are dropped.
+        PreviewRequest {
+            file_id: FileId,
+            content_hash: String,
+        },
+        /// The canonical preview of `file_id` at `content_hash`. The requester
+        /// caches it keyed by `(file_id, content_hash)` and ignores any further
+        /// replies for the same key.
+        PreviewData {
+            file_id: FileId,
+            content_hash: String,
+            preview: Preview,
+        },
+        /// This direction cannot serve a preview of `(file_id, content_hash)`:
+        /// it lacks the content locally (only metadata-known) and every upstream
+        /// it forwarded to also missed. A key missing from *all* directions
+        /// resolves the request as [`Preview::None`] to the caller.
+        PreviewMiss {
+            file_id: FileId,
+            content_hash: String,
+        },
     }
 
     /// Top-level wire message wrapper. Every WebSocket text frame between
@@ -506,6 +542,32 @@ pub mod state {
         Change(Change),
         Sync(Sync),
     }
+}
+
+/// A lightweight preview of a file's content, keyed elsewhere by `(file_id,
+/// content_hash)`. Crosses both the peer wire (in [`Sync::PreviewData`]) and
+/// the UI-facing API boundary, so it lives in `onisync-core`.
+///
+/// A preview is always one of: a tiny low-resolution image, a short text
+/// snippet, or nothing (the content is un-previewable — binary/video/etc, or
+/// generation failed). The `None` variant is a *cacheable* result: it means
+/// "there is no preview for this content", not "unknown".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Preview {
+    /// A small, low-resolution raster preview. `bytes` is a fully-encoded image
+    /// (e.g. WebP/PNG) — self-describing, decoded directly by the UI — and
+    /// `width`/`height` are its pixel dimensions for layout hints.
+    Image {
+        bytes: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+    /// A short UTF-8 snippet from the start of a text file, already truncated on
+    /// a character boundary and sanitized. Bounded to a few hundred bytes.
+    Text(String),
+    /// The content has no preview (un-previewable type, or generation failed).
+    /// A cacheable negative result.
+    None,
 }
 
 /// A file as presented to the UI: its id, managed relative path, and the

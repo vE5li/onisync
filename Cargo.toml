@@ -13,6 +13,8 @@ clap = { version = "4.5.20", features = ["derive"] }
 comfy-table = { version = "7", features = ["custom_styling"] }
 ed25519-dalek = "3.0.0"
 env_logger = "0.11"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
+infer = { version = "0.16", default-features = false }
 # Pinned to the exact version of `flutter_rust_bridge_codegen` in the dev shell
 # (flake.nix); the runtime crate and the generator must match.
 flutter_rust_bridge = "=2.12.0"

@@ -24,7 +24,7 @@ use onisync_core::state::{
     Change, ChangeOrigin, Frame, ManifestEntry, RelationshipManifestEntry, Sync as SyncMessage,
     TagManifestEntry,
 };
-use onisync_core::{FileId, LogicalPath, PhysicalPath, TagId};
+use onisync_core::{FileId, LogicalPath, PhysicalPath, Preview, TagId};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -38,6 +38,7 @@ use crate::database::FileDatabase;
 use crate::directory_manager::{SyncDirectoryCommand, SyncDirectoryManager};
 use crate::fetch::PendingFetches;
 use crate::file_bytes::FileBytes;
+use crate::preview_fetch::{PendingPreviews, PreviewReply};
 use crate::identity::{HandshakeMessage, Identity};
 use crate::paths::Paths;
 use crate::transfer::{ChunkAnswer, ChunkReply, ChunkRequest, ReceiveOutcome, VerifiedHashCache};
@@ -53,6 +54,8 @@ pub mod file_bytes;
 pub mod identity;
 pub mod operations;
 pub mod paths;
+pub mod preview;
+pub mod preview_fetch;
 pub mod transfer;
 pub mod transport;
 pub mod watcher;
@@ -126,6 +129,10 @@ impl ContentTarget {
 struct PeerContext {
     runtime_configuration: Arc<RwLock<RuntimeConfiguration>>,
     pending_fetches: PendingFetches,
+    /// Content-keyed preview relay, sibling to `pending_fetches`. Every peer
+    /// session holds a clone so a `PreviewRequest` forwarded on one link and its
+    /// `PreviewData`/`PreviewMiss` arriving on another share one waiter table.
+    pending_previews: PendingPreviews,
     change_sender: UnboundedSender<DaemonMessage>,
     command_sender: UnboundedSender<SyncDirectoryCommand>,
     /// Node-wide cache of verified content hashes (`path -> (mtime, size,
@@ -305,6 +312,11 @@ pub async fn run(
     // uploads). Cheap to clone (Arcs).
     let pending_fetches = crate::fetch::PendingFetches::new(runtime_configuration.clone());
 
+    // Sibling of `pending_fetches` for previews: a content-keyed waiter table
+    // shared by every peer session and `handle_changes`, so a preview requested
+    // on one link and answered on another resolve together. Cheap to clone.
+    let pending_previews = crate::preview_fetch::PendingPreviews::new(runtime_configuration.clone());
+
     let identity = Identity::load(paths.identity_path()).map_err(|source| RunError::Identity {
         path: paths.identity_path().to_path_buf(),
         source,
@@ -407,6 +419,7 @@ pub async fn run(
         configuration.clone(),
         runtime_configuration.clone(),
         pending_fetches.clone(),
+        pending_previews.clone(),
         database,
         change_receiver,
         change_sender.clone(),
@@ -421,6 +434,7 @@ pub async fn run(
     let peer_context = PeerContext {
         runtime_configuration: runtime_configuration.clone(),
         pending_fetches: pending_fetches.clone(),
+        pending_previews: pending_previews.clone(),
         change_sender: change_sender.clone(),
         command_sender: command_sender.clone(),
         verified_hashes: VerifiedHashCache::new(),
@@ -803,6 +817,7 @@ async fn run_peer_session<S>(
     let PeerContext {
         runtime_configuration,
         pending_fetches,
+        pending_previews,
         change_sender,
         command_sender,
         verified_hashes,
@@ -1567,6 +1582,61 @@ async fn run_peer_session<S>(
                             tag_id.to_string()
                         );
                     }
+                    Frame::Sync(SyncMessage::PreviewRequest {
+                        file_id,
+                        content_hash,
+                    }) => {
+                        // Serve if we hold the content locally (generating the
+                        // preview off the runtime), else relay across the tree.
+                        // We answer `PreviewData` even for `Preview::None`: a
+                        // holder that has the bytes but they are un-previewable
+                        // is authoritative, so downstream should cache that
+                        // negative result rather than keep asking.
+                        let short = content_hash.get(..8).unwrap_or(&content_hash);
+                        let local = read_local_if_hash_matches(
+                            &command_sender,
+                            file_id,
+                            &content_hash,
+                        )
+                        .await;
+
+                        if let Some(file_bytes) = local {
+                            let preview = generate_preview_from_local(file_id, file_bytes).await;
+                            log::debug!(
+                                "peer[{peer_name}]: served PreviewData {} [{short}]",
+                                file_id.to_string()
+                            );
+                            let _ = our_sender.send(Frame::Sync(SyncMessage::PreviewData {
+                                file_id,
+                                content_hash,
+                                preview,
+                            }));
+                        } else {
+                            log::debug!(
+                                "peer[{peer_name}]: [{short}] preview not served locally; relaying"
+                            );
+                            pending_previews
+                                .relay_preview_request(peer_public_key, file_id, content_hash)
+                                .await;
+                        }
+                    }
+                    Frame::Sync(SyncMessage::PreviewData {
+                        file_id,
+                        content_hash,
+                        preview,
+                    }) => {
+                        pending_previews
+                            .handle_preview_data(file_id, content_hash, preview)
+                            .await;
+                    }
+                    Frame::Sync(SyncMessage::PreviewMiss {
+                        file_id,
+                        content_hash,
+                    }) => {
+                        pending_previews
+                            .handle_preview_miss(peer_public_key, file_id, content_hash)
+                            .await;
+                    }
                 }
             }
         }
@@ -1585,6 +1655,10 @@ async fn run_peer_session<S>(
     // (rather than hanging until the TTL) and any request it was waiting on is
     // forgotten.
     pending_fetches.prune_link(peer_public_key).await;
+    // Same for the preview relay: any preview key only reachable through this
+    // link fails its downstream waiters (resolving them to `None`) rather than
+    // hanging until the TTL.
+    pending_previews.prune_link(peer_public_key).await;
 }
 
 async fn send_frame<S>(
@@ -2078,6 +2152,199 @@ async fn read_local_if_hash_matches(
                 file_id.to_string()
             );
             None
+        }
+    }
+}
+
+/// If this device is configured for eager previews, kick off preview generation
+/// for `file_id` now (fire-and-forget), so the preview is warm in the cache
+/// before anyone requests it.
+///
+/// Implemented by enqueuing a fire-and-forget [`DaemonMessage::GetPreview`]
+/// (the reply is discarded): it reuses the exact resolve-and-cache path, runs
+/// the CPU-heavy generation in `spawn_blocking` off the writer loop, and is a
+/// cheap no-op when the preview is already cached. Call this only after the
+/// file's bytes are known to be present locally (a completed peer transfer or a
+/// locally-observed file), so the local-first `resolve_preview` generates from
+/// disk rather than fetching from a peer.
+///
+/// A no-op unless `configuration.eager_previews` is set.
+fn maybe_eager_preview(
+    configuration: &Configuration,
+    change_sender: &UnboundedSender<DaemonMessage>,
+    file_id: FileId,
+) {
+    if !configuration.eager_previews {
+        return;
+    }
+    // Throwaway responder: we don't consume the result here, we only want the
+    // side effect of generating + caching it.
+    let (respond_to, _discard) = tokio::sync::oneshot::channel();
+    if change_sender
+        .send(DaemonMessage::GetPreview {
+            file_id,
+            respond_to,
+        })
+        .is_err()
+    {
+        log::debug!(
+            "maybe_eager_preview: change channel closed; skipping eager preview for {}",
+            file_id.to_string()
+        );
+    } else {
+        log::debug!(
+            "maybe_eager_preview: enqueued eager preview generation for {}",
+            file_id.to_string()
+        );
+    }
+}
+
+/// Resolve the preview for `(file_id, content_hash)` when it is not cached.
+///
+/// Presence-first, mirroring the byte-fetch policy: if the file is present
+/// locally (its bytes are on disk and hash-match), generate the preview here
+/// (off the async runtime, via `spawn_blocking`); otherwise flood a
+/// `PreviewRequest` across the peer tree and take the first responder. A file
+/// that no reachable peer holds resolves to [`Preview::None`] — a valid,
+/// cacheable "no preview" result, not an error.
+///
+/// Runs off the DB-writer loop; the caller re-enters via
+/// [`DaemonMessage::ApplyPreview`] to cache the result.
+async fn resolve_preview(
+    command_sender: &UnboundedSender<SyncDirectoryCommand>,
+    pending_previews: &PendingPreviews,
+    file_id: FileId,
+    content_hash: &str,
+) -> Preview {
+    // Bound how many source bytes we pull into memory for generation. Large
+    // enough for the image decoder's needs and any text snippet, capped so a
+    // huge file can't blow up the blocking task.
+    const MAX_PREVIEW_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+
+    let short = content_hash.get(..8).unwrap_or(content_hash);
+
+    // 1. Present locally? Generate from our own bytes.
+    //
+    // NOTE: `read_local_if_hash_matches` issues `SyncDirectoryCommand::ReadFile`,
+    // which reads *and hashes the whole file* to verify it matches
+    // `content_hash`. For a large file that hash is O(size) and is a prime
+    // suspect for a slow first preview — the timing below isolates it.
+    let local_read_start = std::time::Instant::now();
+    let local = read_local_if_hash_matches(command_sender, file_id, content_hash).await;
+    log::debug!(
+        "resolve_preview[{short}]: local ReadFile+verify for {} took {:?} (present={})",
+        file_id.to_string(),
+        local_read_start.elapsed(),
+        local.is_some()
+    );
+
+    if let Some(file_bytes) = local {
+        let read_bytes_start = std::time::Instant::now();
+        match file_bytes.read_all_bounded(MAX_PREVIEW_SOURCE_BYTES).await {
+            Ok((bytes, _complete)) => {
+                log::debug!(
+                    "resolve_preview[{short}]: read {} source bytes for generation in {:?}",
+                    bytes.len(),
+                    read_bytes_start.elapsed()
+                );
+                // Decoding/resizing/encoding is CPU-bound: run it on the
+                // blocking pool so the async runtime keeps serving other work.
+                let generate_start = std::time::Instant::now();
+                match tokio::task::spawn_blocking(move || crate::preview::generate(&bytes)).await {
+                    Ok(preview) => {
+                        log::debug!(
+                            "resolve_preview[{short}]: local generation for {} took {:?}",
+                            file_id.to_string(),
+                            generate_start.elapsed()
+                        );
+                        return preview;
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "resolve_preview: generation task panicked for {}: {error}",
+                            file_id.to_string()
+                        );
+                        return Preview::None;
+                    }
+                }
+            }
+            Err(error) => {
+                // Row said present but the read failed (deleted/racing). Fall
+                // through to asking peers rather than failing outright.
+                log::debug!(
+                    "resolve_preview: local read failed for {}: {:?}; asking peers",
+                    file_id.to_string(),
+                    error
+                );
+            }
+        }
+    }
+
+    // 2. Not present locally: ask peers. First responder wins; exhaustion or
+    // timeout resolves to `None`.
+    let peer_start = std::time::Instant::now();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    pending_previews
+        .request_preview_local(file_id, content_hash.to_owned(), reply_tx)
+        .await;
+
+    let result = match reply_rx.await {
+        Ok(PreviewReply::Data(preview)) => preview,
+        Ok(PreviewReply::Miss) | Err(_) => Preview::None,
+    };
+    log::debug!(
+        "resolve_preview[{short}]: peer fetch for {} took {:?}",
+        file_id.to_string(),
+        peer_start.elapsed()
+    );
+    result
+}
+
+/// Read `file_bytes` fully (bounded) and generate a [`Preview`] off the async
+/// runtime. Used by the holder side of a peer `PreviewRequest`. A read failure
+/// yields [`Preview::None`] (the requester falls back to other holders).
+async fn generate_preview_from_local(file_id: FileId, file_bytes: FileBytes) -> Preview {
+    const MAX_PREVIEW_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+
+    let read_start = std::time::Instant::now();
+    match file_bytes.read_all_bounded(MAX_PREVIEW_SOURCE_BYTES).await {
+        Ok((bytes, _complete)) => {
+            log::debug!(
+                "generate_preview_from_local: read {} source bytes for {} in {:?}",
+                bytes.len(),
+                file_id.to_string(),
+                read_start.elapsed()
+            );
+            // Time the whole blocking hop separately from the read: this
+            // includes any wait for a free blocking-pool thread *plus* the
+            // decode/resize/encode itself (which `preview::generate` logs
+            // internally).
+            let blocking_start = std::time::Instant::now();
+            match tokio::task::spawn_blocking(move || crate::preview::generate(&bytes)).await {
+                Ok(preview) => {
+                    log::debug!(
+                        "generate_preview_from_local: spawn_blocking(generate) for {} took {:?}",
+                        file_id.to_string(),
+                        blocking_start.elapsed()
+                    );
+                    preview
+                }
+                Err(error) => {
+                    log::error!(
+                        "generate_preview_from_local: task panicked for {}: {error}",
+                        file_id.to_string()
+                    );
+                    Preview::None
+                }
+            }
+        }
+        Err(error) => {
+            log::debug!(
+                "generate_preview_from_local: read failed for {}: {:?}",
+                file_id.to_string(),
+                error
+            );
+            Preview::None
         }
     }
 }
@@ -2839,6 +3106,7 @@ async fn handle_changes(
     configuration: Configuration,
     runtime_configuration: Arc<RwLock<RuntimeConfiguration>>,
     pending_fetches: PendingFetches,
+    pending_previews: PendingPreviews,
     mut database: FileDatabase,
     mut change_receiver: tokio::sync::mpsc::UnboundedReceiver<DaemonMessage>,
     change_sender: UnboundedSender<DaemonMessage>,
@@ -2978,6 +3246,7 @@ async fn handle_changes(
         runtime_configuration: &Arc<RwLock<RuntimeConfiguration>>,
         database: &mut FileDatabase,
         command_sender: &UnboundedSender<SyncDirectoryCommand>,
+        change_sender: &UnboundedSender<DaemonMessage>,
         content_change: ContentChange,
         change_origin: ChangeOrigin,
     ) {
@@ -3122,6 +3391,9 @@ async fn handle_changes(
                         },
                     )
                     .await;
+                    // Bytes just landed in our sync directories: warm the
+                    // preview cache now on an eager-preview device.
+                    maybe_eager_preview(configuration, change_sender, file_id);
                 } else {
                     // Known file: decide by whether this is already the version
                     // we currently hold (latest). Matching an *older* historical
@@ -3205,6 +3477,7 @@ async fn handle_changes(
                         },
                     )
                     .await;
+                    maybe_eager_preview(configuration, change_sender, file_id);
                 }
             }
             ContentChange::FileChanged {
@@ -3263,6 +3536,7 @@ async fn handle_changes(
                     },
                 )
                 .await;
+                maybe_eager_preview(configuration, change_sender, file_id);
             }
         }
     }
@@ -3642,6 +3916,131 @@ async fn handle_changes(
                 let _ = respond_to.send(Ok(()));
                 continue;
             }
+            DaemonMessage::GetPreview {
+                file_id,
+                respond_to,
+            } => {
+                // Overall stopwatch for this preview request, threaded through to
+                // the `ApplyPreview` re-entry so we can log the full
+                // request→reply latency in one place.
+                let request_start = std::time::Instant::now();
+
+                // Resolve the file's current content hash. An unknown file (no
+                // recorded version) has nothing to key a preview by.
+                let content_hash = match database.latest_version(file_id) {
+                    Ok(Some(version)) => version.content_hash,
+                    Ok(None) => {
+                        let _ = respond_to.send(Err(bus::PreviewError::UnknownFile));
+                        continue;
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "GetPreview: latest_version failed for {}: {:?}",
+                            file_id.to_string(),
+                            error
+                        );
+                        let _ = respond_to.send(Err(bus::PreviewError::UnknownFile));
+                        continue;
+                    }
+                };
+
+                // Cache hit (including a cached `Preview::None`): answer now.
+                match database.preview_for(file_id, &content_hash) {
+                    Ok(Some(preview)) => {
+                        log::debug!(
+                            "GetPreview: {} served from cache in {:?}",
+                            file_id.to_string(),
+                            request_start.elapsed()
+                        );
+                        let _ = respond_to.send(Ok(preview));
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        log::error!(
+                            "GetPreview: preview_for failed for {}: {:?}",
+                            file_id.to_string(),
+                            error
+                        );
+                        // Fall through and try to (re)generate.
+                    }
+                }
+
+                log::debug!(
+                    "GetPreview: {} cache miss; resolving off-loop (hash resolution + cache \
+                     lookup took {:?})",
+                    file_id.to_string(),
+                    request_start.elapsed()
+                );
+
+                // Cache miss: resolve the preview off the writer loop, then
+                // re-enter via `ApplyPreview` to cache it and reply. This
+                // mirrors `Fetch`→`Materialize`: generation (`spawn_blocking`)
+                // and any peer round-trip must never block the sole DB writer.
+                let command_sender_preview = command_sender.clone();
+                let pending_previews_preview = pending_previews.clone();
+                let change_sender_preview = change_sender.clone();
+                tokio::spawn(async move {
+                    let resolve_start = std::time::Instant::now();
+                    let preview = resolve_preview(
+                        &command_sender_preview,
+                        &pending_previews_preview,
+                        file_id,
+                        &content_hash,
+                    )
+                    .await;
+                    log::debug!(
+                        "GetPreview: {} resolve_preview took {:?} (total since request: {:?})",
+                        file_id.to_string(),
+                        resolve_start.elapsed(),
+                        request_start.elapsed()
+                    );
+
+                    if change_sender_preview
+                        .send(DaemonMessage::ApplyPreview {
+                            file_id,
+                            content_hash,
+                            preview,
+                            respond_to,
+                        })
+                        .is_err()
+                    {
+                        log::error!(
+                            "GetPreview: change channel closed; cannot apply preview for {}",
+                            file_id.to_string()
+                        );
+                        // `respond_to` moved into the failed send; the waiter
+                        // observes the shutting-down case via timeout.
+                    }
+                });
+
+                continue;
+            }
+            DaemonMessage::ApplyPreview {
+                file_id,
+                content_hash,
+                preview,
+                respond_to,
+            } => {
+                // Cache the resolved preview on the writer loop, then reply.
+                // Best-effort caching: a DB error still returns the preview to
+                // the caller (they just don't get the cache benefit next time).
+                let cache_write_start = std::time::Instant::now();
+                if let Err(error) = database.record_preview(file_id, &content_hash, &preview) {
+                    log::error!(
+                        "ApplyPreview: record_preview failed for {}: {:?}",
+                        file_id.to_string(),
+                        error
+                    );
+                }
+                log::debug!(
+                    "ApplyPreview: {} cache write took {:?}; replying to caller",
+                    file_id.to_string(),
+                    cache_write_start.elapsed()
+                );
+                let _ = respond_to.send(Ok(preview));
+                continue;
+            }
             DaemonMessage::ReconcilePlacement { file_id } => {
                 // Connect-time placement sweep, handed off from a peer session so
                 // the fetch runs here (not on the session's frame loop). If a
@@ -3825,6 +4224,10 @@ async fn handle_changes(
                 // forwarded when it was first handled (announce time). `origin`
                 // is unused now that we neither record nor re-announce here.
                 let _ = origin;
+                // Bytes for this version are now on disk locally: on an
+                // eager-preview device, warm the preview cache now so a later
+                // peer `PreviewRequest` is a cache hit rather than a decode.
+                maybe_eager_preview(&configuration, &change_sender, file_id);
                 continue;
             }
             DaemonMessage::AnnounceProvided {
@@ -3923,6 +4326,7 @@ async fn handle_changes(
                     &runtime_configuration,
                     &mut database,
                     &command_sender,
+                    &change_sender,
                     content_change,
                     change_origin,
                 )

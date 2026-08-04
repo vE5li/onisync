@@ -197,6 +197,33 @@ impl FileBytes {
         }
     }
 
+    /// Read the entire content into memory, up to `max_len` bytes.
+    ///
+    /// Returns `(bytes, complete)` where `complete` is `true` iff the whole file
+    /// fit within `max_len` (i.e. it was not truncated). Used by preview
+    /// generation, which needs the full bytes in memory to decode/snippet but
+    /// must be bounded so an enormous file cannot exhaust memory — the caller
+    /// decides what a truncated read means for each preview kind.
+    pub async fn read_all_bounded(
+        &self,
+        max_len: usize,
+    ) -> Result<(Vec<u8>, bool), FileBytesError> {
+        match self {
+            FileBytes::InMemory(bytes) => {
+                let complete = bytes.len() <= max_len;
+                Ok((bytes[..bytes.len().min(max_len)].to_vec(), complete))
+            }
+            FileBytes::FileToCopy(_) | FileBytes::FileToMove(_) => {
+                let total = self.byte_len().await?;
+                let (bytes, _last) = self.read_chunk_at(0, max_len).await?;
+                // Complete iff the whole file fit within `max_len` (i.e. we did
+                // not stop short of the end).
+                let complete = total as usize <= bytes.len();
+                Ok((bytes, complete))
+            }
+        }
+    }
+
     /// Compute the BLAKE3 hex digest of this content, streaming from disk for
     /// the file-backed variants so the whole file is never held in memory.
     ///

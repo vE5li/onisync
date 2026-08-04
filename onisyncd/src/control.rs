@@ -49,7 +49,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use onisync_core::{FileId, FileInfo, TagId};
+use onisync_core::{FileId, FileInfo, Preview, TagId};
 use serde::{Deserialize, Serialize};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -163,6 +163,11 @@ pub enum ControlRequest {
         file_id: FileId,
         expected_hash: String,
     },
+    /// Get the preview for a file's current content (cached / generated /
+    /// peer-fetched). Answered with [`ControlResponse::Preview`].
+    GetPreview {
+        file_id: FileId,
+    },
     /// Resolve a file's absolute on-disk path if present locally. Answered with
     /// [`ControlResponse::LocalPath`].
     LocalPathForFile {
@@ -232,6 +237,9 @@ pub enum ControlResponse {
     /// client consumes the temp file with move semantics (rename into place or
     /// delete). No file bytes cross the socket.
     FilePath(PathBuf),
+    /// A file's preview (answer to [`ControlRequest::GetPreview`]).
+    /// [`Preview::None`] is a valid result (the content has no preview).
+    Preview(Preview),
     /// A file's absolute on-disk path, or `None` if not present locally (answer
     /// to [`ControlRequest::LocalPathForFile`]).
     LocalPath(Option<PathBuf>),
@@ -674,6 +682,10 @@ async fn dispatch(
             expected_hash,
         } => match api.fetch_file(file_id, expected_hash).await {
             Ok(path) => ControlResponse::FilePath(path),
+            Err(error) => ControlResponse::Error(error),
+        },
+        ControlRequest::GetPreview { file_id } => match api.get_preview(file_id).await {
+            Ok(preview) => ControlResponse::Preview(preview),
             Err(error) => ControlResponse::Error(error),
         },
         ControlRequest::LocalPathForFile { file_id } => {
@@ -1302,6 +1314,13 @@ impl TransportBackend for IpcClientBackend {
             .await?
         {
             ControlResponse::FilePath(path) => Ok(path),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn get_preview(&self, file_id: FileId) -> Result<Preview, ApiError> {
+        match self.call(ControlRequest::GetPreview { file_id }).await? {
+            ControlResponse::Preview(preview) => Ok(preview),
             other => Err(unexpected(other)),
         }
     }

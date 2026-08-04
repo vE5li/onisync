@@ -16,7 +16,7 @@
 // exactly how `flutter_rust_bridge_codegen` references them in the generated
 // `frb_generated.rs`. A plain private `use` would not be visible through that
 // glob and the generated code fails to compile.
-pub use onisync_core::{FileId, FileInfo, TagId};
+pub use onisync_core::{FileId, FileInfo, Preview, TagId};
 pub use onisyncd::api::{ApiError, ApiEvent};
 pub use onisyncd::database::{DeletedRule, SubtagRule, Tag};
 pub use onisyncd::operations::{
@@ -67,6 +67,68 @@ impl From<FileInfo> for FileEntry {
             size: info.size as i64,
             short_id_length: info.short_id_length as i64,
             deleted: info.deleted,
+        }
+    }
+}
+
+/// Which kind of content a [`PreviewEntry`] carries. Mirrors the variants of
+/// the core [`Preview`] enum as a flat tag the Dart UI can switch on.
+pub enum PreviewKind {
+    /// A small raster image; `PreviewEntry.image_bytes`/`width`/`height` are set.
+    Image,
+    /// A short text snippet; `PreviewEntry.text` is set.
+    Text,
+    /// No preview for this content (un-previewable type). All payload fields
+    /// are empty/None.
+    None,
+}
+
+/// A file preview flattened for the Dart UI (see [`FileEntry`] for why a DTO).
+///
+/// The core [`Preview`] is an enum with per-variant payloads; frb cannot see
+/// inside a foreign enum, so this flattens it into one struct with a `kind`
+/// discriminant plus optional fields. Exactly the fields relevant to `kind` are
+/// populated:
+/// - `Image`: `image_bytes` (an encoded PNG the UI decodes directly), `width`,
+///   `height`.
+/// - `Text`: `text`.
+/// - `None`: nothing.
+pub struct PreviewEntry {
+    pub kind: PreviewKind,
+    pub image_bytes: Option<Vec<u8>>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub text: Option<String>,
+}
+
+impl From<Preview> for PreviewEntry {
+    fn from(preview: Preview) -> Self {
+        match preview {
+            Preview::Image {
+                bytes,
+                width,
+                height,
+            } => Self {
+                kind: PreviewKind::Image,
+                image_bytes: Some(bytes),
+                width: Some(width),
+                height: Some(height),
+                text: None,
+            },
+            Preview::Text(text) => Self {
+                kind: PreviewKind::Text,
+                image_bytes: None,
+                width: None,
+                height: None,
+                text: Some(text),
+            },
+            Preview::None => Self {
+                kind: PreviewKind::None,
+                image_bytes: None,
+                width: None,
+                height: None,
+                text: None,
+            },
         }
     }
 }
@@ -509,6 +571,23 @@ impl OniSyncApp {
             .local_path_for_file(file_id)
             .await?
             .map(|path| path.to_string_lossy().into_owned()))
+    }
+
+    /// Get the preview for `file_id`'s current content as a flat
+    /// [`PreviewEntry`].
+    ///
+    /// The daemon returns a cached preview, generates one from local bytes, or
+    /// fetches one from a peer (first responder wins) — the UI does not need to
+    /// know which. A file whose content has no preview comes back with
+    /// `PreviewEntry.kind == PreviewKind::None` (a successful result). Errors
+    /// `NotFound` only if the id itself is unknown.
+    pub async fn get_preview_by_string(
+        &self,
+        file_id: String,
+    ) -> Result<PreviewEntry, ApiError> {
+        let backend = self.try_backend()?;
+        let file_id = backend.resolve_file_id(file_id).await?;
+        Ok(PreviewEntry::from(backend.get_preview(file_id).await?))
     }
 
     /// Fetch `file_id`'s content on demand (from a peer if no local sync

@@ -20,7 +20,7 @@
 //! peers lives entirely in `handle_changes`/the peer sessions.
 
 use onisync_core::state::{Change, ChangeOrigin};
-use onisync_core::{FileId, LogicalPath, TagId};
+use onisync_core::{FileId, LogicalPath, Preview, TagId};
 use tokio::sync::oneshot;
 
 use crate::file_bytes::FileBytes;
@@ -212,6 +212,35 @@ pub enum DaemonMessage {
         restored_at: i64,
         respond_to: oneshot::Sender<Result<(), RestoreError>>,
     },
+    /// Request the preview for `file_id`'s current content. Request-reply, like
+    /// [`DaemonMessage::Fetch`], and handled on the writer loop because the
+    /// preview cache (`previews_v1`) is part of the main DB (sole-writer).
+    ///
+    /// `handle_changes` resolves the file's current `content_hash`, then:
+    /// 1. returns any cached preview for `(file_id, content_hash)`;
+    /// 2. else, if the bytes are present locally, generates the preview
+    ///    off-loop (`spawn_blocking`), caches it via `ApplyPreview`, and
+    ///    replies;
+    /// 3. else floods a `PreviewRequest` across the peer tree and caches +
+    ///    replies with the first response (or `Preview::None` if none holds it).
+    GetPreview {
+        file_id: FileId,
+        respond_to: oneshot::Sender<Result<Preview, PreviewError>>,
+    },
+    /// Internal follow-up to [`DaemonMessage::GetPreview`], enqueued by the
+    /// off-loop generation / peer-fetch task once a preview is resolved. Handled
+    /// on the writer loop so the cache write (`record_preview`) happens on the
+    /// sole DB writer, then the caller's `respond_to` is fulfilled.
+    ///
+    /// Split out from `GetPreview` (mirroring `Fetch`→`Materialize` and
+    /// `Restore`→`ApplyRestore`) so slow generation / network work never blocks
+    /// the single-threaded consumer.
+    ApplyPreview {
+        file_id: FileId,
+        content_hash: String,
+        preview: Preview,
+        respond_to: oneshot::Sender<Result<Preview, PreviewError>>,
+    },
 }
 
 /// A command sent to a specific peer's live session by `handle_changes`.
@@ -305,6 +334,29 @@ impl std::fmt::Display for RestoreError {
                 formatter.write_str("no source holds the file's bytes; cannot restore")
             }
             RestoreError::ShuttingDown => formatter.write_str("runtime is shutting down"),
+        }
+    }
+}
+
+/// Why a preview request failed.
+///
+/// Note that "no peer holds the content" is *not* an error: it resolves to
+/// [`Preview::None`]. This enum covers only genuine failures (the file is
+/// unknown, or the daemon is shutting down / its internals dropped a channel).
+#[derive(Debug, Clone)]
+pub enum PreviewError {
+    /// The file id is not in the catalog (no recorded version to key a preview
+    /// by). Distinct from a known file that simply has no preview.
+    UnknownFile,
+    /// The runtime is shutting down, or an internal responder was dropped.
+    ShuttingDown,
+}
+
+impl std::fmt::Display for PreviewError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PreviewError::UnknownFile => formatter.write_str("file is not known to the catalog"),
+            PreviewError::ShuttingDown => formatter.write_str("runtime is shutting down"),
         }
     }
 }

@@ -151,6 +151,13 @@ pub struct SyncDirectoryManager {
     command_receiver: tokio::sync::mpsc::UnboundedReceiver<SyncDirectoryCommand>,
     // TODO: Make this a more robust messaging framework instead of a ref cell.
     self_writes: RefCell<HashMap<PathBuf, SelfWrite>>,
+    /// Whether this device eagerly warms the preview cache. Mirrors
+    /// [`Configuration::eager_previews`]; consulted during `run_initial_sync`
+    /// so that files which were *unchanged* while the daemon was off (and so
+    /// produce no `ContentChange` on startup) still get a preview generated
+    /// retroactively. Live changes already flow through `handle_content_change`,
+    /// which warms them itself.
+    eager_previews: bool,
 }
 
 impl SyncDirectoryManager {
@@ -163,6 +170,8 @@ impl SyncDirectoryManager {
         let (mut dispatcher, watcher_events) = WatchDispatcher::new()
             .await
             .expect("Failed to set up debouncer");
+
+        let eager_previews = configuration.eager_previews;
 
         let sync_directories = configuration
             .sync_directories
@@ -213,7 +222,29 @@ impl SyncDirectoryManager {
             watcher_events,
             command_receiver,
             self_writes: Default::default(),
+            eager_previews,
         }
+    }
+
+    /// Retroactively warm the preview cache for a locally-present, *unchanged*
+    /// file during the initial sync.
+    ///
+    /// Live changes (add/modify) already route through the ingest bus and get a
+    /// preview via `handle_content_change`; a file that was untouched while the
+    /// daemon was off produces no such change, so on an eager-preview device we
+    /// nudge it here. Fire-and-forget `GetPreview` (reply discarded): it reuses
+    /// the resolve-and-cache path, generates off the writer loop, and is a cheap
+    /// no-op when the preview is already cached — so re-running the initial sync
+    /// does not re-decode. A no-op unless `eager_previews` is set.
+    fn maybe_eager_preview(&self, file_id: FileId) {
+        if !self.eager_previews {
+            return;
+        }
+        let (respond_to, _discard) = tokio::sync::oneshot::channel();
+        let _ = self.change_sender.send(DaemonMessage::GetPreview {
+            file_id,
+            respond_to,
+        });
     }
 
     /// Record that the daemon itself just wrote `path`, so the resulting
@@ -662,6 +693,12 @@ impl SyncDirectoryManager {
                         error
                     );
                 }
+                // `update_file_content` enqueues a `FileChanged`, which warms
+                // the preview via `handle_content_change`; nothing to do here.
+            } else {
+                // Unchanged while offline: no `ContentChange` is emitted, so
+                // retroactively warm its preview (no-op if already cached).
+                self.maybe_eager_preview(sync_file.file_id);
             }
         }
 
@@ -777,6 +814,12 @@ impl SyncDirectoryManager {
                         error
                     );
                 }
+                // `update_file_content` enqueues a `FileChanged`, which warms
+                // the preview via `handle_content_change`; nothing to do here.
+            } else {
+                // Unchanged while offline: no `ContentChange` is emitted, so
+                // retroactively warm its preview (no-op if already cached).
+                self.maybe_eager_preview(sync_file.file_id);
             }
         }
 
@@ -1428,7 +1471,11 @@ impl SyncDirectoryManager {
                     // the file.
                     let physical_path = file.physical_path.clone();
                     let absolute_path = sync_directory.path.join(physical_path.as_str());
-                    let (content, content_hash, _size) =
+                    // `get_file_content` hashes the entire file (O(size)); time it
+                    // so a slow preview/fetch on a large file is attributable to
+                    // this verify step rather than the preview generation itself.
+                    let read_start = std::time::Instant::now();
+                    let (content, content_hash, size) =
                         match self.get_file_content(&absolute_path).await {
                             Ok(triple) => triple,
                             Err(error) => {
@@ -1441,6 +1488,12 @@ impl SyncDirectoryManager {
                                 continue;
                             }
                         };
+                    log::debug!(
+                        "ReadFile: hashed {} ({} bytes) in {:?}",
+                        absolute_path.to_string_lossy(),
+                        size,
+                        read_start.elapsed()
+                    );
                     response = Some((physical_path, content, content_hash));
                     break;
                 }
@@ -1819,6 +1872,7 @@ mod tests {
             listen_port: None,
             peers: Vec::new(),
             tags: Vec::new(),
+            eager_previews: false,
         };
         let paths = Paths::new(data_dir, data_dir.join("identity"));
         let (change_sender, _change_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -2001,6 +2055,7 @@ mod tests {
             listen_port: None,
             peers: Vec::new(),
             tags: Vec::new(),
+            eager_previews: false,
         };
         let paths = Paths::new(&data_dir, data_dir.join("identity"));
         let (change_sender, mut change_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -2068,6 +2123,7 @@ mod tests {
             listen_port: None,
             peers: Vec::new(),
             tags: Vec::new(),
+            eager_previews: false,
         };
         let paths = Paths::new(data_dir, data_dir.join("identity"));
         let (change_sender, change_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -2234,6 +2290,7 @@ mod tests {
             listen_port: None,
             peers: Vec::new(),
             tags: Vec::new(),
+            eager_previews: false,
         };
         let paths = Paths::new(&data_dir, data_dir.join("identity"));
         let (change_sender, _change_receiver) = tokio::sync::mpsc::unbounded_channel();

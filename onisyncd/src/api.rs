@@ -25,12 +25,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use onisync_core::state::{Change, ChangeOrigin};
-use onisync_core::{FileId, FileInfo, LogicalPath, TagId};
+use onisync_core::{FileId, FileInfo, LogicalPath, Preview, TagId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{broadcast, oneshot};
 
-use crate::bus::{DaemonMessage, FetchError, Ingest, RestoreError};
+use crate::bus::{DaemonMessage, FetchError, Ingest, PreviewError, RestoreError};
 use crate::database::{DatabaseError, DeletedRule, FileDatabase, QueryTerm, SubtagRule, Tag};
 use crate::directory_manager::SyncDirectoryCommand;
 use crate::fetch::PendingFetches;
@@ -119,6 +119,16 @@ impl From<RestoreError> for ApiError {
             RestoreError::NotAvailable => ApiError::NotFound,
             RestoreError::NotDeleted => ApiError::InvalidArgument(error.to_string()),
             RestoreError::ShuttingDown => ApiError::Internal(error.to_string()),
+        }
+    }
+}
+
+impl From<PreviewError> for ApiError {
+    fn from(error: PreviewError) -> Self {
+        match error {
+            // The file id isn't in the catalog at all.
+            PreviewError::UnknownFile => ApiError::NotFound,
+            PreviewError::ShuttingDown => ApiError::Internal(error.to_string()),
         }
     }
 }
@@ -748,6 +758,47 @@ impl Api {
             ApiError::Internal(format!("failed to stage fetched file: {error}"))
         })?;
         Ok(dest)
+    }
+
+    /// Get the preview for `file_id`'s current content.
+    ///
+    /// Enqueues a [`DaemonMessage::GetPreview`] onto the ingest bus;
+    /// `handle_changes` returns any cached preview, else generates it locally
+    /// (if the bytes are present) or requests it from a peer (first responder
+    /// wins), caching the result in `previews_v1` before replying.
+    ///
+    /// A file with no previewable content resolves to [`Preview::None`] — that
+    /// is a successful result, not an error. `ApiError::NotFound` means the file
+    /// id itself is unknown to the catalog.
+    pub async fn get_preview(&self, file_id: FileId) -> Result<Preview, ApiError> {
+        // End-to-end stopwatch for the whole daemon-side request (bus enqueue →
+        // handle_changes resolution → reply). Combined with the finer-grained
+        // logs inside `handle_changes`, this shows how much time is the actual
+        // work vs. queueing behind other messages on the single-writer bus.
+        let api_start = std::time::Instant::now();
+        log::debug!("Api::get_preview: requesting preview for {}", file_id.to_string());
+
+        let (respond_to, response) = oneshot::channel();
+        self.change_sender
+            .send(DaemonMessage::GetPreview {
+                file_id,
+                respond_to,
+            })
+            .map_err(|_| ApiError::Internal("runtime is shutting down".to_owned()))?;
+
+        let result = match tokio::time::timeout(Self::FETCH_TIMEOUT, response).await {
+            Ok(Ok(result)) => result.map_err(ApiError::from),
+            // The responder was dropped without sending — treat as shutdown.
+            Ok(Err(_recv_error)) => Err(ApiError::Internal(PreviewError::ShuttingDown.to_string())),
+            Err(_elapsed) => Err(ApiError::Internal(FetchError::TimedOut.to_string())),
+        };
+        log::debug!(
+            "Api::get_preview: preview for {} resolved in {:?} (ok={})",
+            file_id.to_string(),
+            api_start.elapsed(),
+            result.is_ok()
+        );
+        result
     }
 
     /// Resolve `file_id` to the absolute on-disk path where its bytes currently

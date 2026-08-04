@@ -18,6 +18,7 @@ import '../rust/api.dart' as onisync;
 import '../onisync_service.dart';
 import '../widgets/file_preview.dart';
 import '../widgets/property_tile.dart';
+import '../widgets/remote_preview.dart';
 import '../widgets/tag_chip.dart';
 import 'tag_detail_screen.dart';
 
@@ -630,11 +631,16 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     return '${value.toStringAsFixed(1)} ${units[unit]}';
   }
 
-  /// The file's inline preview, or a placeholder if no local copy is present.
+  /// The file's inline preview.
   ///
-  /// Not every known file has bytes on this device: peers can advertise files
-  /// whose content we haven't fetched yet. In that case `_localPath` is null
-  /// and we render a neutral "not synced" tile instead of the preview widget.
+  /// Two sources, picked by local presence:
+  /// - The bytes are on disk (`_localPath != null`): render the full-fidelity
+  ///   [FilePreview] straight from disk (full-res image, more text).
+  /// - Not present locally: peers can advertise files whose content we haven't
+  ///   fetched. Fall back to the daemon's small cacheable preview
+  ///   ([RemotePreview]) — a low-res thumbnail or short snippet fetched from a
+  ///   peer — so there's still something to show without pulling the whole file.
+  ///
   /// Preview height is bounded so it never crowds out the tags/properties.
   Widget _buildPreview(BuildContext context, onisync.FileEntry file) {
     final theme = Theme.of(context);
@@ -642,23 +648,26 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     final header = Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16),
       child: Text(
-        'Preview',
+        path == null ? 'Remote preview' : 'Preview',
         style: theme.textTheme.labelMedium?.copyWith(
           color: theme.colorScheme.onSurfaceVariant,
           fontWeight: FontWeight.bold,
         ),
       ),
     );
-    final body = path == null
-        ? ListTile(
-            leading: const Icon(Icons.cloud_off_outlined),
-            title: const Text('Not available locally'),
-            subtitle: const Text('No sync directory on this device holds a copy.'),
-          )
-        : ConstrainedBox(
-            constraints: const BoxConstraints(maxHeight: 360),
-            child: FilePreview(path: path),
-          );
+    final body = ConstrainedBox(
+      constraints: const BoxConstraints(maxHeight: 360),
+      child: path == null
+          // Keyed by content hash so a content change refetches (the
+          // RemotePreview widget also guards this via didUpdateWidget).
+          ? RemotePreview(
+              key: ValueKey('remote-preview-${file.fileId}-${file.contentHash}'),
+              app: _app,
+              fileId: file.fileId,
+              contentHash: file.contentHash,
+            )
+          : FilePreview(path: path),
+    );
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [header, body],
