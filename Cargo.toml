@@ -22,7 +22,14 @@ infer = { version = "0.16", default-features = false }
 # onisyncd's `preview-generation` feature. `image_latest` pins the same `image`
 # crate version we use elsewhere (0.25) so `PdfBitmap::as_image()` yields a
 # compatible `DynamicImage`.
-pdfium-render = { version = "0.9", default-features = false, features = ["image_latest", "pdfium_latest", "thread_safe"] }
+#
+# The `pdfium_*` API version MUST NOT be newer than the `libpdfium.so` we bind
+# at runtime, or newer symbols the crate references fail to resolve at load time
+# (e.g. `undefined symbol: FPDFTextObj_SetFontSize`). nixpkgs pins
+# `pdfium-binaries` at build 7749; `pdfium_7543` is the highest crate-supported
+# API version <= 7749, so every bound symbol exists in that binary. Bump this to
+# track nixpkgs' pdfium when it updates.
+pdfium-render = { version = "0.9", default-features = false, features = ["image_latest", "pdfium_7543", "thread_safe"] }
 # Pinned to the exact version of `flutter_rust_bridge_codegen` in the dev shell
 # (flake.nix); the runtime crate and the generator must match.
 flutter_rust_bridge = "=2.12.0"
