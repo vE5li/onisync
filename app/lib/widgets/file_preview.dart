@@ -37,8 +37,13 @@ class FilePreview extends StatelessWidget {
     final ext = _ext;
 
     if (_imageExts.contains(ext)) {
+      // Center the image (like the remote preview) rather than pinning it
+      // top-left, which is InteractiveViewer's default child alignment.
       return InteractiveViewer(
-        child: Image.file(file, fit: BoxFit.contain),
+        alignment: Alignment.center,
+        child: Center(
+          child: Image.file(file, fit: BoxFit.contain),
+        ),
       );
     }
 

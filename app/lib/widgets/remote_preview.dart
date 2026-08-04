@@ -101,21 +101,18 @@ class _RemotePreviewState extends State<RemotePreview> {
             subtitle: 'The preview image could not be decoded.',
           );
         }
-        // Low-resolution thumbnail from the daemon; center it and cap its
-        // rendered size so a tiny image is not blurrily upscaled to fill the
-        // box. `filterQuality: none` keeps the small source crisp.
+        // Low-resolution thumbnail from the daemon. Fill the available box
+        // (like the local FilePreview) rather than drawing at the tiny native
+        // size; `BoxFit.contain` preserves aspect ratio. It's a small preview,
+        // so upscaling looks blocky — that's fine.
         return Padding(
           padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
-          child: Row(
-            children: [
-              Image.memory(
-                bytes,
-                width: preview.width?.toDouble(),
-                height: preview.height?.toDouble(),
-                fit: BoxFit.contain,
-                filterQuality: FilterQuality.none,
-              ),
-            ],
+          child: SizedBox(
+            width: double.infinity,
+            child: Image.memory(
+              bytes,
+              fit: BoxFit.contain,
+            ),
           ),
         );
       case onisync.PreviewKind.text:
