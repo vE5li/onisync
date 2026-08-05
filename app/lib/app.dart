@@ -7,6 +7,7 @@
 // its own change-stream subscription); the actual pixels live in screens/.
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'bootstrap/bootstrap.dart';
 import 'screens/home_screen.dart';
@@ -38,6 +39,32 @@ class _OniSyncAppState extends State<OniSyncApp> {
   void initState() {
     super.initState();
     _boot();
+    // Global Ctrl+C = "go back": pop the current route regardless of which
+    // screen is focused. We hook `HardwareKeyboard` directly (rather than
+    // wrapping the app in Shortcuts/Actions) so the shortcut fires no
+    // matter where focus currently sits — mirrors the Ctrl+F handler in
+    // home_screen.dart. Suppressed while an editable text widget has
+    // focus so it doesn't clobber the standard "copy" affordance.
+    HardwareKeyboard.instance.addHandler(_handleGlobalKey);
+  }
+
+  bool _handleGlobalKey(KeyEvent event) {
+    if (event is! KeyDownEvent) return false;
+    if (event.logicalKey != LogicalKeyboardKey.keyC) return false;
+    if (!HardwareKeyboard.instance.isControlPressed) return false;
+    // Don't hijack Ctrl+C from a text field — the user probably means copy.
+    final focus = FocusManager.instance.primaryFocus?.context;
+    if (focus != null &&
+        focus.findAncestorWidgetOfExactType<EditableText>() != null) {
+      return false;
+    }
+    final nav = _navigatorKey.currentState;
+    if (nav == null) return false;
+    // `maybePop` returns false when at the root — in that case we don't
+    // want to swallow the event (there's nothing to pop, and consuming it
+    // could suppress a legitimate downstream handler).
+    nav.maybePop();
+    return true;
   }
 
   Future<void> _boot() async {
@@ -73,6 +100,7 @@ class _OniSyncAppState extends State<OniSyncApp> {
 
   @override
   void dispose() {
+    HardwareKeyboard.instance.removeHandler(_handleGlobalKey);
     widget.bootstrap.dispose();
     super.dispose();
   }
@@ -83,6 +111,15 @@ class _OniSyncAppState extends State<OniSyncApp> {
       title: 'OniSync',
       scaffoldMessengerKey: _messengerKey,
       navigatorKey: _navigatorKey,
+      themeMode: ThemeMode.dark,
+      darkTheme: ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.dark,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.indigo,
+          brightness: Brightness.dark,
+        ),
+      ),
       home: HomeScreen(session: _session),
     );
   }

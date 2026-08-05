@@ -340,10 +340,17 @@
         # long-lived process the user runs via systemd or cargo; the flake does
         # not build or manage it, and the app attaches to its control socket at
         # launch.
+        #
+        # We build in release mode so the produced bundle at
+        # app/build/linux/x64/release/bundle/onisync_app is a real,
+        # standalone-launchable binary — `flutter run` itself is slow to start
+        # (device daemon, hot-reload VM service, incremental compiler), but the
+        # resulting binary boots instantly, so a wrapper script can exec it
+        # directly and skip all of `flutter run`'s overhead.
         launchLinuxBody = ''
           # Select the daemon-attach backend at build time (the Dart sources are
           # shared with Android; only this define differs).
-          ( cd app && flutter run -d linux \
+          ( cd app && flutter run --release -d linux \
               --dart-define=ONISYNC_BACKEND=linux )
         '';
       in {

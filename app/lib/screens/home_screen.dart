@@ -74,6 +74,21 @@ class _HomeScreenState extends State<HomeScreen> {
   /// stabilises.
   bool _watching = false;
 
+  /// Stable pool of focus nodes for the visible result rows, in render
+  /// order (tags → create-tag → files). The list grows lazily as the query
+  /// returns more rows and is never shrunk — extra nodes just don't get
+  /// attached — so a rebuild triggered by the change stream mid-navigation
+  /// can't dispose the currently-focused node out from under the user
+  /// (which used to cause focus to snap back to a previous row on Up).
+  ///
+  /// All entries are disposed in [dispose]; unused entries are cheap.
+  final List<FocusNode> _rowFocus = [];
+
+  /// Number of row focus nodes actually bound to a visible row in the most
+  /// recent build. Used by the arrow-key handlers to clamp navigation and
+  /// by [_handleSubmit] to decide whether there is anything to focus.
+  int _activeRowCount = 0;
+
   @override
   void initState() {
     super.initState();
@@ -111,6 +126,9 @@ class _HomeScreenState extends State<HomeScreen> {
     _query.removeListener(_onQueryChanged);
     _query.dispose();
     _queryFocus.dispose();
+    for (final node in _rowFocus) {
+      node.dispose();
+    }
     super.dispose();
   }
 
@@ -199,6 +217,185 @@ class _HomeScreenState extends State<HomeScreen> {
     return text;
   }
 
+  /// Handle Enter in the search field.
+  ///
+  /// If the results list contains exactly one entry (across tags, the
+  /// create-tag affordance, and files combined) we activate it directly —
+  /// there's no ambiguity, and this preserves the fast "type + Enter to
+  /// open" flow for common cases like resolving a query down to a single
+  /// tag or offering to create a fresh tag name. Otherwise (two or more
+  /// entries, or none) we hand focus to the first row instead, so the user
+  /// can arrow-key their way to the desired result without tabbing past the
+  /// AppBar actions.
+  ///
+  /// Flushes any pending debounced query first so Enter works even when the
+  /// user types and immediately hits Enter, before the 200 ms debounce has
+  /// fired.
+  Future<void> _handleSubmit() async {
+    final session = widget.session;
+    if (session == null) return;
+    if (_debounce?.isActive ?? false) {
+      _debounce!.cancel();
+      await _runQuery();
+    }
+    if (!mounted) return;
+    final results = _results;
+    if (results == null) return;
+    final candidate = _createCandidate;
+    final total = results.tags.length +
+        (candidate != null ? 1 : 0) +
+        results.files.length;
+    if (total == 1) {
+      if (results.tags.length == 1) {
+        // Sole result is a tag; open it and restore focus to row 0 on
+        // return so a subsequent Enter re-opens the same tag.
+        await _openTag(results.tags.first, restoreIndex: 0);
+      } else if (candidate != null) {
+        await _createTag(candidate);
+      } else {
+        await _openFile(results.files.first, restoreIndex: 0);
+      }
+      return;
+    }
+    // Zero or 2+ results: move keyboard focus onto the first row (if any)
+    // so arrow keys traverse the list. `_rowFocus[0]` is attached to
+    // whichever row renders first in `_buildResults`.
+    if (total >= 2 && _rowFocus.isNotEmpty) {
+      _rowFocus[0].requestFocus();
+    }
+  }
+
+  /// Ensure `_rowFocus` has at least [count] entries, creating new nodes on
+  /// demand. Never shrinks — see the field docstring.
+  void _ensureRowFocusCapacity(int count) {
+    while (_rowFocus.length < count) {
+      _rowFocus.add(FocusNode(debugLabel: 'row${_rowFocus.length}'));
+    }
+  }
+
+  /// Index of the currently-focused row within `_rowFocus`, or -1 if none.
+  /// We match by primary focus rather than `hasFocus` because parent focus
+  /// scopes report `hasFocus == true` on ancestors too.
+  int _focusedRowIndex() {
+    final primary = FocusManager.instance.primaryFocus;
+    if (primary == null) return -1;
+    for (var i = 0; i < _activeRowCount; i++) {
+      if (identical(_rowFocus[i], primary)) return i;
+    }
+    return -1;
+  }
+
+  /// ArrowDown on the results area: move to the next row, clamped at the
+  /// last visible row. No wraparound — reaching the bottom just stays put.
+  void _focusNextRow() {
+    if (_activeRowCount == 0) return;
+    final current = _focusedRowIndex();
+    // If focus somehow drifted off-list, fall back to the first row.
+    final next = current < 0 ? 0 : (current + 1).clamp(0, _activeRowCount - 1);
+    _rowFocus[next].requestFocus();
+    _ensureRowVisible(
+      next,
+      ScrollPositionAlignmentPolicy.keepVisibleAtEnd,
+    );
+  }
+
+  /// ArrowUp on the results area: move to the previous row. From row 0,
+  /// jump back to the search field so the user can keep typing without
+  /// having to Shift-Tab through anything.
+  void _focusPreviousRow() {
+    if (_activeRowCount == 0) return;
+    final current = _focusedRowIndex();
+    if (current <= 0) {
+      _queryFocus.requestFocus();
+      return;
+    }
+    final prev = current - 1;
+    _rowFocus[prev].requestFocus();
+    _ensureRowVisible(
+      prev,
+      ScrollPositionAlignmentPolicy.keepVisibleAtStart,
+    );
+  }
+
+  /// Escape on the results area: return focus to the search field.
+  void _focusSearchField() {
+    _queryFocus.requestFocus();
+  }
+
+  /// Push the tag detail screen and, on return, put keyboard focus back on
+  /// the row the user came from so keyboard navigation resumes where it
+  /// left off.
+  Future<void> _openTag(onisync.TagEntry tag, {required int restoreIndex}) async {
+    // Drop focus before pushing so Flutter's automatic focus restoration
+    // doesn't re-focus the search field (which would also re-open the soft
+    // keyboard on mobile). We put focus back explicitly on return.
+    FocusManager.instance.primaryFocus?.unfocus();
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => TagDetailScreen(
+          session: widget.session!,
+          tagId: tag.tagId,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    _restoreRowFocus(restoreIndex);
+  }
+
+  /// See [_openTag].
+  Future<void> _openFile(onisync.FileEntry file, {required int restoreIndex}) async {
+    FocusManager.instance.primaryFocus?.unfocus();
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => FileDetailScreen(
+          session: widget.session!,
+          file: file,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    _restoreRowFocus(restoreIndex);
+  }
+
+  /// Best-effort: put keyboard focus back on `_rowFocus[index]`. If the
+  /// results have shrunk while we were away, clamp to the last visible
+  /// row; if there are no rows at all, refocus the search field. Also
+  /// scrolls the row into view since it may have been off-screen when the
+  /// user activated it — for restore we center the row rather than doing
+  /// a minimal scroll, since the user has lost the visual thread.
+  void _restoreRowFocus(int index) {
+    if (_activeRowCount == 0) {
+      _queryFocus.requestFocus();
+      return;
+    }
+    final clamped = index.clamp(0, _activeRowCount - 1);
+    _rowFocus[clamped].requestFocus();
+  }
+
+  /// Scroll `_rowFocus[index]` into view. Uses a post-frame callback so
+  /// this works both when the row is already laid out (arrow-key
+  /// navigation) and when the tree is mid-rebuild (returning from a
+  /// detail screen).
+  void _ensureRowVisible(
+    int index,
+    ScrollPositionAlignmentPolicy policy
+  ) {
+    final node = _rowFocus[index];
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final ctx = node.context;
+      if (ctx == null) return;
+      Scrollable.ensureVisible(
+        ctx,
+        alignment: 0.0,
+        alignmentPolicy: policy,
+        duration: const Duration(milliseconds: 150),
+      );
+    });
+  }
+
   Future<void> _createTag(String name) async {
     final session = widget.session;
     if (session == null) return;
@@ -224,6 +421,24 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('OniSync'),
         actions: [
+          // Toggle: search live vs. tombstoned rows. When on, the daemon
+          // returns only soft-deleted files/tags for the same query text;
+          // when off, only live ones.
+          IconButton(
+            isSelected: _showDeleted,
+            tooltip: _showDeleted
+                ? 'Showing deleted — tap to search live'
+                : 'Search deleted files and tags',
+            icon: Icon(
+              _showDeleted ? Icons.delete : Icons.delete_outline,
+            ),
+            onPressed: () {
+              setState(() => _showDeleted = !_showDeleted);
+              // Re-run immediately if a query is already active so the mode
+              // change is visible without waiting for a keystroke.
+              if (_results != null) _runQuery();
+            },
+          ),
           _OperationsButton(session: widget.session),
           _PurgePreviewsButton(session: widget.session),
           if (publicKey != null) _CopyPublicKeyButton(publicKey: publicKey),
@@ -235,38 +450,11 @@ class _HomeScreenState extends State<HomeScreen> {
           children: [
             Padding(
               padding: const EdgeInsets.all(16),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: _SearchBar(
-                      controller: _query,
-                      focusNode: _queryFocus,
-                      loading: _loading,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  // Toggle: search live vs. tombstoned rows. When on, the
-                  // daemon returns only soft-deleted files/tags for the same
-                  // query text; when off, only live ones.
-                  IconButton.filledTonal(
-                    isSelected: _showDeleted,
-                    tooltip: _showDeleted
-                        ? 'Showing deleted — tap to search live'
-                        : 'Search deleted files and tags',
-                    icon: Icon(
-                      _showDeleted
-                          ? Icons.delete
-                          : Icons.delete_outline,
-                    ),
-                    onPressed: () {
-                      setState(() => _showDeleted = !_showDeleted);
-                      // Re-run immediately if a query is already active so
-                      // the mode change is visible without waiting for a
-                      // keystroke.
-                      if (_results != null) _runQuery();
-                    },
-                  ),
-                ],
+              child: _SearchBar(
+                controller: _query,
+                focusNode: _queryFocus,
+                loading: _loading,
+                onSubmitted: _handleSubmit,
               ),
             ),
             Expanded(child: _buildResults()),
@@ -302,26 +490,64 @@ class _HomeScreenState extends State<HomeScreen> {
     final hasTags = results.tags.isNotEmpty;
     final hasFiles = results.files.isNotEmpty;
     if (!hasTags && !hasFiles && createCandidate == null) {
+      _activeRowCount = 0;
       return const Center(child: Text('No matches.'));
     }
-    return ListView(
-      children: [
-        if (hasTags || createCandidate != null) ...[
-          const _SectionHeader('Tags'),
-          for (final tag in results.tags)
-            _TagRow(tag: tag, session: session),
-          if (createCandidate != null)
-            _CreateTagRow(
-              name: createCandidate,
-              onCreate: () => _createTag(createCandidate),
-            ),
-        ],
-        if (hasFiles) ...[
-          const _SectionHeader('Files'),
-          for (final file in results.files)
-            _FileRow(file: file, session: session),
-        ],
-      ],
+    // Allocate a stable FocusNode per visible row in render order (tags →
+    // create-tag → files). Using state-owned nodes for every row — not just
+    // the first — is critical: rows without an explicit FocusNode get an
+    // implicit one owned by the ListTile, which is disposed and recreated
+    // on every rebuild. Change-stream-driven rebuilds during arrow-key
+    // navigation would otherwise pull the focused node out from under the
+    // user, causing the "Up bounces back down" symptom.
+    final totalRows = results.tags.length +
+        (createCandidate != null ? 1 : 0) +
+        results.files.length;
+    _ensureRowFocusCapacity(totalRows);
+    _activeRowCount = totalRows;
+    // Row index within the flat `_rowFocus` array, incremented as we emit
+    // each interactive row so the tap and Enter handlers can pass the
+    // right restore index back to `_openTag` / `_openFile`.
+    var rowIndex = 0;
+    final children = <Widget>[];
+    if (hasTags || createCandidate != null) {
+      children.add(const _SectionHeader('Tags'));
+      for (final tag in results.tags) {
+        final index = rowIndex++;
+        children.add(_TagRow(
+          tag: tag,
+          focusNode: _rowFocus[index],
+          onActivate: () => _openTag(tag, restoreIndex: index),
+        ));
+      }
+      if (createCandidate != null) {
+        // The create-tag row doesn't push a route, so nothing to restore
+        // focus to; `_createTag` returns and the results list mutates.
+        children.add(_CreateTagRow(
+          name: createCandidate,
+          onCreate: () => _createTag(createCandidate),
+          focusNode: _rowFocus[rowIndex++],
+        ));
+      }
+    }
+    if (hasFiles) {
+      children.add(const _SectionHeader('Files'));
+      for (final file in results.files) {
+        final index = rowIndex++;
+        children.add(_FileRow(
+          file: file,
+          focusNode: _rowFocus[index],
+          onActivate: () => _openFile(file, restoreIndex: index),
+        ));
+      }
+    }
+    return CallbackShortcuts(
+      bindings: {
+        const SingleActivator(LogicalKeyboardKey.arrowDown): _focusNextRow,
+        const SingleActivator(LogicalKeyboardKey.arrowUp): _focusPreviousRow,
+        const SingleActivator(LogicalKeyboardKey.escape): _focusSearchField,
+      },
+      child: ListView(children: children),
     );
   }
 }
@@ -331,17 +557,25 @@ class _SearchBar extends StatelessWidget {
     required this.controller,
     required this.focusNode,
     required this.loading,
+    required this.onSubmitted,
   });
 
   final TextEditingController controller;
   final FocusNode focusNode;
   final bool loading;
 
+  /// Invoked when the user presses Enter in the field. Wired to
+  /// [_HomeScreenState._handleSubmit], which either activates the sole
+  /// result or hands focus to the first result row, so keyboard users
+  /// don't have to tab past the AppBar actions to reach the list.
+  final Future<void> Function() onSubmitted;
+
   @override
   Widget build(BuildContext context) {
     return TextField(
       controller: controller,
       focusNode: focusNode,
+      onSubmitted: (_) => onSubmitted(),
       decoration: InputDecoration(
         prefixIcon: const Icon(Icons.search),
         hintText: 'Search files and tags',
@@ -388,10 +622,21 @@ class _SectionHeader extends StatelessWidget {
 }
 
 class _TagRow extends StatelessWidget {
-  const _TagRow({required this.tag, required this.session});
+  const _TagRow({
+    required this.tag,
+    required this.focusNode,
+    required this.onActivate,
+  });
 
   final onisync.TagEntry tag;
-  final OniSyncSession session;
+
+  /// Stable state-owned focus node for this row's slot in the list. See
+  /// [_HomeScreenState._rowFocus] for why every row needs one.
+  final FocusNode focusNode;
+
+  /// Invoked on tap or Enter. Navigation lives on the state so it can
+  /// restore focus to this row's slot when the detail screen pops.
+  final VoidCallback onActivate;
 
   @override
   Widget build(BuildContext context) {
@@ -403,25 +648,11 @@ class _TagRow extends StatelessWidget {
         : null;
     return ListTile(
       dense: true,
+      focusNode: focusNode,
       leading: TagColorSwatch(color: tag.color),
       title: Text(tag.name, style: titleStyle),
       trailing: const Icon(Icons.chevron_right),
-      onTap: () {
-        // Drop focus from the search field before pushing so the soft keyboard
-        // hides during navigation and — importantly — is not re-opened when
-        // the user pops back to Home (Flutter otherwise restores focus to the
-        // previously-focused text field on route resumption).
-        FocusManager.instance.primaryFocus?.unfocus();
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (_) => TagDetailScreen(
-              session: session,
-              tagId: tag.tagId,
-            ),
-          ),
-        );
-      },
+      onTap: onActivate,
     );
   }
 }
@@ -431,15 +662,23 @@ class _TagRow extends StatelessWidget {
 /// match) exists yet. Tapping it creates the tag with the engine's default
 /// color; the user can recolor via the tag detail screen.
 class _CreateTagRow extends StatelessWidget {
-  const _CreateTagRow({required this.name, required this.onCreate});
+  const _CreateTagRow({
+    required this.name,
+    required this.onCreate,
+    required this.focusNode,
+  });
 
   final String name;
   final VoidCallback onCreate;
+
+  /// See [_TagRow.focusNode].
+  final FocusNode focusNode;
 
   @override
   Widget build(BuildContext context) {
     return ListTile(
       dense: true,
+      focusNode: focusNode,
       leading: const Icon(Icons.add),
       title: Text('Create tag "$name"'),
       onTap: onCreate,
@@ -448,10 +687,19 @@ class _CreateTagRow extends StatelessWidget {
 }
 
 class _FileRow extends StatelessWidget {
-  const _FileRow({required this.file, required this.session});
+  const _FileRow({
+    required this.file,
+    required this.focusNode,
+    required this.onActivate,
+  });
 
   final onisync.FileEntry file;
-  final OniSyncSession session;
+
+  /// See [_TagRow.focusNode].
+  final FocusNode focusNode;
+
+  /// See [_TagRow.onActivate].
+  final VoidCallback onActivate;
 
   @override
   Widget build(BuildContext context) {
@@ -461,21 +709,10 @@ class _FileRow extends StatelessWidget {
         : null;
     return ListTile(
       dense: true,
+      focusNode: focusNode,
       title: Text(file.path, style: titleStyle),
       trailing: const Icon(Icons.chevron_right),
-      onTap: () {
-        // See _TagRow.onTap for why we drop focus before navigating.
-        FocusManager.instance.primaryFocus?.unfocus();
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (_) => FileDetailScreen(
-              session: session,
-              file: file,
-            ),
-          ),
-        );
-      },
+      onTap: onActivate,
     );
   }
 }
