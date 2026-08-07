@@ -3244,6 +3244,47 @@ async fn probe_availability(
 // sender) plus the routing handles it shares. They don't form a reusable
 // cluster the way `PeerContext` does, so they're kept as plain arguments
 // rather than bundled into a single-use struct.
+//
+// EVENT PUBLISHING (KNOWN-SUBOPTIMAL — see the TODO below)
+// --------------------------------------------------------
+// Applied changes are published to UI-facing API subscribers over
+// `event_sender`. The intended single publish site is the fall-through at the
+// very bottom of the message loop, but most arms of the loop `continue` before
+// reaching it, so each one that must notify the UI has to emit for itself.
+// The emit sites are therefore hand-maintained and easy to forget:
+//
+//   1. bottom-of-loop fall-through   — every `Ingest::Meta` change (this is how
+//      a device learns about peer edits)
+//   2. `Change::FileRestored` arm    — `continue`s
+//   3. `DaemonMessage::AnnounceProvided` arm — `continue`s; this is the local
+//      client upload/edit path (`Api::upload_file` / `Api::edit_file`)
+//   4. `DaemonMessage::Materialize` arm — `continue`s; "bytes are now on disk"
+//   5. `dispatch_and_forward`        — reached from `Ingest::Content`, which
+//      `continue`s; sync-directory watcher edits
+//
+// Arms that deliberately do NOT publish (they change no user-visible catalog
+// state): `Fetch`, `GetPreview`, `ApplyPreview`, `PurgePreviews`,
+// `ReconcilePlacement`, `CatalogFile`.
+//
+// TODO: Make publishing structural instead of hand-maintained. Every missing
+// emit shows up as a UI that silently serves stale data until the user
+// navigates away and back, and the bug is invisible at the call site. Options,
+// roughly in increasing order of effort:
+//
+//   - Restructure the loop body so the publish is unconditional — e.g. extract
+//     it into a function returning `Option<Change>` (or a small
+//     `Published`/`Silent` enum) that the caller publishes, so `continue`
+//     cannot skip it and a new arm has to state its intent explicitly.
+//   - Give the event bus its own type instead of reusing the wire `Change`.
+//     `Materialize` currently has to re-send the metadata change it already
+//     announced because there is no way to say "bytes landed"; a dedicated
+//     `ApiEvent`-shaped bus would model catalog-change vs. byte-arrival vs.
+//     placement separately and drop the duplicate.
+//   - Flatten `ApiEvent` into a real DTO across the bridge. It crosses into
+//     Dart as an opaque handle with no accessors (`onisync-bridge/src/api.rs`),
+//     so every screen full-reloads on every change anywhere in the store and
+//     cannot filter by `file_id` — mirror what `OperationUpdateDto` already
+//     does for the operations stream.
 #[allow(clippy::too_many_arguments)]
 async fn handle_changes(
     configuration: Configuration,
@@ -3384,12 +3425,14 @@ async fn handle_changes(
     /// Handle a [`ContentChange`] (`FileAdded`/`FileChanged` carrying
     /// [`FileBytes`]): persist the version, dispatch bytes to matching sync
     /// directories, and forward a wire `Change` to peers.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_content_change(
         configuration: &Configuration,
         runtime_configuration: &Arc<RwLock<RuntimeConfiguration>>,
         database: &mut FileDatabase,
         command_sender: &UnboundedSender<SyncDirectoryCommand>,
         change_sender: &UnboundedSender<DaemonMessage>,
+        event_sender: &tokio::sync::broadcast::Sender<Change>,
         content_change: ContentChange,
         change_origin: ChangeOrigin,
     ) {
@@ -3521,6 +3564,7 @@ async fn handle_changes(
                         configuration,
                         runtime_configuration,
                         command_sender,
+                        event_sender,
                         targets,
                         content,
                         &change_origin,
@@ -3610,6 +3654,7 @@ async fn handle_changes(
                         configuration,
                         runtime_configuration,
                         command_sender,
+                        event_sender,
                         targets,
                         content,
                         &change_origin,
@@ -3669,6 +3714,7 @@ async fn handle_changes(
                     configuration,
                     runtime_configuration,
                     command_sender,
+                    event_sender,
                     targets,
                     content,
                     &change_origin,
@@ -3773,10 +3819,15 @@ async fn handle_changes(
     /// so a peer that wants the content pulls it over a separate transfer. This
     /// keeps large local ingests entirely off the heap regardless of how many
     /// peers are connected.
+    ///
+    /// Also publishes the change to UI subscribers. See `EVENT PUBLISHING` on
+    /// [`handle_changes`]: this arm `continue`s and so never reaches the shared
+    /// publish at the bottom of the loop, so it must emit for itself.
     async fn dispatch_and_forward(
         configuration: &Configuration,
         runtime_configuration: &Arc<RwLock<RuntimeConfiguration>>,
         command_sender: &UnboundedSender<SyncDirectoryCommand>,
+        event_sender: &tokio::sync::broadcast::Sender<Change>,
         targets: Vec<ContentTarget>,
         content: FileBytes,
         change_origin: &ChangeOrigin,
@@ -3785,6 +3836,7 @@ async fn handle_changes(
         dispatch_content_to_sync_directories(command_sender, targets, content).await;
         let change = wire.into_change();
         forward_to_peers(configuration, runtime_configuration, &change, change_origin).await;
+        let _ = event_sender.send(change);
     }
 
     log::info!("handle_changes task started; awaiting changes");
@@ -4053,7 +4105,7 @@ async fn handle_changes(
                 // Publish to UI-facing API subscribers so the deleted-files view
                 // refreshes (the file is now live). This arm `continue`s and so
                 // bypasses the shared publish at the bottom of the loop; emit
-                // here, mirroring it.
+                // here, mirroring it. See `EVENT PUBLISHING` on `handle_changes`.
                 let _ = event_sender.send(change);
 
                 let _ = respond_to.send(Ok(()));
@@ -4402,6 +4454,37 @@ async fn handle_changes(
                 // eager-preview device, warm the preview cache now so a later
                 // peer `PreviewRequest` is a cache hit rather than a decode.
                 maybe_eager_preview(&configuration, &change_sender, file_id);
+
+                // Publish to UI-facing API subscribers. The catalog already
+                // published at announce time, but that fires *before* the bytes
+                // exist locally, so anything keyed on local presence (a file
+                // detail view switching from the remote thumbnail to the
+                // full-fidelity on-disk preview, a tag-triggered fetch landing)
+                // would stay stale until the view is reopened. This is the
+                // "bytes are now on disk" edge.
+                //
+                // Synthetic, local-only: the event bus is typed as `Change`, so
+                // we re-send the metadata change we already announced rather
+                // than modelling byte arrival properly. It is never forwarded to
+                // peers, so the duplicate cannot escape this device. See
+                // `EVENT PUBLISHING` on `handle_changes`.
+                let size = database
+                    .latest_version(file_id)
+                    .unwrap_or_else(|error| {
+                        log::error!(
+                            "Materialize: latest_version failed for {}: {:?}; reporting size 0",
+                            file_id.to_string(),
+                            error
+                        );
+                        None
+                    })
+                    .map(|version| version.size.max(0) as u64)
+                    .unwrap_or(0);
+                let _ = event_sender.send(Change::FileMetadataChanged {
+                    file_id,
+                    content_hash,
+                    size,
+                });
                 continue;
             }
             DaemonMessage::AnnounceProvided {
@@ -4483,6 +4566,14 @@ async fn handle_changes(
                     );
                 }
                 forward_to_peers(&configuration, &runtime_configuration, &change, &origin).await;
+                // Publish to UI-facing API subscribers so an open file view
+                // picks up the new version on the device that *made* the edit.
+                // Peers learn of it through the forwarded `Change` above, which
+                // they ingest as `Ingest::Meta` and publish from the shared site
+                // at the bottom of the loop; without this the originating device
+                // is the only one that never refreshes. See `EVENT PUBLISHING`
+                // on `handle_changes`.
+                let _ = event_sender.send(change);
                 continue;
             }
         };
@@ -4501,6 +4592,7 @@ async fn handle_changes(
                     &mut database,
                     &command_sender,
                     &change_sender,
+                    &event_sender,
                     content_change,
                     change_origin,
                 )
@@ -5314,7 +5406,11 @@ async fn handle_changes(
             }
         }
 
-        // Publish the applied change to UI-facing API subscribers.
+        // Publish the applied change to UI-facing API subscribers. This is the
+        // shared site every arm that does not `continue` falls through to; the
+        // arms that do `continue` emit for themselves. See `EVENT PUBLISHING`
+        // on `handle_changes` for the full list and why it is suboptimal.
+        //
         // Best-effort: if there are no subscribers, or the channel is full and
         // a subscriber lags, the send/receive machinery handles it (the
         // subscriber observes `Lagged`, mapped to `Resynced` by the transport).

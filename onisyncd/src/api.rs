@@ -781,10 +781,10 @@ impl Api {
         // `fetch_file` materialises as `<fetch_temp_dir>/<uuid>/<basename>`,
         // so removing the parent (`<uuid>`) drops both the file and the
         // now-empty subdir.
-        if let Some(parent) = path.parent() {
-            if parent != self.fetch_temp_dir {
-                let _ = std::fs::remove_dir_all(parent);
-            }
+        if let Some(parent) = path.parent()
+            && parent != self.fetch_temp_dir
+        {
+            let _ = std::fs::remove_dir_all(parent);
         }
     }
 
