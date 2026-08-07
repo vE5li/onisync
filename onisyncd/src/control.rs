@@ -58,7 +58,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_util::sync::CancellationToken;
 
-use crate::api::{Api, ApiError, ApiEvent, QueryResult};
+use crate::api::{Api, ApiError, ApiEvent, EditOutcome, QueryResult};
+use crate::configuration::EditorRule;
 use crate::database::{DeletedRule, SubtagRule, Tag};
 use crate::transport::{EventStream, OperationStream, OperationUpdate, TransportBackend};
 
@@ -156,6 +157,27 @@ pub enum ControlRequest {
         /// The file's new content size in bytes, computed by the client.
         size: u64,
     },
+    /// Start an external edit. The daemon returns the path the client should
+    /// hand to an editor — either the file's real sync-dir path (edit in
+    /// place) or a per-request temp file under `fetch_temp_dir` named after
+    /// the file's logical basename. Answered with
+    /// [`ControlResponse::FilePath`].
+    BeginEdit {
+        file_id: FileId,
+    },
+    /// Complete an external edit. The daemon re-hashes the bytes at `path`,
+    /// publishes a new version if different from the current recorded hash,
+    /// and cleans up any daemon-owned temp. Answered with
+    /// [`ControlResponse::EditOutcome`].
+    FinishEdit {
+        file_id: FileId,
+        path: PathBuf,
+    },
+    /// Abort an external edit without publishing. Cleans up any daemon-owned
+    /// temp at `path`. Answered with [`ControlResponse::Ok`].
+    CancelEdit {
+        path: PathBuf,
+    },
     /// Fetch a file's content on demand (from a peer if not local). Answered
     /// with [`ControlResponse::FilePath`] or an error. `expected_hash` gates
     /// which content is accepted.
@@ -207,6 +229,9 @@ pub enum ControlRequest {
     /// [`ControlResponse::PurgedPreviews`] carrying the number of cached
     /// previews removed.
     PurgePreviews,
+    /// Read the daemon's external-editor rules. Answered with
+    /// [`ControlResponse::EditorRules`].
+    EditorRules,
     /// Snapshot every currently-active sync operation. Answered with
     /// [`ControlResponse::Operations`].
     ListOperations,
@@ -247,6 +272,9 @@ pub enum ControlResponse {
     /// A file's absolute on-disk path, or `None` if not present locally (answer
     /// to [`ControlRequest::LocalPathForFile`]).
     LocalPath(Option<PathBuf>),
+    /// The outcome of an external edit (answer to
+    /// [`ControlRequest::FinishEdit`]).
+    EditOutcome(crate::api::EditOutcome),
     /// A write/command that returns no payload succeeded.
     Ok,
     /// The subscription was established; events will follow on this connection.
@@ -254,6 +282,9 @@ pub enum ControlResponse {
     /// The number of cached previews removed (answer to
     /// [`ControlRequest::PurgePreviews`]).
     PurgedPreviews(usize),
+    /// The daemon's external-editor rules (answer to
+    /// [`ControlRequest::EditorRules`]).
+    EditorRules(Vec<EditorRule>),
     /// A snapshot of currently-active sync operations (answer to
     /// [`ControlRequest::ListOperations`]).
     Operations(Vec<crate::operations::Operation>),
@@ -691,6 +722,20 @@ async fn dispatch(
             Ok(path) => ControlResponse::FilePath(path),
             Err(error) => ControlResponse::Error(error),
         },
+        ControlRequest::BeginEdit { file_id } => match api.begin_edit(file_id).await {
+            Ok(path) => ControlResponse::FilePath(path),
+            Err(error) => ControlResponse::Error(error),
+        },
+        ControlRequest::FinishEdit { file_id, path } => {
+            match api.finish_edit(file_id, path).await {
+                Ok(outcome) => ControlResponse::EditOutcome(outcome),
+                Err(error) => ControlResponse::Error(error),
+            }
+        }
+        ControlRequest::CancelEdit { path } => match api.cancel_edit(path) {
+            Ok(()) => ControlResponse::Ok,
+            Err(error) => ControlResponse::Error(error),
+        },
         ControlRequest::GetPreview { file_id } => match api.get_preview(file_id).await {
             Ok(preview) => ControlResponse::Preview(preview),
             Err(error) => ControlResponse::Error(error),
@@ -746,6 +791,7 @@ async fn dispatch(
             Ok(purged) => ControlResponse::PurgedPreviews(purged),
             Err(error) => ControlResponse::Error(error),
         },
+        ControlRequest::EditorRules => ControlResponse::EditorRules(api.editor_rules()),
         ControlRequest::ListOperations => ControlResponse::Operations(api.list_operations()),
         ControlRequest::SubscribeOperations => {
             *operation_events = Some(OperationStream::InProcess(api.subscribe_operations()));
@@ -1329,6 +1375,36 @@ impl TransportBackend for IpcClientBackend {
         }
     }
 
+    /// Start an external edit. Thin IPC wrapper: the daemon does the actual
+    /// work (local-path check or on-demand fetch into a per-request temp) and
+    /// returns the path. No chunk-provider setup is needed here — unlike
+    /// [`Self::edit_file`], the client does not stream bytes in either
+    /// direction. The daemon reads the edited bytes off its own filesystem
+    /// when [`Self::finish_edit`] runs (client and daemon share it).
+    async fn begin_edit(&self, file_id: FileId) -> Result<PathBuf, ApiError> {
+        match self.call(ControlRequest::BeginEdit { file_id }).await? {
+            ControlResponse::FilePath(path) => Ok(path),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn finish_edit(&self, file_id: FileId, path: PathBuf) -> Result<EditOutcome, ApiError> {
+        match self
+            .call(ControlRequest::FinishEdit { file_id, path })
+            .await?
+        {
+            ControlResponse::EditOutcome(outcome) => Ok(outcome),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn cancel_edit(&self, path: PathBuf) -> Result<(), ApiError> {
+        match self.call(ControlRequest::CancelEdit { path }).await? {
+            ControlResponse::Ok => Ok(()),
+            other => Err(unexpected(other)),
+        }
+    }
+
     async fn get_preview(&self, file_id: FileId) -> Result<Preview, ApiError> {
         match self.call(ControlRequest::GetPreview { file_id }).await? {
             ControlResponse::Preview(preview) => Ok(preview),
@@ -1422,6 +1498,13 @@ impl TransportBackend for IpcClientBackend {
     async fn purge_previews(&self) -> Result<usize, ApiError> {
         match self.call(ControlRequest::PurgePreviews).await? {
             ControlResponse::PurgedPreviews(purged) => Ok(purged),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn editor_rules(&self) -> Result<Vec<EditorRule>, ApiError> {
+        match self.call(ControlRequest::EditorRules).await? {
+            ControlResponse::EditorRules(rules) => Ok(rules),
             other => Err(unexpected(other)),
         }
     }

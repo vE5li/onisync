@@ -15,6 +15,7 @@ import 'dart:io';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart'
     show ExternalLibrary;
 
+import '../editor/linux_editor_launcher.dart';
 import '../rust/frb_generated.dart';
 import '../rust/api.dart' as onisync;
 import 'bootstrap.dart';
@@ -30,7 +31,11 @@ class LinuxBootstrap extends OniSyncBootstrap {
     // fails if the daemon is not running. No config/paths: the daemon owns the
     // engine, DB, and identity.
     final app = await onisync.OniSyncApp.attach();
-    return OniSyncSession(app: app, publicKey: null);
+    return OniSyncSession(
+      app: app,
+      publicKey: null,
+      editorLauncher: LinuxEditorLauncher(),
+    );
   }
 
   /// Resolve libonisync_bridge.so for both run modes.

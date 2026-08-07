@@ -28,53 +28,33 @@ use onisyncd::paths::Paths;
 use onisyncd::transport::Backend;
 
 /// Why the native runtime could not be started.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum StartError {
     /// The configuration JSON supplied by the frontend was invalid.
-    Configuration(ConfigurationError),
+    #[error(transparent)]
+    Configuration(#[from] ConfigurationError),
     /// Building the dedicated-thread tokio runtime failed.
-    Runtime(std::io::Error),
+    #[error("failed to build tokio runtime: {0}")]
+    Runtime(#[source] std::io::Error),
     /// The sync engine failed its fallible startup (identity, DB, bind).
-    Run(onisyncd::RunError),
+    #[error(transparent)]
+    Run(#[from] onisyncd::RunError),
     /// Bootstrapping on-disk state (data directory or identity key) failed.
+    #[error("failed to bootstrap on-disk state at {}: {source}", path.display())]
     Bootstrap {
         path: PathBuf,
+        #[source]
         source: std::io::Error,
     },
     /// The runtime thread exited before it reported readiness.
+    #[error("runtime thread exited before startup completed")]
     Cancelled,
     /// Attaching to the daemon over IPC failed (Linux desktop topology): the
     /// control socket could not be reached or the handshake failed. Usually
     /// means the daemon is not running.
-    Ipc(onisyncd::api::ApiError),
+    #[error("failed to attach to the onisync daemon: {0}")]
+    Ipc(#[source] onisyncd::api::ApiError),
 }
-
-impl std::fmt::Display for StartError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StartError::Configuration(error) => write!(formatter, "{error}"),
-            StartError::Runtime(error) => {
-                write!(formatter, "failed to build tokio runtime: {error}")
-            }
-            StartError::Run(error) => write!(formatter, "{error}"),
-            StartError::Bootstrap { path, source } => {
-                write!(
-                    formatter,
-                    "failed to bootstrap on-disk state at {}: {source}",
-                    path.display()
-                )
-            }
-            StartError::Cancelled => {
-                write!(formatter, "runtime thread exited before startup completed")
-            }
-            StartError::Ipc(error) => {
-                write!(formatter, "failed to attach to the onisync daemon: {error}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for StartError {}
 
 /// A running onisync core hosted on a dedicated thread.
 ///

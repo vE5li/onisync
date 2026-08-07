@@ -101,6 +101,33 @@ pub struct TagDeclaration {
     pub color: String,
 }
 
+/// A rule mapping a tag name to an external editor command.
+///
+/// Used by the desktop UI's "edit" action: when a file carries a tag whose
+/// name matches [`tag`], its bytes are handed to [`command`] instead of the
+/// generic `$VISUAL`/`$EDITOR` fallback. Rules are consulted in declaration
+/// order; the first match wins.
+///
+/// The daemon does not use these rules itself — it has no notion of external
+/// processes — but stores them so every frontend on this device (and any
+/// future non-Flutter client of the same daemon) sees the same set. The
+/// Android app currently has no external-editor concept and simply ignores
+/// them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditorRule {
+    /// Tag name to match (not id — names are user-facing, stable across
+    /// devices, and writeable by hand; ids are opaque UUIDs that would be
+    /// hostile to a config file).
+    pub tag: String,
+    /// The editor command. Whitespace-split into `argv`; the file path is
+    /// appended as the final argument. The command must block until the user
+    /// is done editing (e.g. `gimp`, `inkscape`, `code --wait`); a command
+    /// that forks off and returns immediately (`xdg-open`, `nohup ...`) will
+    /// make the UI think the edit finished as soon as the launch call
+    /// returns.
+    pub command: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Configuration {
     /// Synchronized directories on the device itself.
@@ -126,6 +153,13 @@ pub struct Configuration {
     /// can serve them onward.
     #[serde(default)]
     pub preview_generation_policy: PreviewGenerationPolicy,
+    /// Tag → command mapping consulted by the desktop UI's external-edit
+    /// action. See [`EditorRule`]. Empty (the default) means the UI falls
+    /// back to `$VISUAL` / `$EDITOR` for every file. The daemon does not act
+    /// on these rules; they are stored here so every frontend attached to
+    /// this device sees the same set.
+    #[serde(default)]
+    pub editor_rules: Vec<EditorRule>,
 }
 
 /// How a device generates file previews.
@@ -181,35 +215,19 @@ impl PreviewGenerationPolicy {
 /// which generates the JSON on first launch and passes it through the bridge)
 /// must not panic on malformed input — a panic crashes the app. They use
 /// [`Configuration::from_str`], which surfaces failures as this error.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ConfigurationError {
     /// The configuration file on disk could not be read.
+    #[error("failed to read configuration file {}: {source}", path.display())]
     Read {
         path: PathBuf,
+        #[source]
         source: std::io::Error,
     },
     /// The bytes were not valid configuration JSON.
-    Parse(serde_json::Error),
+    #[error("failed to parse configuration JSON: {0}")]
+    Parse(#[from] serde_json::Error),
 }
-
-impl std::fmt::Display for ConfigurationError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConfigurationError::Read { path, source } => {
-                write!(
-                    formatter,
-                    "failed to read configuration file {}: {source}",
-                    path.display()
-                )
-            }
-            ConfigurationError::Parse(error) => {
-                write!(formatter, "failed to parse configuration JSON: {error}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ConfigurationError {}
 
 impl Configuration {
     // TODO: Return a result

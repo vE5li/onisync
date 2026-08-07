@@ -27,6 +27,7 @@ generated = ["flutter_rust_bridge"]
 onisyncd = { workspace = true }
 onisync-core = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+thiserror = { workspace = true }
 log = { workspace = true }
 
 flutter_rust_bridge = { workspace = true, optional = true }

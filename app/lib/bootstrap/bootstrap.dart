@@ -15,6 +15,7 @@
 
 import 'package:flutter/widgets.dart';
 
+import '../editor/editor_launcher.dart';
 import '../rust/api.dart' as onisync;
 
 /// A connected backend, ready for the shared UI to drive.
@@ -32,10 +33,18 @@ class OniSyncSession {
   /// doubles as the mobile-only gate, like [publicKey].
   final String? downloadsDir;
 
+  /// External-editor launcher for this platform, or `null` if editing files
+  /// in an external app is not supported on this platform. Currently
+  /// non-null on both Android (ACTION_EDIT via a FileProvider URI) and Linux
+  /// (child process from a daemon-configured rule or $VISUAL/$EDITOR). The
+  /// file detail screen's "Edit" button is hidden when this is null.
+  final EditorLauncher? editorLauncher;
+
   const OniSyncSession({
     required this.app,
     this.publicKey,
     this.downloadsDir,
+    this.editorLauncher,
   });
 }
 

@@ -31,6 +31,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{broadcast, oneshot};
 
 use crate::bus::{DaemonMessage, FetchError, Ingest, PreviewError, RestoreError};
+use crate::configuration::EditorRule;
 use crate::database::{DatabaseError, DeletedRule, FileDatabase, QueryTerm, SubtagRule, Tag};
 use crate::directory_manager::SyncDirectoryCommand;
 use crate::fetch::PendingFetches;
@@ -39,48 +40,31 @@ use crate::transfer::ChunkSource;
 /// Errors surfaced to the UI.
 ///
 /// A single serializable error type so the transport can carry one shape over
-/// the wire. It wraps the crate's hand-rolled [`DatabaseError`] (which has no
-/// `Display` and flattens most SQL failures) rather than leaking it raw, and
-/// adds UI-facing variants.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// the wire. It wraps the crate's [`DatabaseError`] rather than leaking it raw,
+/// and adds UI-facing variants.
+#[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
 pub enum ApiError {
     /// Unknown `FileId`/`TagId`.
+    #[error("not found")]
     NotFound,
     /// A short-id prefix matched more than one file, so it could not be
     /// resolved to a single id. Carries the ambiguous prefix.
+    #[error("ambiguous id prefix '{0}': matches multiple files")]
     Ambiguous(String),
     /// A caller-supplied argument was invalid (e.g. empty tag name).
+    #[error("invalid argument: {0}")]
     InvalidArgument(String),
     /// A database-layer failure.
-    Database(DatabaseError),
+    #[error("database error: {0}")]
+    Database(#[source] DatabaseError),
     /// IPC-only: socket/protocol failure. Never produced in-process.
+    #[error("transport error: {0}")]
     Transport(String),
     /// An unexpected internal failure (e.g. a change could not be enqueued
     /// because the runtime is shutting down).
+    #[error("internal error: {0}")]
     Internal(String),
 }
-
-impl std::fmt::Display for ApiError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ApiError::NotFound => write!(formatter, "not found"),
-            ApiError::Ambiguous(prefix) => {
-                write!(
-                    formatter,
-                    "ambiguous id prefix '{prefix}': matches multiple files"
-                )
-            }
-            ApiError::InvalidArgument(message) => {
-                write!(formatter, "invalid argument: {message}")
-            }
-            ApiError::Database(error) => write!(formatter, "database error: {error:?}"),
-            ApiError::Transport(message) => write!(formatter, "transport error: {message}"),
-            ApiError::Internal(message) => write!(formatter, "internal error: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for ApiError {}
 
 impl From<DatabaseError> for ApiError {
     fn from(error: DatabaseError) -> Self {
@@ -94,6 +78,9 @@ impl From<DatabaseError> for ApiError {
             DatabaseError::CantTagItself => {
                 ApiError::InvalidArgument("a tag cannot be its own subtag".to_owned())
             }
+            // A raw SQL failure is not actionable by the UI, so it is reported
+            // as an internal error rather than a structured database error.
+            sqlite @ DatabaseError::Sqlite { .. } => ApiError::Internal(sqlite.to_string()),
             other => ApiError::Database(other),
         }
     }
@@ -146,6 +133,20 @@ pub struct QueryResult {
     pub tags: Vec<Tag>,
 }
 
+/// The result of [`Api::finish_edit`]: did the edit actually change the file?
+///
+/// `changed = false` means the post-edit bytes hashed to the file's current
+/// recorded `content_hash`; either the editor produced no change, or the edit
+/// happened in place and the filesystem watcher already published the same
+/// content the daemon then saw at `finish_edit` time. `changed = true` means
+/// the daemon streamed the new content to peers as a new version. The Dart UI
+/// uses this to show a "no changes" hint vs. an "edited" confirmation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EditOutcome {
+    /// Whether the daemon published a new version from the edited bytes.
+    pub changed: bool,
+}
+
 /// A live update delivered on the API event stream.
 ///
 /// Delivery is **best-effort**, mirroring the in-process ingest bus. There is
@@ -192,6 +193,11 @@ pub struct Api {
     /// `subscribe_operations` taps its event broadcast. Fed by the peer
     /// sessions, not by this API.
     operations: crate::operations::Operations,
+    /// External-editor rules the desktop UI consults for its "edit" action
+    /// (see [`crate::configuration::EditorRule`]). Snapshot of the startup
+    /// configuration; the daemon does not act on these but stores them so
+    /// every frontend attached to this device sees the same set.
+    editor_rules: Vec<EditorRule>,
 }
 
 impl Api {
@@ -217,6 +223,7 @@ impl Api {
         pending_fetches: PendingFetches,
         fetch_temp_dir: PathBuf,
         operations: crate::operations::Operations,
+        editor_rules: Vec<EditorRule>,
     ) -> Self {
         Self {
             main_db_path,
@@ -226,7 +233,15 @@ impl Api {
             pending_fetches,
             fetch_temp_dir,
             operations,
+            editor_rules,
         }
+    }
+
+    /// Snapshot of the desktop UI's tag-based editor rules (see
+    /// [`crate::configuration::EditorRule`]). Read-only; taken from
+    /// configuration at startup.
+    pub fn editor_rules(&self) -> Vec<EditorRule> {
+        self.editor_rules.clone()
     }
 
     /// Open a fresh read-only DB handle for a single read call.
@@ -657,6 +672,122 @@ impl Api {
             .map_err(|_| ApiError::Internal("runtime is shutting down".to_owned()))
     }
 
+    /// Start an external edit: return the on-disk path the caller should hand
+    /// to an editor.
+    ///
+    /// If the file lives in a local sync directory, returns that real
+    /// on-disk path (edit-in-place; the watcher propagates the save). Otherwise
+    /// fetches the content — from a peer if needed — into an isolated
+    /// per-request subdirectory under [`crate::paths::Paths::fetch_temp_dir`],
+    /// named with the file's logical basename (extension preserved so editors
+    /// dispatch by MIME correctly), and returns that path with move semantics.
+    ///
+    /// No daemon-side state is kept across the edit. The caller's `file_id`
+    /// plus the returned `path` fully describe the follow-up
+    /// [`Self::finish_edit`] / [`Self::cancel_edit`]. A caller that crashes
+    /// before finishing only leaks the temp file, which the daemon bulk-cleans
+    /// on next start (see [`crate::paths::Paths::clean_fetch_temp_dir`]).
+    pub async fn begin_edit(&self, file_id: FileId) -> Result<PathBuf, ApiError> {
+        // Fast path: the bytes already live in a local sync directory. Give
+        // the editor the real file; the watcher will pick up the save.
+        if let Some(path) = self.local_path_for_file(file_id).await? {
+            return Ok(path);
+        }
+
+        // Otherwise materialise into a caller-visible temp. `fetch_file`
+        // handles the extension-preserving naming and the on-demand peer
+        // pull. Getting the expected hash costs one by-id read; the file
+        // must exist for us to fetch it.
+        let info = self.get_file(file_id, DeletedRule::Include)?;
+        self.fetch_file(file_id, info.content_hash).await
+    }
+
+    /// Complete an external edit started with [`Self::begin_edit`]: publish a
+    /// new version if the bytes at `path` differ from the file's currently
+    /// recorded content.
+    ///
+    /// Hashing is streaming; the bytes are never buffered whole. The
+    /// comparison is against the DB's *current* `content_hash`, so an in-place
+    /// edit whose save was already ingested by the watcher no-ops here
+    /// automatically.
+    ///
+    /// # Temp file lifetime
+    ///
+    /// When the bytes changed, the daemon registers `path` as a chunk provider
+    /// (via `FileToCopy`) so peers can pull the new content **on demand** —
+    /// reads happen after this call returns, from `path` on disk. The temp
+    /// is therefore **not deleted here**: doing so would break peers mid-pull
+    /// with a "No such file or directory" error. The temp is left in place
+    /// and cleaned up in bulk on the next daemon start (see
+    /// [`crate::paths::Paths::clean_fetch_temp_dir`]), matching the "provider
+    /// outlives the API call" semantics that
+    /// [`crate::transport::TransportBackend::upload_file`] has always had.
+    ///
+    /// The no-op branch (bytes unchanged) still cleans up: no provider was
+    /// registered, no peer will ever read from `path`, so the temp is safe to
+    /// remove immediately.
+    pub async fn finish_edit(
+        &self,
+        file_id: FileId,
+        path: PathBuf,
+    ) -> Result<EditOutcome, ApiError> {
+        // Compare the edited bytes against the file's current recorded hash.
+        // If they match there is nothing to publish — either the editor
+        // produced no change, or the watcher already ingested the in-place
+        // save and updated the DB.
+        let (edited_hash, edited_size) = crate::control::hash_file(&path).await?;
+        let current_hash = self.get_file(file_id, DeletedRule::Include)?.content_hash;
+
+        if edited_hash == current_hash {
+            // No-op: nothing was published, nothing else will read `path`.
+            self.cleanup_edit_path(&path);
+            return Ok(EditOutcome { changed: false });
+        }
+
+        // Publish the new content by streaming it from `path` via the
+        // usual chunk-provider protocol. Peers pull on demand *after* this
+        // call returns, so `path` must remain readable until the daemon
+        // restarts. See the method docs.
+        let source = crate::file_bytes::FileBytes::FileToCopy(path);
+        self.edit_file(file_id, edited_hash.clone(), edited_size)?;
+        self.register_provider(file_id, edited_hash, std::sync::Arc::new(source))
+            .await;
+        Ok(EditOutcome { changed: true })
+    }
+
+    /// Abort an external edit started with [`Self::begin_edit`] without
+    /// publishing. Cleans up any daemon-owned temp under
+    /// [`crate::paths::Paths::fetch_temp_dir`]; other paths are left alone.
+    pub fn cancel_edit(&self, path: PathBuf) -> Result<(), ApiError> {
+        self.cleanup_edit_path(&path);
+        Ok(())
+    }
+
+    /// Remove the per-request subdir the daemon created for a Branch B
+    /// `begin_edit`, iff `path` lives under `fetch_temp_dir`. A path handed
+    /// out for Branch A (a real sync-dir file) is silently ignored — we
+    /// never delete user data.
+    ///
+    /// Best-effort: any I/O failure here is swallowed. The daemon bulk-wipes
+    /// `fetch_temp_dir` on its next start regardless, so a missed cleanup is
+    /// a bounded leak.
+    fn cleanup_edit_path(&self, path: &std::path::Path) {
+        // Only touch paths that are actually inside our fetch temp dir.
+        // `starts_with` compares path components, so it is not fooled by
+        // string-level tricks (e.g. a `..` in a caller-supplied path).
+        if !path.starts_with(&self.fetch_temp_dir) {
+            return;
+        }
+        // `fetch_file` materialises as `<fetch_temp_dir>/<uuid>/<basename>`,
+        // so removing the parent (`<uuid>`) drops both the file and the
+        // now-empty subdir.
+        if let Some(parent) = path.parent() {
+            if parent != self.fetch_temp_dir {
+                let _ = std::fs::remove_dir_all(parent);
+            }
+        }
+    }
+
     /// Delete a file. Enqueues `Change::FileDeleted`, stamped with our wall
     /// clock now for last-writer-wins against a later edit.
     pub fn delete_file(&self, file_id: FileId) -> Result<(), ApiError> {
@@ -728,11 +859,42 @@ impl Api {
     /// buffered into memory — a peer transfer already lands as a temp file
     /// on disk, and a locally-held copy is streamed into the fetch temp
     /// dir.
+    ///
+    /// The materialised path has the shape
+    /// `<fetch_temp_dir>/<uuid>/<logical_basename>` (an isolated
+    /// per-request subdirectory whose leaf carries the file's logical name,
+    /// including extension). The extension is load-bearing: editors, share
+    /// sheets, and downloads all key their behaviour off it. Callers should
+    /// clean up the *parent* directory (`<fetch_temp_dir>/<uuid>`) rather
+    /// than just the file, so an unmoved temp leaves nothing behind. Any
+    /// leftover subdirectories are also wiped in bulk on the next daemon
+    /// start (see [`crate::paths::Paths::clean_fetch_temp_dir`]), so a
+    /// missed cleanup only leaks until the next restart.
     pub async fn fetch_file(
         &self,
         file_id: FileId,
         expected_hash: String,
     ) -> Result<PathBuf, ApiError> {
+        // Read the file's logical basename before enqueuing the fetch so a
+        // completed fetch always has a name to land under. This is one extra
+        // by-id read (cheap; same shape as `get_file`), and doing it here
+        // means every caller — CLI download, UI download/share, and the
+        // upcoming edit flow — gets the right on-disk name for free.
+        let logical_basename = {
+            let database = self.open_read()?;
+            let info = database.file_info_from_id(file_id, DeletedRule::Include)?;
+            let basename = info.logical_path.basename().to_owned();
+            // A pathological empty basename would resolve to
+            // `<uuid>/` which some filesystems reject and which would in any
+            // case give the editor no extension to dispatch on. Fall back to
+            // the file id, which at least yields a stable, unique name.
+            if basename.is_empty() {
+                file_id.to_string()
+            } else {
+                basename
+            }
+        };
+
         let (respond_to, response) = oneshot::channel();
         self.change_sender
             .send(DaemonMessage::Fetch {
@@ -752,8 +914,15 @@ impl Api {
             Err(_elapsed) => return Err(ApiError::Internal(FetchError::TimedOut.to_string())),
         };
 
-        // Materialize into a fresh daemon-owned temp file the caller consumes.
-        let dest = self.fetch_temp_dir.join(uuid::Uuid::new_v4().to_string());
+        // Materialize into `<fetch_temp_dir>/<uuid>/<logical_basename>`. The
+        // per-request `<uuid>` subdirectory isolates the file so it can carry
+        // its real name (matching extension included) without colliding with
+        // other in-flight fetches of the same logical basename.
+        let subdir = self.fetch_temp_dir.join(uuid::Uuid::new_v4().to_string());
+        tokio::fs::create_dir_all(&subdir).await.map_err(|error| {
+            ApiError::Internal(format!("failed to create fetch temp subdir: {error}"))
+        })?;
+        let dest = subdir.join(&logical_basename);
         content.materialize_to(&dest).await.map_err(|error| {
             ApiError::Internal(format!("failed to stage fetched file: {error}"))
         })?;

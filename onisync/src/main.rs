@@ -1138,102 +1138,54 @@ async fn run(
     Ok(())
 }
 
-/// The `edit` flow.
+/// The `edit` flow — a thin driver over the daemon's stateless edit protocol.
 ///
-/// - If the daemon reports the file is present in a local sync directory, open
-///   that real file directly in `$EDITOR`. The daemon's filesystem watcher
-///   picks up the save and propagates a `FileMetadataChanged` on its own — no
-///   explicit write-back, no temp file.
-/// - Otherwise fetch the bytes from a peer, drop them in a temp file, open the
-///   editor, and — only if the content actually changed — write the new bytes
-///   back with `edit_file`.
+/// The daemon owns the whole workflow (local-path vs. peer-fetch decision,
+/// extension-preserving naming, hashing, no-op detection, upload, and temp
+/// cleanup). This CLI's job is only:
+///
+/// 1. Ask the daemon to prepare an editable path (`begin_edit`).
+/// 2. Launch `$EDITOR` on it, blocking until it exits.
+/// 3. Hand the path back with `finish_edit` (uploads iff the bytes changed) on
+///    success, or `cancel_edit` on editor failure.
+///
+/// A crash between (1) and (3) only leaks a temp file, which the daemon
+/// bulk-wipes on next start.
 async fn edit_file(
     backend: &IpcClientBackend,
     file_id: FileId,
     output_mode: OutputMode,
 ) -> Result<(), String> {
-    if let Some(path) = backend
-        .local_path_for_file(file_id)
-        .await
-        .map_err(|error| error.to_string())?
-    {
-        open_in_editor(&path)?;
-
-        // The watcher propagates the on-disk save; report the same shape as the
-        // fetch-and-write-back path below.
-        match output_mode {
-            OutputMode::Human => {}
-            OutputMode::Json => print_json(&json!({ "id": file_id, "edited": true })),
-        }
-
-        return Ok(());
-    }
-
-    // Not local: we need the expected content hash to fetch. It comes from the
-    // file's known metadata; if the daemon has never heard of this file there is
-    // nothing to fetch. A single by-id lookup (not a full listing).
-    let expected_hash = match backend.get_file(file_id, DeletedRule::Exclude).await {
-        Ok(file) => file.content_hash,
+    let path = match backend.begin_edit(file_id).await {
+        Ok(path) => path,
         Err(onisyncd::api::ApiError::NotFound) => {
             return Err(format!("unknown file id: {}", file_id.to_string()));
         }
         Err(error) => return Err(error.to_string()),
     };
 
-    // The daemon stages the fetched content in a temp file and hands us the
-    // path with move semantics: we own it now and must consume (edit + hand
-    // back) or remove it. Edit it in place, then decide by hash whether it
-    // changed.
-    let temp_path = backend
-        .fetch_file(file_id, expected_hash.clone())
-        .await
-        .map_err(|error| error.to_string())?;
-
-    let result = edit_fetched_file(backend, file_id, &temp_path, &expected_hash, output_mode).await;
-
-    // Best-effort cleanup: `edit_file` streams the temp to the daemon but does
-    // not consume it, and the no-change path never hands it off. Either way we
-    // own it and remove it here.
-    let _ = std::fs::remove_file(&temp_path);
-
-    result
-}
-
-/// Edit the temp file the daemon staged for us (at `temp_path`), then push the
-/// result back if it changed. `expected_hash` is the fetched content's hash;
-/// comparing the post-edit hash against it detects "no change" without reading
-/// either version fully into memory.
-async fn edit_fetched_file(
-    backend: &IpcClientBackend,
-    file_id: FileId,
-    temp_path: &std::path::Path,
-    expected_hash: &str,
-    output_mode: OutputMode,
-) -> Result<(), String> {
-    open_in_editor(temp_path)?;
-
-    let (edited_hash, _edited_size) = onisyncd::control::hash_file(temp_path)
-        .await
-        .map_err(|error| error.to_string())?;
-
-    if edited_hash == expected_hash {
-        match output_mode {
-            OutputMode::Human => println!("No changes"),
-            OutputMode::Json => print_json(&json!({ "id": file_id, "edited": false })),
-        }
-        return Ok(());
+    // Launch the editor. On failure, tell the daemon to clean up and return
+    // the editor error to the user — we do not want a stale temp to linger
+    // until the next daemon restart.
+    if let Err(error) = open_in_editor(&path) {
+        let _ = backend.cancel_edit(path).await;
+        return Err(error);
     }
 
-    // Serve the edited temp file to the daemon as a provider (streamed, not
-    // sent as bytes). Blocks until the new content is handed off.
-    backend
-        .edit_file(file_id, temp_path.to_path_buf())
+    let outcome = backend
+        .finish_edit(file_id, path)
         .await
         .map_err(|error| error.to_string())?;
 
     match output_mode {
-        OutputMode::Human => println!("Edited file {}", file_id.to_string()),
-        OutputMode::Json => print_json(&json!({ "id": file_id, "edited": true })),
+        OutputMode::Human => {
+            if outcome.changed {
+                println!("Edited file {}", file_id.to_string());
+            } else {
+                println!("No changes");
+            }
+        }
+        OutputMode::Json => print_json(&json!({ "id": file_id, "edited": outcome.changed })),
     }
 
     Ok(())
@@ -1311,6 +1263,14 @@ async fn download_file(
                      fallback also failed: {error}"
                 )
             })?;
+        }
+        // The daemon staged the fetched bytes in a per-request subdirectory
+        // (`<fetch_temp_dir>/<uuid>/<logical_basename>`). We just moved the
+        // file out of it, so the subdir is now an empty leftover. Remove it
+        // (best-effort — the daemon bulk-wipes `fetch_temp_dir` on next start
+        // regardless).
+        if let Some(parent) = temp_path.parent() {
+            let _ = std::fs::remove_dir(parent);
         }
     }
 

@@ -28,63 +28,26 @@ pub struct HandshakeMessage {
 /// Anything that can go wrong while building or verifying a handshake. Kept
 /// as data (no panics) so the networking code can log and reject malformed
 /// input instead of crashing the task.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum HandshakeError {
-    InvalidPublicKeyEncoding(base64::DecodeError),
-    InvalidSignatureEncoding(base64::DecodeError),
-    WrongPublicKeyLength {
-        expected: usize,
-        found: usize,
-    },
-    WrongSignatureLength {
-        expected: usize,
-        found: usize,
-    },
-    InvalidPublicKey(ed25519_dalek::SignatureError),
+    #[error("public key is not valid base64: {0}")]
+    InvalidPublicKeyEncoding(#[source] base64::DecodeError),
+    #[error("signature is not valid base64: {0}")]
+    InvalidSignatureEncoding(#[source] base64::DecodeError),
+    #[error("public key has wrong length: expected {expected} bytes, found {found}")]
+    WrongPublicKeyLength { expected: usize, found: usize },
+    #[error("signature has wrong length: expected {expected} bytes, found {found}")]
+    WrongSignatureLength { expected: usize, found: usize },
+    #[error("public key is not a valid ed25519 key: {0}")]
+    InvalidPublicKey(#[source] ed25519_dalek::SignatureError),
+    #[error("signature verification failed")]
     SignatureVerificationFailed,
     /// The peer advertised a wire-protocol version different from ours. Since
     /// all devices are updated together there is no compatibility range; a
     /// mismatch is fail-closed.
-    IncompatibleProtocol {
-        ours: u32,
-        theirs: u32,
-    },
+    #[error("incompatible protocol version: ours is {ours}, peer's is {theirs}")]
+    IncompatibleProtocol { ours: u32, theirs: u32 },
 }
-
-impl std::fmt::Display for HandshakeError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            HandshakeError::InvalidPublicKeyEncoding(error) => {
-                write!(formatter, "public key is not valid base64: {error}")
-            }
-            HandshakeError::InvalidSignatureEncoding(error) => {
-                write!(formatter, "signature is not valid base64: {error}")
-            }
-            HandshakeError::WrongPublicKeyLength { expected, found } => write!(
-                formatter,
-                "public key has wrong length: expected {expected} bytes, found {found}"
-            ),
-            HandshakeError::WrongSignatureLength { expected, found } => write!(
-                formatter,
-                "signature has wrong length: expected {expected} bytes, found {found}"
-            ),
-            HandshakeError::InvalidPublicKey(error) => {
-                write!(formatter, "public key is not a valid ed25519 key: {error}")
-            }
-            HandshakeError::SignatureVerificationFailed => {
-                write!(formatter, "signature verification failed")
-            }
-            HandshakeError::IncompatibleProtocol { ours, theirs } => {
-                write!(
-                    formatter,
-                    "incompatible protocol version: ours is {ours}, peer's is {theirs}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for HandshakeError {}
 
 /// This machine's long-lived cryptographic identity: an ed25519 keypair whose
 /// public half is shared with peers and whose private half never leaves disk.

@@ -64,6 +64,22 @@
             android:name=".OniSyncService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+        <!-- onisync: FileProvider used by the external-editor launcher
+             (EditorChannel) to hand files to third-party editors as
+             `content://` URIs. Raw filesystem paths under the app's private
+             storage are not readable by other apps on modern Android, so we
+             expose the daemon's fetch temp dir (under `filesDir`) and the
+             sync directory (under external storage) through this provider.
+             See res/xml/onisync_editor_paths.xml for the exposed roots. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.editorprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/onisync_editor_paths" />
+        </provider>
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data
@@ -79,6 +95,19 @@
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
+        </intent>
+        <!-- Package visibility (Android 11+ enforces this): the
+             external-editor launcher (EditorChannel) probes whether any
+             installed app handles ACTION_EDIT / ACTION_VIEW for a given
+             MIME so it can pick the right one. Without these queries,
+             resolveActivity() returns null even when an editor exists. -->
+        <intent>
+            <action android:name="android.intent.action.EDIT"/>
+            <data android:mimeType="*/*"/>
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:mimeType="*/*"/>
         </intent>
     </queries>
 </manifest>

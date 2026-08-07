@@ -13,6 +13,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 
+import '../editor/android_editor_launcher.dart';
 import '../rust/frb_generated.dart';
 import '../rust/api.dart' as onisync;
 import '../screens/share_review_screen.dart';
@@ -66,6 +67,7 @@ class AndroidBootstrap extends OniSyncBootstrap {
       app: app,
       publicKey: app.publicKey(),
       downloadsDir: downloadsDir,
+      editorLauncher: AndroidEditorLauncher(),
     );
   }
 

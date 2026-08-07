@@ -300,54 +300,34 @@ impl DaemonMessage {
 }
 
 /// Why an on-demand fetch failed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum FetchError {
     /// No connected peer (directly or transitively) reported holding content
     /// that matches `expected_hash` before the timeout.
+    #[error("file not available from any connected peer")]
     NotAvailable,
     /// The fetch did not complete within the overall deadline.
+    #[error("fetch timed out")]
     TimedOut,
     /// The runtime is shutting down; the request cannot be served.
+    #[error("runtime is shutting down")]
     ShuttingDown,
 }
 
-impl std::fmt::Display for FetchError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FetchError::NotAvailable => {
-                formatter.write_str("file not available from any connected peer")
-            }
-            FetchError::TimedOut => formatter.write_str("fetch timed out"),
-            FetchError::ShuttingDown => formatter.write_str("runtime is shutting down"),
-        }
-    }
-}
-
 /// Why a restore failed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum RestoreError {
     /// The file is not soft-deleted (nothing to restore), or is unknown.
+    #[error("file is not deleted; nothing to restore")]
     NotDeleted,
     /// Best-effort recovery found no source for the bytes: neither a local
     /// `keep_deleted_files` vault nor any connected peer still holds them. The
     /// tombstone is left in place.
+    #[error("no source holds the file's bytes; cannot restore")]
     NotAvailable,
     /// The runtime is shutting down; the request cannot be served.
+    #[error("runtime is shutting down")]
     ShuttingDown,
-}
-
-impl std::fmt::Display for RestoreError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RestoreError::NotDeleted => {
-                formatter.write_str("file is not deleted; nothing to restore")
-            }
-            RestoreError::NotAvailable => {
-                formatter.write_str("no source holds the file's bytes; cannot restore")
-            }
-            RestoreError::ShuttingDown => formatter.write_str("runtime is shutting down"),
-        }
-    }
 }
 
 /// Why a preview request failed.
@@ -355,22 +335,13 @@ impl std::fmt::Display for RestoreError {
 /// Note that "no peer holds the content" is *not* an error: it resolves to
 /// [`Preview::None`]. This enum covers only genuine failures (the file is
 /// unknown, or the daemon is shutting down / its internals dropped a channel).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum PreviewError {
     /// The file id is not in the catalog (no recorded version to key a preview
     /// by). Distinct from a known file that simply has no preview.
+    #[error("file is not known to the catalog")]
     UnknownFile,
     /// The runtime is shutting down, or an internal responder was dropped.
+    #[error("runtime is shutting down")]
     ShuttingDown,
 }
-
-impl std::fmt::Display for PreviewError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PreviewError::UnknownFile => formatter.write_str("file is not known to the catalog"),
-            PreviewError::ShuttingDown => formatter.write_str("runtime is shutting down"),
-        }
-    }
-}
-
-impl std::error::Error for FetchError {}

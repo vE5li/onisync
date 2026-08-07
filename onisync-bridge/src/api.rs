@@ -18,6 +18,7 @@
 // glob and the generated code fails to compile.
 pub use onisync_core::{FileId, FileInfo, Preview, TagId};
 pub use onisyncd::api::{ApiError, ApiEvent};
+pub use onisyncd::configuration::EditorRule;
 pub use onisyncd::database::{DeletedRule, SubtagRule, Tag};
 pub use onisyncd::operations::{
     Direction, Operation, OperationEvent, OperationKind, OperationStatus,
@@ -168,6 +169,28 @@ pub enum _SubtagRule {
 pub enum _DeletedRule {
     Include,
     Exclude,
+}
+
+/// An external-editor rule flattened for the Dart UI.
+///
+/// Mirrors [`EditorRule`] as a DTO with plain `String` fields (rather than an
+/// opaque handle) so the Dart side can read `tag` / `command` directly when
+/// choosing which command to launch; see [`FileEntry`] for the same
+/// DTO-flattening pattern used elsewhere in this crate.
+pub struct EditorRuleEntry {
+    /// Tag name to match against the file's applied tags.
+    pub tag: String,
+    /// The editor command (whitespace-split into argv, file path appended).
+    pub command: String,
+}
+
+impl From<EditorRule> for EditorRuleEntry {
+    fn from(rule: EditorRule) -> Self {
+        Self {
+            tag: rule.tag,
+            command: rule.command,
+        }
+    }
 }
 
 /// A tag flattened into primitive fields for the Dart UI (see [`FileEntry`]).
@@ -611,6 +634,93 @@ impl OniSyncApp {
             .await?
             .to_string_lossy()
             .into_owned())
+    }
+
+    /// Start an external edit of `file_id`: return the on-disk path the UI
+    /// should hand to an editor.
+    ///
+    /// Two branches, transparent to the UI:
+    ///
+    /// - The file already lives in a local sync directory → the returned path
+    ///   is that real file; editing happens in place and the daemon's
+    ///   filesystem watcher picks up the save.
+    /// - Otherwise the daemon fetches the content into an isolated per-request
+    ///   temp path named after the file's logical basename
+    ///   (extension-preserving, so external editors dispatch by MIME
+    ///   correctly).
+    ///
+    /// Move semantics: the UI must consume the returned path by calling
+    /// [`Self::finish_edit_by_string`] (upload if bytes changed) or
+    /// [`Self::cancel_edit`] (abort + cleanup). A missed follow-up only leaks
+    /// a temp file that the daemon bulk-cleans on next start; no state is
+    /// tracked between calls.
+    pub async fn begin_edit_by_string(&self, file_id: String) -> Result<String, ApiError> {
+        let backend = self.try_backend()?;
+        let file_id = backend.resolve_file_id(file_id).await?;
+        Ok(backend
+            .begin_edit(file_id)
+            .await?
+            .to_string_lossy()
+            .into_owned())
+    }
+
+    /// Complete an external edit started with [`Self::begin_edit_by_string`].
+    ///
+    /// The daemon re-hashes the bytes at `path`; if different from the file's
+    /// current recorded content it publishes a new version (streaming from
+    /// `path`, never buffering). Either way it cleans up any daemon-owned
+    /// temp under its fetch temp dir; sync-dir paths (Branch A) are left
+    /// untouched.
+    ///
+    /// Returns `true` if a new version was published, `false` for a no-op
+    /// (editor produced no change, or the in-place edit was already ingested
+    /// by the daemon's filesystem watcher). Lets the UI show "edited" vs.
+    /// "no changes".
+    ///
+    /// The core [`onisyncd::api::EditOutcome`] type is flattened to a bare
+    /// bool here so the Dart side gets a plain value rather than an opaque
+    /// handle it would then need a getter for; see [`FileEntry`] for the
+    /// same DTO-flattening pattern used elsewhere in this crate.
+    pub async fn finish_edit_by_string(
+        &self,
+        file_id: String,
+        path: String,
+    ) -> Result<bool, ApiError> {
+        let backend = self.try_backend()?;
+        let file_id = backend.resolve_file_id(file_id).await?;
+        Ok(backend
+            .finish_edit(file_id, std::path::PathBuf::from(path))
+            .await?
+            .changed)
+    }
+
+    /// Abort an external edit without publishing. Cleans up any daemon-owned
+    /// temp at `path`; a sync-dir path is left untouched. Called by the UI
+    /// when the launcher itself fails (no editor available, user cancelled,
+    /// etc.) so the daemon does not leave a temp behind.
+    pub async fn cancel_edit(&self, path: String) -> Result<(), ApiError> {
+        self.try_backend()?
+            .cancel_edit(std::path::PathBuf::from(path))
+            .await
+    }
+
+    /// The daemon's configured external-editor rules (see [`EditorRule`]) as
+    /// flattened [`EditorRuleEntry`] rows the Dart UI reads directly.
+    ///
+    /// The desktop UI consults these when preparing an edit: it walks the
+    /// list in order, and the first rule whose `tag` matches one of the
+    /// file's applied tag names wins — its `command` is spawned with the
+    /// file path as the final arg. If no rule matches, the UI falls back to
+    /// `$VISUAL` / `$EDITOR`. An empty list means every file goes through
+    /// that fallback.
+    pub async fn editor_rules(&self) -> Result<Vec<EditorRuleEntry>, ApiError> {
+        Ok(self
+            .try_backend()?
+            .editor_rules()
+            .await?
+            .into_iter()
+            .map(EditorRuleEntry::from)
+            .collect())
     }
 
     /// Get a single tag's flattened [`TagEntry`] by id string (a full or short

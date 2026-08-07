@@ -10,10 +10,10 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
-import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
 import '../bootstrap/bootstrap.dart';
+import '../editor/editor_launcher.dart';
 import '../rust/api.dart' as onisync;
 import '../onisync_service.dart';
 import '../widgets/file_preview.dart';
@@ -64,6 +64,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
   bool _restoring = false;
   bool _sharing = false;
   bool _downloading = false;
+  bool _editing = false;
 
   onisync.OniSyncApp get _app => widget.session.app;
 
@@ -305,54 +306,32 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
   /// the bytes we share that path directly; otherwise we fetch the content to a
   /// daemon-owned temp file first (from a peer if needed) and share that.
   ///
-  /// A locally-held path is shared in place. A fetched temp file is handed to
-  /// us with move semantics: we rename it under a dedicated share dir so its
-  /// filename matches the logical name (see below), then delete that dir after
-  /// the share sheet returns.
+  /// Both branches share the fetched path directly. The daemon materialises
+  /// fetches as `<fetch_temp_dir>/<uuid>/<logical_basename>` so the on-disk
+  /// name already carries the file's real extension — receiving apps
+  /// dispatch by MIME correctly without any client-side renaming. Move
+  /// semantics on the fetched path: we clean up the per-request subdir when
+  /// we are done.
   Future<void> _shareFile() async {
     final file = _file;
     if (file == null) return;
     setState(() => _sharing = true);
-    // A temp directory we fully own for this share, deleted in `finally`. Only
-    // created when we fetch (a local file is shared in place, untouched).
-    Directory? shareDir;
-    // The logical file name — its extension is what receiving apps use to infer
-    // the type, so the shared file on disk MUST carry it (an `XFile.name`
-    // override is not enough: many targets read the path's extension, and the
-    // daemon's fetched temp file is named with an extension-less UUID).
+    // Set to the fetched path's parent (the daemon's per-request `<uuid>`
+    // subdir) when we fetch, so we can clean it up in `finally`. `null` for
+    // the local-path branch where we do not own the file.
+    String? fetchedParent;
     final name = file.path.split('/').last;
     try {
       var path = _localPath;
       if (path == null) {
-        // Not present locally: fetch the bytes to a daemon-owned temp file...
-        final fetched = await _app.fetchFileByString(
+        // Not present locally: fetch the bytes to a daemon-owned temp file.
+        // The daemon materialises it with the correct basename, so we can
+        // share the fetched path in place — no renaming, no extra staging.
+        path = await _app.fetchFileByString(
           fileId: widget.fileId,
           expectedHash: file.contentHash,
         );
-        // ...then move it to `<temp>/onisync_share/<logicalName>` so the shared
-        // file has the correct name + extension. A per-share subdir avoids
-        // collisions when the logical name repeats across shares.
-        final base = await getTemporaryDirectory();
-        shareDir = Directory(
-          '${base.path}/onisync_share/${DateTime.now().microsecondsSinceEpoch}',
-        );
-        await shareDir.create(recursive: true);
-        final named = '${shareDir.path}/$name';
-        final fetchedFile = File(fetched);
-        try {
-          // Cheap path: same filesystem, just relink.
-          await fetchedFile.rename(named);
-        } on FileSystemException {
-          // The daemon's fetch temp dir may be on a different mount than the
-          // app temp dir; rename can't cross filesystems, so copy then delete.
-          await fetchedFile.copy(named);
-          try {
-            await fetchedFile.delete();
-          } catch (_) {
-            // Best-effort; the original still lives in the daemon temp dir.
-          }
-        }
-        path = named;
+        fetchedParent = File(path).parent.path;
       }
       await Share.shareXFiles([XFile(path, name: name)]);
     } catch (error) {
@@ -362,12 +341,14 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
           : 'Failed to share file: $error';
       _snack(message);
     } finally {
-      // Clean up the fetched copy (move semantics); best-effort.
-      if (shareDir != null) {
+      // Clean up the daemon-owned per-request subdir (move semantics on the
+      // fetched path). Best-effort — the daemon bulk-wipes `fetch_temp_dir`
+      // on its next start regardless.
+      if (fetchedParent != null) {
         try {
-          await shareDir.delete(recursive: true);
+          await Directory(fetchedParent).delete(recursive: true);
         } catch (_) {
-          // Nothing to do if cleanup fails; it lives in a temp dir.
+          // Nothing to do.
         }
       }
       if (mounted) setState(() => _sharing = false);
@@ -387,14 +368,23 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     final downloadsDir = widget.session.downloadsDir;
     if (file == null || downloadsDir == null) return;
     setState(() => _downloading = true);
-    String? tempPath;
+    // The daemon-owned per-request subdir (parent of a fetched path). We
+    // clean it up in `finally` regardless of whether the file inside was
+    // moved out or not — a successful rename leaves the subdir empty; a
+    // failed copy leaves both the subdir and the temp behind.
+    String? fetchedParent;
     try {
       final localPath = _localPath;
-      final source = localPath ??
-          (tempPath = await _app.fetchFileByString(
-            fileId: widget.fileId,
-            expectedHash: file.contentHash,
-          ));
+      final String source;
+      if (localPath != null) {
+        source = localPath;
+      } else {
+        source = await _app.fetchFileByString(
+          fileId: widget.fileId,
+          expectedHash: file.contentHash,
+        );
+        fetchedParent = File(source).parent.path;
+      }
 
       final name = file.path.split('/').last;
       final dir = Directory(downloadsDir);
@@ -410,7 +400,6 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
         final fetched = File(source);
         try {
           await fetched.rename(dest);
-          tempPath = null; // consumed by the move
         } on FileSystemException {
           await fetched.copy(dest);
         }
@@ -423,15 +412,111 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
           : 'Failed to download file: $error';
       _snack(message);
     } finally {
-      // Clean up a fetched temp file we didn't move; best-effort.
-      if (tempPath != null) {
+      // Clean up the daemon-owned per-request subdir. Best-effort — the
+      // daemon bulk-wipes `fetch_temp_dir` on next start regardless.
+      if (fetchedParent != null) {
         try {
-          await File(tempPath).delete();
+          await Directory(fetchedParent).delete(recursive: true);
         } catch (_) {
           // Nothing to do; it lives in a temp dir.
         }
       }
       if (mounted) setState(() => _downloading = false);
+    }
+  }
+
+  /// Hand this file to an external editor, then let the daemon publish a new
+  /// version if the bytes changed.
+  ///
+  /// A thin driver over the daemon's stateless edit protocol:
+  ///
+  ///   1. `beginEditByString` returns a path — either the real sync-dir
+  ///      file (Branch A) or a daemon-owned temp under `fetch_temp_dir`
+  ///      named with the file's logical basename (Branch B, extension
+  ///      preserving so editors dispatch by MIME correctly).
+  ///   2. The platform-specific [EditorLauncher] opens the editor and
+  ///      blocks until the user is done (Linux: `await exitCode`; Android:
+  ///      `ACTION_EDIT` + first `onResume` wins).
+  ///   3. `finishEditByString` re-hashes the bytes; if different from the
+  ///      DB, streams the new content to peers. Either way it cleans up any
+  ///      daemon-owned temp.
+  ///
+  /// On launcher failure we call `cancelEdit` so the daemon does not leave
+  /// a temp behind (sync-dir paths are left alone). A crash between (1) and
+  /// (3) leaks only a temp file that the daemon bulk-wipes on next start.
+  ///
+  /// The Edit button is gated on the session carrying an [EditorLauncher];
+  /// this is a defensive nullness check for the same condition.
+  Future<void> _editFile() async {
+    final file = _file;
+    final launcher = widget.session.editorLauncher;
+    if (file == null || launcher == null) return;
+    setState(() => _editing = true);
+    String? beginPath;
+    try {
+      beginPath = await _app.beginEditByString(fileId: widget.fileId);
+
+      // The user-facing name (extension included) is what the Linux launcher
+      // shows in errors and the Android launcher sniffs a MIME from. Take
+      // it from the file's logical path so a nested `foo/bar.png` becomes
+      // just `bar.png`.
+      final logicalName = file.path.split('/').last;
+
+      // Fetch the applied tag *names* for the launcher's rule matching.
+      // We already have `_appliedTags` (id → TagEntry) loaded, so pull the
+      // names straight from there rather than a fresh round-trip.
+      final tagNames = [
+        for (final id in _appliedTagIds)
+          if (_appliedTags[id] != null) _appliedTags[id]!.name,
+      ];
+
+      // Rules are per-daemon config; fetching them per edit is a cheap
+      // round-trip and keeps a live edit reactive to config changes without
+      // an app restart.
+      final rules = await _app.editorRules();
+
+      try {
+        await launcher.launchAndWait(
+          path: beginPath,
+          logicalName: logicalName,
+          appliedTagNames: tagNames,
+          rules: rules,
+        );
+      } catch (error) {
+        // The launcher never got started (no rule matched + no $EDITOR, no
+        // app handles the MIME on Android, editor exited nonzero). Tell the
+        // daemon to clean up, then surface the failure.
+        await _app.cancelEdit(path: beginPath);
+        beginPath = null;
+        final message = error is EditorLaunchException
+            ? error.message
+            : 'Failed to launch editor: $error';
+        _snack(message);
+        return;
+      }
+
+      final changed = await _app.finishEditByString(
+        fileId: widget.fileId,
+        path: beginPath,
+      );
+      beginPath = null; // finish_edit consumed / cleaned up.
+      if (!mounted) return;
+      _snack(changed ? 'Edited "${file.path}".' : 'No changes.');
+      // Live update flows in via the change stream (`_watch`) — no manual
+      // reload needed.
+    } catch (error) {
+      // begin_edit / finish_edit failed. If we have a path we obtained but
+      // never handed off, cancel it so the daemon does not leave a temp.
+      if (beginPath != null) {
+        try {
+          await _app.cancelEdit(path: beginPath);
+        } catch (_) {
+          // Best-effort; daemon bulk-wipes on next start.
+        }
+      }
+      _snack('Failed to edit file: $error');
+    } finally {
+      if (mounted) setState(() => _editing = false);
     }
   }
 
@@ -508,6 +593,25 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
                   : const Icon(Icons.download_outlined),
               tooltip: 'Download file',
               onPressed: _downloading ? null : _downloadFile,
+            ),
+          // Open in an external editor. Gated on the session carrying an
+          // EditorLauncher — currently non-null on both Android (ACTION_EDIT
+          // via FileProvider) and Linux ($EDITOR or a daemon-configured tag
+          // rule). Only for live files, and disabled while an edit is in
+          // flight so a second tap does not overlap.
+          if (file != null &&
+              !file.deleted &&
+              widget.session.editorLauncher != null)
+            IconButton(
+              icon: _editing
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.edit_note_outlined),
+              tooltip: 'Edit file',
+              onPressed: _editing ? null : _editFile,
             ),
           // Share to the OS share sheet, to the right of delete/restore.
           // Mobile-only (gated on the session's public-key hint, which is

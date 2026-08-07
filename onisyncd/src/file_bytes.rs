@@ -67,36 +67,19 @@ pub enum FileBytes {
 /// error variant: it is handled transparently by a stream-copy-then-delete
 /// fallback (see [`FileBytes::materialize_to`]), so it surfaces only as an `Io`
 /// error if that fallback itself fails.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum FileBytesError {
     /// An I/O error occurred against `path` (or an in-memory buffer when
     /// `path` is `None`).
+    #[error("I/O error{}: {source}", match path {
+        Some(p) => format!(" for {}", p.display()),
+        None => String::new(),
+    })]
     Io {
         path: Option<PathBuf>,
+        #[source]
         source: std::io::Error,
     },
-}
-
-impl std::fmt::Display for FileBytesError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FileBytesError::Io {
-                path: Some(path),
-                source,
-            } => write!(formatter, "I/O error for {}: {source}", path.display()),
-            FileBytesError::Io { path: None, source } => {
-                write!(formatter, "I/O error: {source}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for FileBytesError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            FileBytesError::Io { source, .. } => Some(source),
-        }
-    }
 }
 
 impl FileBytes {

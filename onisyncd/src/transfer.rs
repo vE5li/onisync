@@ -83,49 +83,28 @@ pub struct ChunkRequest {
 }
 
 /// Why a receive failed.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum TransferError {
     /// A chunk was missed from every reachable direction (the version is
     /// superseded, or the only holder is unreachable). No retry helps.
+    #[error("chunk at offset {offset} unavailable from any peer")]
     ChunkUnavailable { offset: u64 },
     /// A *connected* peer accepted the request but went silent for
     /// [`HOP_TIMEOUT`](crate::fetch::HOP_TIMEOUT): no chunk was written within
     /// the per-chunk liveness window. The one guard against hanging forever.
+    #[error("transfer stalled (liveness timeout)")]
     LivenessTimeout,
     /// The reassembled content did not hash to the expected value.
+    #[error("content hash mismatch: expected {expected}, got {actual}")]
     HashMismatch { expected: String, actual: String },
     /// A local I/O error writing the temp file.
-    Io(std::io::Error),
+    #[error("transfer I/O error: {0}")]
+    Io(#[source] std::io::Error),
     /// The inbound reply channel closed before the receive completed (the link
     /// dropped).
+    #[error("transfer channel closed early")]
     ChannelClosed,
 }
-
-impl std::fmt::Display for TransferError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TransferError::ChunkUnavailable { offset } => {
-                write!(
-                    formatter,
-                    "chunk at offset {offset} unavailable from any peer"
-                )
-            }
-            TransferError::LivenessTimeout => {
-                write!(formatter, "transfer stalled (liveness timeout)")
-            }
-            TransferError::HashMismatch { expected, actual } => {
-                write!(
-                    formatter,
-                    "content hash mismatch: expected {expected}, got {actual}"
-                )
-            }
-            TransferError::Io(error) => write!(formatter, "transfer I/O error: {error}"),
-            TransferError::ChannelClosed => write!(formatter, "transfer channel closed early"),
-        }
-    }
-}
-
-impl std::error::Error for TransferError {}
 
 /// The outcome of a receive, delivered once it finishes.
 pub enum ReceiveOutcome {

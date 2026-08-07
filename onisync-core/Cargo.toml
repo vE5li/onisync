@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 serde = { workspace = true }
 rusqlite = { workspace = true }
+thiserror = { workspace = true }
 uuid = { workspace = true }

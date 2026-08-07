@@ -23,14 +23,21 @@ fn contains_all_tags(sync_directory_tags: &[TagId], file_tags: &[TagId]) -> bool
         .all(|tag_id| file_tags.contains(tag_id))
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, thiserror::Error)]
 enum SyncDirectoryError {
+    #[error("directory is not monitored")]
     UnmonitoredDirectory,
+    #[error("failed to read file")]
     FailedToReadFile,
+    #[error("tracked file is missing")]
     MissingTrackedFile,
+    #[error("failed to add file")]
     FailedAddingFile,
+    #[error("failed to change file")]
     FailedChangingFile,
+    #[error("failed to move file")]
     FailedMovingFile,
+    #[error("failed to remove file")]
     FailedRemovingFile,
 }
 
@@ -1875,6 +1882,7 @@ mod tests {
             peers: Vec::new(),
             tags: Vec::new(),
             preview_generation_policy: crate::configuration::PreviewGenerationPolicy::Lazy,
+            editor_rules: Vec::new(),
         };
         let paths = Paths::new(data_dir, data_dir.join("identity"));
         let (change_sender, _change_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -2058,6 +2066,7 @@ mod tests {
             peers: Vec::new(),
             tags: Vec::new(),
             preview_generation_policy: crate::configuration::PreviewGenerationPolicy::Lazy,
+            editor_rules: Vec::new(),
         };
         let paths = Paths::new(&data_dir, data_dir.join("identity"));
         let (change_sender, mut change_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -2126,6 +2135,7 @@ mod tests {
             peers: Vec::new(),
             tags: Vec::new(),
             preview_generation_policy: crate::configuration::PreviewGenerationPolicy::Lazy,
+            editor_rules: Vec::new(),
         };
         let paths = Paths::new(data_dir, data_dir.join("identity"));
         let (change_sender, change_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -2293,6 +2303,7 @@ mod tests {
             peers: Vec::new(),
             tags: Vec::new(),
             preview_generation_policy: crate::configuration::PreviewGenerationPolicy::Lazy,
+            editor_rules: Vec::new(),
         };
         let paths = Paths::new(&data_dir, data_dir.join("identity"));
         let (change_sender, _change_receiver) = tokio::sync::mpsc::unbounded_channel();

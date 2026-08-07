@@ -17,6 +17,14 @@ class MainActivity : FlutterActivity() {
         private const val TAG = "onisync"
     }
 
+    /**
+     * External-editor channel. Fires `ACTION_EDIT` intents and notifies
+     * Flutter when the user returns from the editor via [onResume]. Owned by
+     * the activity (not the runtime): its state (a "pending resume" flag) is
+     * per-launch, and its callback plumbing needs an [Activity] handle.
+     */
+    private val editorChannel = EditorChannel(this)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         maybeStartRuntime()
@@ -53,13 +61,22 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+
+        // Wire the external-editor channel onto the same engine. See
+        // [EditorChannel] for the launch/return contract.
+        editorChannel.register(flutterEngine)
     }
 
     // The user may grant "All files access" in Settings and return here; re-check
     // and start the runtime on resume so we don't require an app restart.
+    //
+    // Also the signal we surface as "editor returned" to Flutter — the first
+    // resume after [EditorChannel.launch] wins (see EditorChannel for
+    // rationale).
     override fun onResume() {
         super.onResume()
         maybeStartRuntime()
+        editorChannel.onActivityResumed()
     }
 
     /**

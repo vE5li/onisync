@@ -42,7 +42,8 @@ use onisync_core::state::Change;
 use onisync_core::{FileId, FileInfo, Preview, TagId};
 use tokio::sync::broadcast;
 
-use crate::api::{Api, ApiError, ApiEvent, QueryResult};
+use crate::api::{Api, ApiError, ApiEvent, EditOutcome, QueryResult};
+use crate::configuration::EditorRule;
 use crate::database::{DeletedRule, SubtagRule, Tag};
 use crate::operations::{Operation, OperationEvent};
 
@@ -174,6 +175,63 @@ pub trait TransportBackend {
         path: PathBuf,
     ) -> impl Future<Output = Result<(), ApiError>> + Send;
 
+    /// Start an external edit: return the on-disk path the caller should hand
+    /// to an editor.
+    ///
+    /// Two branches, transparent to the caller:
+    ///
+    /// - The file is present in a local sync directory → the returned path is
+    ///   that real on-disk file, edited in place. The daemon's filesystem
+    ///   watcher will pick up the save and propagate a `FileMetadataChanged` on
+    ///   its own; [`finish_edit`](Self::finish_edit) is still called and acts
+    ///   as a "did the bytes change vs. the current DB hash?" belt-and-braces
+    ///   check.
+    /// - Otherwise the daemon fetches the content (from a peer if needed) into
+    ///   an isolated per-request subdirectory under
+    ///   [`crate::paths::Paths::fetch_temp_dir`], named with the file's logical
+    ///   basename so an external editor dispatches by extension correctly. Move
+    ///   semantics: the caller must consume via
+    ///   [`finish_edit`](Self::finish_edit) or
+    ///   [`cancel_edit`](Self::cancel_edit).
+    ///
+    /// No daemon-side state is kept between `begin_edit` and
+    /// `finish_edit`/`cancel_edit`; the caller's `file_id`+`path` fully
+    /// describe the follow-up. A caller that crashes before finishing leaks
+    /// only a temp file, which the daemon bulk-cleans on next start.
+    fn begin_edit(&self, file_id: FileId)
+    -> impl Future<Output = Result<PathBuf, ApiError>> + Send;
+
+    /// Complete an in-flight external edit.
+    ///
+    /// `path` is the path returned by [`begin_edit`](Self::begin_edit) (the
+    /// bytes at that path are the editor's output). The daemon re-hashes
+    /// them, compares to the file's current recorded `content_hash`, and:
+    ///
+    /// - if equal → nothing to do (either the editor produced no change, or the
+    ///   file was edited in place and the watcher already published the
+    ///   change);
+    /// - if different → publish a new version by streaming `path` to peers via
+    ///   the same provider protocol as [`edit_file`](Self::edit_file).
+    ///
+    /// After that the daemon deletes `path` **only if it lives under**
+    /// [`crate::paths::Paths::fetch_temp_dir`] (the isolated per-request
+    /// subdirectory it created in `begin_edit`). Paths under sync
+    /// directories, or anywhere else the caller may have staged bytes, are
+    /// left untouched.
+    fn finish_edit(
+        &self,
+        file_id: FileId,
+        path: PathBuf,
+    ) -> impl Future<Output = Result<EditOutcome, ApiError>> + Send;
+
+    /// Abort an in-flight external edit without uploading.
+    ///
+    /// `path` is the path returned by [`begin_edit`](Self::begin_edit).
+    /// Cleans up the daemon-owned temp exactly as
+    /// [`finish_edit`](Self::finish_edit) does (delete iff under
+    /// [`crate::paths::Paths::fetch_temp_dir`]).
+    fn cancel_edit(&self, path: PathBuf) -> impl Future<Output = Result<(), ApiError>> + Send;
+
     /// Fetch a file's content on demand (from a peer if not present locally)
     /// and return the path to a temp file holding it. `expected_hash` gates
     /// which content is accepted.
@@ -247,6 +305,11 @@ pub trait TransportBackend {
     /// removed. Previews are hash-keyed and regenerated on demand, so this only
     /// forces re-evaluation on the next request.
     fn purge_previews(&self) -> impl Future<Output = Result<usize, ApiError>> + Send;
+
+    /// The daemon's configured external-editor rules (see
+    /// [`crate::configuration::EditorRule`]). A snapshot read; the desktop UI
+    /// calls this once when preparing to launch an editor.
+    fn editor_rules(&self) -> impl Future<Output = Result<Vec<EditorRule>, ApiError>> + Send;
 
     /// Subscribe to the live change stream. Returns an [`EventStream`] whose
     /// [`recv`](EventStream::recv) yields [`ApiEvent`]s.
@@ -505,6 +568,18 @@ impl TransportBackend for InProcessBackend {
         Ok(())
     }
 
+    async fn begin_edit(&self, file_id: FileId) -> Result<PathBuf, ApiError> {
+        self.api.begin_edit(file_id).await
+    }
+
+    async fn finish_edit(&self, file_id: FileId, path: PathBuf) -> Result<EditOutcome, ApiError> {
+        self.api.finish_edit(file_id, path).await
+    }
+
+    async fn cancel_edit(&self, path: PathBuf) -> Result<(), ApiError> {
+        self.api.cancel_edit(path)
+    }
+
     async fn fetch_file(
         &self,
         file_id: FileId,
@@ -551,6 +626,10 @@ impl TransportBackend for InProcessBackend {
 
     async fn purge_previews(&self) -> Result<usize, ApiError> {
         self.api.purge_previews().await
+    }
+
+    async fn editor_rules(&self) -> Result<Vec<EditorRule>, ApiError> {
+        Ok(self.api.editor_rules())
     }
 
     fn subscribe(&self) -> EventStream {
@@ -733,6 +812,27 @@ impl TransportBackend for Backend {
         }
     }
 
+    async fn begin_edit(&self, file_id: FileId) -> Result<PathBuf, ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.begin_edit(file_id).await,
+            Backend::Ipc(backend) => backend.begin_edit(file_id).await,
+        }
+    }
+
+    async fn finish_edit(&self, file_id: FileId, path: PathBuf) -> Result<EditOutcome, ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.finish_edit(file_id, path).await,
+            Backend::Ipc(backend) => backend.finish_edit(file_id, path).await,
+        }
+    }
+
+    async fn cancel_edit(&self, path: PathBuf) -> Result<(), ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.cancel_edit(path).await,
+            Backend::Ipc(backend) => backend.cancel_edit(path).await,
+        }
+    }
+
     async fn fetch_file(
         &self,
         file_id: FileId,
@@ -811,6 +911,13 @@ impl TransportBackend for Backend {
         match self {
             Backend::InProcess(backend) => backend.purge_previews().await,
             Backend::Ipc(backend) => backend.purge_previews().await,
+        }
+    }
+
+    async fn editor_rules(&self) -> Result<Vec<EditorRule>, ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.editor_rules().await,
+            Backend::Ipc(backend) => backend.editor_rules().await,
         }
     }
 

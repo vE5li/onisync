@@ -33,8 +33,11 @@ pub mod tag {
         Float(f64),
     }
 
+    #[derive(Debug, thiserror::Error)]
     pub enum QueryError {
+        #[error("not found")]
         NotFound,
+        #[error("wrong type")]
         WrongType,
     }
 
@@ -719,6 +722,22 @@ impl LogicalPath {
 
     pub fn into_string(self) -> String {
         self.0
+    }
+
+    /// The final `/`-separated component of the logical path, ignoring any
+    /// trailing slashes and empty segments — so `foo/bar/baz.txt` yields
+    /// `baz.txt`, `foo/bar/` yields `bar`, and an all-empty path yields `""`.
+    ///
+    /// This is the "file name" as far as OS-level tools (editors, share
+    /// sheets) are concerned: the extension it carries determines MIME/type
+    /// dispatch on both Linux and Android. Used when materialising a file
+    /// into a caller-visible temp path so the on-disk name matches the user's
+    /// mental model rather than an opaque UUID.
+    pub fn basename(&self) -> &str {
+        self.0
+            .rsplit('/')
+            .find(|segment| !segment.is_empty())
+            .unwrap_or("")
     }
 }
 

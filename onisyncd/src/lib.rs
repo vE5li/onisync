@@ -186,44 +186,26 @@ impl ShutdownSignal {
 }
 
 /// Errors that can abort startup of [`run`].
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum RunError {
     /// The identity key could not be loaded from `identity_file`.
+    #[error("failed to load identity key at {}: {source}", path.display())]
     Identity {
         path: PathBuf,
+        #[source]
         source: std::io::Error,
     },
     /// Opening the main database failed.
-    Database(database::DatabaseError),
+    #[error("failed to open main database: {0}")]
+    Database(#[source] database::DatabaseError),
     /// Binding the peer-sync listener failed.
+    #[error("failed to bind peer listener to {address}: {source}")]
     Bind {
         address: String,
+        #[source]
         source: std::io::Error,
     },
 }
-
-impl std::fmt::Display for RunError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RunError::Identity { path, source } => write!(
-                formatter,
-                "failed to load identity key at {}: {source}",
-                path.display()
-            ),
-            RunError::Database(error) => {
-                write!(formatter, "failed to open main database: {error:?}")
-            }
-            RunError::Bind { address, source } => {
-                write!(
-                    formatter,
-                    "failed to bind peer listener to {address}: {source}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for RunError {}
 
 /// Enqueue a `Change::TagAdded` for every tag declared in the configuration, so
 /// their definitions are guaranteed to exist before any tagging/reconciliation
@@ -411,6 +393,7 @@ pub async fn run(
         pending_fetches.clone(),
         fetch_temp_dir,
         operations.clone(),
+        configuration.editor_rules.clone(),
     );
 
     // The sync-directory manager is inherently single-threaded: it holds

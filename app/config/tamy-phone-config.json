@@ -1,8 +1,8 @@
 {
   "sync_directories": [
     {
-      "path": "$DOCUMENTS/sylvie-phone",
-      "sync_type": { "TagBased": { "tags": ["6450a8fe6eb945cc8b40adf4b97408bd", "52bbf75854a84b8cb2b715c237d0c8c8"] } }
+      "path": "$DOCUMENTS/tamy-phone",
+      "sync_type": { "TagBased": { "tags": ["6450a8fe6eb945cc8b40adf4b97408bd", "7c606d6f902945a4952adf39b0397de7"] } }
     }
   ],
   "listen_port": null,
