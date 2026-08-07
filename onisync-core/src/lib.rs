@@ -694,7 +694,19 @@ make_id_type!(TagId);
 /// decision that lives in the `onisync` crate (`physical_for`). Keeping them
 /// distinct makes the logical-vs-physical confusion a compile error rather than
 /// a convention.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+///
+/// # Containment invariant
+///
+/// A `LogicalPath` is **always a safe relative path** — see
+/// [`validate_relative_path`]. This is enforced on every path by which an
+/// untrusted value can enter the process: [`Deserialize`] (peer wire data) and
+/// [`FromSql`] (a database row, which may have been written by an older,
+/// unvalidating build). Upholding it here is what makes
+/// `sync_directory.path.join(physical_path)` in the daemon sound: without it a
+/// peer could advertise `/etc/cron.d/x` or `../../.bashrc` and, because
+/// `Path::join` *replaces* the base when handed an absolute path, steer daemon
+/// reads and writes anywhere on the filesystem.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct LogicalPath(String);
 
@@ -706,14 +718,167 @@ pub struct LogicalPath(String);
 /// actual on-disk name. Stored in `SyncDirectoryDatabase`
 /// (`files.physical_path`).
 ///
-/// See [`LogicalPath`] for why the two are not interchangeable.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+/// See [`LogicalPath`] for why the two are not interchangeable, and for the
+/// containment invariant both types uphold.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct PhysicalPath(String);
 
+/// Why a string was rejected as a relative path. See
+/// [`validate_relative_path`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RelativePathError {
+    #[error("path is empty")]
+    Empty,
+    #[error("path is absolute")]
+    Absolute,
+    #[error("path contains a `..` component")]
+    ParentDirComponent,
+    #[error("path contains a `.` component")]
+    CurrentDirComponent,
+    #[error("path contains an empty component (`//`)")]
+    EmptyComponent,
+    #[error("path contains a NUL byte")]
+    InteriorNul,
+}
+
+/// Check that `path` is a *safe relative path*: one that, when joined onto a
+/// sync-directory root, cannot escape it.
+///
+/// Enforced rules, and why each exists:
+///
+/// - **Non-empty.** An empty path joins to the root itself, turning a file
+///   operation into an operation on the whole sync directory.
+/// - **Not absolute.** [`std::path::Path::join`] *discards the base* when its
+///   argument is absolute, so `root.join("/etc/passwd")` is `/etc/passwd`. This
+///   is the single most dangerous case and is easy to miss when reading the
+///   call site.
+/// - **No `..` component.** Classic traversal; `root/../..` escapes upward.
+/// - **No `.` component and no empty component.** Neither escapes on its own,
+///   but both let the same file be spelled many ways (`a/b`, `a/./b`, `a//b`).
+///   Since `physical_path` doubles as the reverse index for filesystem events
+///   and as a uniqueness key (`physical_path_in_use_by_other`), non-canonical
+///   spellings would let one file masquerade as two. Rejecting is simpler than
+///   normalizing.
+/// - **No NUL byte.** Paths cross into C APIs as NUL-terminated strings; an
+///   interior NUL silently truncates, so `"safe.txt\0/../../etc/passwd"` could
+///   pass a naive string check and then address a different file.
+///
+/// A single trailing slash is tolerated and ignored, matching
+/// [`LogicalPath::basename`], which documents `foo/bar/` as yielding `bar`.
+///
+/// # What is deliberately *not* rejected
+///
+/// A leading `-` on a component (`-rf.txt`). It is tempting to forbid, since
+/// such a name looks like an option flag to any tool that receives it
+/// positionally. But it is a **legal Linux filename**, and rejecting it here
+/// would be unsound in a subtler way: local ingestion builds paths through the
+/// infallible [`LogicalPath::new`], so a user's own `-rf.txt` would be accepted
+/// on write and then rejected by [`FromSql`] on read, permanently breaking that
+/// row. Argument-injection risk belongs to whoever spawns a process, and is
+/// handled there — the external editor launcher passes an absolute path, which
+/// cannot begin with `-`.
+///
+/// The rules that *are* enforced above are all things a filesystem walk of a
+/// sync directory can never produce, so no such asymmetry arises for them.
+pub fn validate_relative_path(path: &str) -> Result<(), RelativePathError> {
+    if path.is_empty() {
+        return Err(RelativePathError::Empty);
+    }
+    if path.contains('\0') {
+        return Err(RelativePathError::InteriorNul);
+    }
+    if path.starts_with('/') {
+        return Err(RelativePathError::Absolute);
+    }
+
+    // Tolerate exactly one trailing slash (`foo/bar/`) so the documented
+    // `basename` behaviour keeps working, then split the rest strictly.
+    let trimmed = path.strip_suffix('/').unwrap_or(path);
+    if trimmed.is_empty() {
+        return Err(RelativePathError::Empty);
+    }
+
+    for component in trimmed.split('/') {
+        match component {
+            "" => return Err(RelativePathError::EmptyComponent),
+            "." => return Err(RelativePathError::CurrentDirComponent),
+            ".." => return Err(RelativePathError::ParentDirComponent),
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// Deserialize a validated relative path, or fail with the validation error.
+///
+/// Used by the [`Deserialize`] impls of both path newtypes. Peer wire data is
+/// the primary untrusted source, and failing here is fail-closed: the frame is
+/// rejected and the connection torn down rather than a bad path reaching the
+/// filesystem.
+fn deserialize_relative_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    let raw = String::deserialize(deserializer)?;
+    validate_relative_path(&raw)
+        .map_err(|error| D::Error::custom(format!("invalid path {raw:?}: {error}")))?;
+    Ok(raw)
+}
+
+/// Read a validated relative path from a database row.
+///
+/// Rows written by an older build predate [`validate_relative_path`], so this
+/// is not merely paranoia: it stops a value that was persisted before the check
+/// existed from being trusted now.
+fn column_relative_path(value: ValueRef<'_>) -> FromSqlResult<String> {
+    let raw = value.as_str()?.to_owned();
+    validate_relative_path(&raw)
+        .map_err(|error| rusqlite::types::FromSqlError::Other(Box::new(error)))?;
+    Ok(raw)
+}
+
+impl<'de> Deserialize<'de> for LogicalPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_relative_path(deserializer).map(Self)
+    }
+}
+
+impl<'de> Deserialize<'de> for PhysicalPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_relative_path(deserializer).map(Self)
+    }
+}
+
 impl LogicalPath {
+    /// Construct from a **trusted, locally derived** path — one produced by
+    /// this process from a filesystem walk, a `FileId`, or an operator-supplied
+    /// CLI argument.
+    ///
+    /// Deliberately infallible, and deliberately *not* the way untrusted data
+    /// enters: peer wire data goes through [`Deserialize`] and database rows
+    /// through [`FromSql`], both of which enforce
+    /// [`validate_relative_path`]. Use [`Self::try_new`] when the input's
+    /// provenance is uncertain.
     pub fn new(path: impl Into<String>) -> Self {
         Self(path.into())
+    }
+
+    /// Construct from a path of uncertain provenance, enforcing
+    /// [`validate_relative_path`].
+    pub fn try_new(path: impl Into<String>) -> Result<Self, RelativePathError> {
+        let path = path.into();
+        validate_relative_path(&path)?;
+        Ok(Self(path))
     }
 
     pub fn as_str(&self) -> &str {
@@ -742,8 +907,19 @@ impl LogicalPath {
 }
 
 impl PhysicalPath {
+    /// Construct from a **trusted, locally derived** path. See
+    /// [`LogicalPath::new`] for why this is infallible and where validation
+    /// actually happens.
     pub fn new(path: impl Into<String>) -> Self {
         Self(path.into())
+    }
+
+    /// Construct from a path of uncertain provenance, enforcing
+    /// [`validate_relative_path`].
+    pub fn try_new(path: impl Into<String>) -> Result<Self, RelativePathError> {
+        let path = path.into();
+        validate_relative_path(&path)?;
+        Ok(Self(path))
     }
 
     pub fn as_str(&self) -> &str {
@@ -785,7 +961,7 @@ impl ToSql for LogicalPath {
 
 impl FromSql for LogicalPath {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        Ok(Self(value.as_str()?.to_owned()))
+        column_relative_path(value).map(Self)
     }
 }
 
@@ -797,6 +973,130 @@ impl ToSql for PhysicalPath {
 
 impl FromSql for PhysicalPath {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        Ok(Self(value.as_str()?.to_owned()))
+        column_relative_path(value).map(Self)
+    }
+}
+
+#[cfg(test)]
+mod relative_path_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_ordinary_relative_paths() {
+        for path in [
+            "a.txt",
+            "photos/cat.jpg",
+            "a/b/c/d.txt",
+            "foo/bar/",
+            "weird name with spaces.txt",
+            "trailing-dash-inside-name.txt",
+            "8f14e45fceea167a5a36dedd4bea2543",
+        ] {
+            assert!(
+                validate_relative_path(path).is_ok(),
+                "expected {path:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_absolute_paths() {
+        // The critical case: `Path::join` discards the base for these.
+        assert_eq!(
+            validate_relative_path("/etc/passwd"),
+            Err(RelativePathError::Absolute)
+        );
+        assert_eq!(
+            validate_relative_path("/"),
+            Err(RelativePathError::Absolute)
+        );
+    }
+
+    #[test]
+    fn rejects_traversal() {
+        assert_eq!(
+            validate_relative_path(".."),
+            Err(RelativePathError::ParentDirComponent)
+        );
+        assert_eq!(
+            validate_relative_path("../../.bashrc"),
+            Err(RelativePathError::ParentDirComponent)
+        );
+        assert_eq!(
+            validate_relative_path("a/../../b"),
+            Err(RelativePathError::ParentDirComponent)
+        );
+        // `..` only as a whole component; a filename may contain dots.
+        assert!(validate_relative_path("a/..b/c").is_ok());
+        assert!(validate_relative_path("..hidden.txt").is_ok());
+    }
+
+    #[test]
+    fn rejects_non_canonical_spellings() {
+        assert_eq!(
+            validate_relative_path("a//b"),
+            Err(RelativePathError::EmptyComponent)
+        );
+        assert_eq!(
+            validate_relative_path("a/./b"),
+            Err(RelativePathError::CurrentDirComponent)
+        );
+        assert_eq!(validate_relative_path(""), Err(RelativePathError::Empty));
+        assert_eq!(
+            validate_relative_path("/"),
+            Err(RelativePathError::Absolute)
+        );
+    }
+
+    #[test]
+    fn rejects_interior_nul() {
+        // Would truncate when handed to a C API, so the checked string and the
+        // addressed file could differ.
+        assert_eq!(
+            validate_relative_path("safe.txt\0/../../etc/passwd"),
+            Err(RelativePathError::InteriorNul)
+        );
+    }
+
+    #[test]
+    fn accepts_leading_dash_component() {
+        // Legal Linux filenames. Rejecting them here would break the user's
+        // own files on read-back; see `validate_relative_path`'s docs.
+        assert!(validate_relative_path("-rf").is_ok());
+        assert!(validate_relative_path("a/--config=evil").is_ok());
+    }
+
+    #[test]
+    fn deserialize_rejects_hostile_peer_paths() {
+        // The actual attack shape: a peer advertises a path that escapes the
+        // sync root. Both newtypes must refuse to decode it at all.
+        for hostile in ["/etc/cron.d/x", "../../.bashrc", "a//b", "x\0y"] {
+            let json = serde_json::to_string(hostile).unwrap();
+            assert!(
+                serde_json::from_str::<LogicalPath>(&json).is_err(),
+                "LogicalPath accepted {hostile:?}"
+            );
+            assert!(
+                serde_json::from_str::<PhysicalPath>(&json).is_err(),
+                "PhysicalPath accepted {hostile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deserialize_accepts_valid_paths_and_round_trips() {
+        let path = LogicalPath::new("photos/cat.jpg");
+        let json = serde_json::to_string(&path).unwrap();
+        assert_eq!(json, "\"photos/cat.jpg\"");
+        assert_eq!(serde_json::from_str::<LogicalPath>(&json).unwrap(), path);
+    }
+
+    #[test]
+    fn try_new_matches_validator() {
+        assert!(PhysicalPath::try_new("a/b.txt").is_ok());
+        assert_eq!(
+            PhysicalPath::try_new("/abs"),
+            Err(RelativePathError::Absolute)
+        );
     }
 }

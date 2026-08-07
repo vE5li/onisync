@@ -2,23 +2,66 @@
 // its exit.
 //
 // The editor to spawn is resolved by consulting the daemon-configured
-// tag-based rules first (first rule whose `tag` name is applied to the file
-// wins) and falling back to `$VISUAL` / `$EDITOR`. Both mechanisms follow the
-// CLI's `open_in_editor` shape: the argv is passed straight to
-// `Process.start`, the file path is appended, and we block on `exitCode`.
-// This makes the launcher inherit the CLI's contract with the shell: the
-// command must run in the foreground and exit when the user is done. A
-// backgrounding launcher (`xdg-open`, `nohup`, `gtk-launch`) would return
-// immediately and confuse the "editing finished" signal — those are not
-// supported.
+// tag-based rules (first rule whose `tag_id` is applied to the file wins).
+// There is deliberately **no `$VISUAL`/`$EDITOR` fallback**: those env vars
+// name terminal editors (`vi`, `nvim`, `nano`), and running one from a GUI
+// process with no controlling TTY hangs forever — the child neither errors
+// out nor produces output, so `Process.run` never returns. The CLI's
+// `open_in_editor` uses that env-var chain safely because it runs inside a
+// terminal already; the desktop app cannot. If no rule matches, we surface a
+// clear error instead of silently invoking something that will misbehave.
 //
-// Command strings are tokenised by whitespace, which is deliberately
-// primitive: it covers `code --wait` / `gimp` / `inkscape --file` / etc.
-// without needing a shell. Quoted arguments and shell metacharacters are not
-// supported; if you need them, wrap the command in a small script and point
-// the rule at that script.
+// The rule's `argv` is passed straight to `Process.run` with the file path
+// appended as the final argument. The command must run in the foreground and
+// exit when the user is done editing — the process exit is our "editing
+// finished" signal. A backgrounding launcher (`xdg-open`, `nohup`,
+// `gtk-launch`) would return immediately and confuse that signal; those are
+// not supported.
+//
+// ---------------------------------------------------------------------------
+// Security model
+// ---------------------------------------------------------------------------
+//
+// An editor rule is arbitrary code execution by design — "run this program" is
+// the whole feature. The trust anchor is therefore **write access to the
+// daemon's config file**, and nothing else: rules are read once at startup
+// from local config, are never synced from peers or persisted to the database,
+// and have no runtime setter. The three properties below keep that the *only*
+// way to influence what runs.
+//
+// 1. No shell, ever. `runInShell: false` means Dart goes straight to `execvp`
+//    with an argv array. `;`, `$(...)`, backticks and globs have no meaning,
+//    and the file path — which is peer-influenced data, since a peer chooses
+//    the filename it advertises — is passed as one discrete argv element that
+//    can never be re-parsed as syntax.
+//
+// 2. `argv[0]` must be absolute. A bare name like `gimp` would be resolved
+//    through `PATH` inherited from this process, so anyone able to prepend a
+//    directory to `PATH` could substitute the editor. Requiring an absolute
+//    path removes the lookup entirely.
+//
+//    This is a deliberate ergonomics trade-off, and it is a cheap one on
+//    NixOS, the target platform: executables live at immutable `/nix/store`
+//    paths surfaced through stable symlink trees
+//    (`/run/current-system/sw/bin/gimp`, `~/.nix-profile/bin/inkscape`), so an
+//    absolute path is both the natural thing to write and stable across
+//    rebuilds. On a distro where binaries move between `/bin` and `/usr/bin`
+//    this rule would be more annoying; here it costs essentially nothing. If
+//    this ever needs relaxing, resolve bare names against a *hardcoded* PATH
+//    rather than the inherited one — do not simply drop the check.
+//
+// 3. The child gets a scrubbed environment. See [_childEnvironment].
+//
+// Note also that the file path can never be parsed as an option flag by the
+// editor: we always pass it through `.absolute`, so it begins with `/` even if
+// the peer-chosen filename begins with `-`. (onisync-core deliberately permits
+// leading-dash filenames, since they are legal on Linux — see
+// `validate_relative_path` — so this normalisation is what actually closes the
+// argument-injection case, not a restriction upstream.)
 
 import 'dart:io';
+
+import 'package:flutter/foundation.dart' show visibleForTesting;
 
 import '../rust/api.dart' as onisync;
 import 'editor_launcher.dart';
@@ -28,21 +71,29 @@ class LinuxEditorLauncher implements EditorLauncher {
   Future<void> launchAndWait({
     required String path,
     required String logicalName,
-    required List<String> appliedTagNames,
+    required List<String> appliedTagIds,
     required List<onisync.EditorRuleEntry> rules,
   }) async {
-    final argv = _resolveCommand(appliedTagNames: appliedTagNames, rules: rules);
+    final argv = resolveArgv(appliedTagIds: appliedTagIds, rules: rules);
+
     // Convention matches the CLI's `open_in_editor` (onisync/src/main.rs):
     // path is the last argument. Users writing rules can rely on it.
-    final args = [...argv.skip(1), path];
+    //
+    // `.absolute` is belt-and-braces: the daemon already returns an absolute
+    // path, but if that ever changed, a relative path here would be resolved
+    // against the *app's* working directory rather than the user's, silently
+    // editing the wrong file.
+    final args = [...argv.skip(1), File(path).absolute.path];
 
     final ProcessResult result;
     try {
-      // `runInShell: false` — we already argv-split the command ourselves and
-      // deliberately do not want the shell to re-interpret arguments (globs,
-      // env, quoting). If a rule needs shell semantics it should call a
-      // wrapper script explicitly.
-      result = await Process.run(argv[0], args, runInShell: false);
+      result = await Process.run(
+        argv[0],
+        args,
+        runInShell: false,
+        includeParentEnvironment: false,
+        environment: _childEnvironment(),
+      );
     } on ProcessException catch (error) {
       throw EditorLaunchException(
         'failed to launch editor "${argv[0]}": ${error.message}',
@@ -62,45 +113,93 @@ class LinuxEditorLauncher implements EditorLauncher {
     }
   }
 
-  /// Walk `rules` in declaration order; the first rule whose `tag` is in
-  /// `appliedTagNames` wins. Falls back to `$VISUAL` then `$EDITOR`. Throws
-  /// [EditorLaunchException] if neither is set and no rule matches — mirroring
-  /// the CLI's "no editor configured" failure mode rather than silently
-  /// picking a default like `vi` (which would open in-terminal from a GUI
-  /// process, going nowhere).
-  static List<String> _resolveCommand({
-    required List<String> appliedTagNames,
+  /// Walk `rules` in declaration order; the first rule whose `tag_id` is in
+  /// `appliedTagIds` wins. Throws [EditorLaunchException] if no rule matches
+  /// — see the file-level doc for why there is no `$VISUAL`/`$EDITOR`
+  /// fallback.
+  ///
+  /// A rule whose `argv` is unusable (empty, or a non-absolute `argv[0]`) is
+  /// rejected loudly rather than skipped. Skipping would silently fall through
+  /// to a *different* editor than the operator configured, which is both
+  /// confusing and, for a rule that fails the absolute-path check, exactly the
+  /// case where staying quiet is least appropriate.
+  @visibleForTesting
+  static List<String> resolveArgv({
+    required List<String> appliedTagIds,
     required List<onisync.EditorRuleEntry> rules,
   }) {
-    final applied = appliedTagNames.toSet();
+    final applied = appliedTagIds.toSet();
     for (final rule in rules) {
-      if (applied.contains(rule.tag)) {
-        final argv = _tokenise(rule.command);
-        if (argv.isEmpty) continue; // empty command: skip and try the next rule.
-        return argv;
-      }
-    }
+      if (!applied.contains(rule.tagId)) continue;
 
-    final envEditor =
-        Platform.environment['VISUAL'] ?? Platform.environment['EDITOR'];
-    if (envEditor != null && envEditor.trim().isNotEmpty) {
-      final argv = _tokenise(envEditor);
-      if (argv.isNotEmpty) return argv;
+      final argv = rule.argv;
+      if (argv.isEmpty || argv.first.isEmpty) {
+        throw EditorLaunchException(
+          'editor rule for tag ${rule.tagId} has an empty argv: give it at '
+          'least the absolute path of the editor, e.g. '
+          '["/run/current-system/sw/bin/gimp"]',
+        );
+      }
+      if (!argv.first.startsWith('/')) {
+        throw EditorLaunchException(
+          'editor rule for tag ${rule.tagId} must use an absolute path for '
+          'argv[0], got "${argv.first}". A bare name would be resolved via '
+          'the inherited PATH, which is not a trustworthy lookup.',
+        );
+      }
+      return argv;
     }
 
     throw const EditorLaunchException(
-      'no editor configured: set an editor rule for one of this file\'s tags '
-      'in the daemon config, or set \$VISUAL / \$EDITOR',
+      'no editor rule matched: add an `editor_rules` entry in the daemon '
+      'config for one of this file\'s tags',
     );
   }
 
-  /// Whitespace-split a command string into argv. Deliberately dumb — no
-  /// quote handling, no escape sequences. See the file-level doc for
-  /// rationale.
-  static List<String> _tokenise(String command) {
-    return command
-        .split(RegExp(r'\s+'))
-        .where((segment) => segment.isNotEmpty)
-        .toList(growable: false);
+  /// The environment handed to the editor.
+  ///
+  /// Built as an **allowlist** rather than inheriting ours wholesale, so that
+  /// credentials that happen to sit in the app's environment — `SSH_AUTH_SOCK`
+  /// (an agent socket is a signing oracle), `AWS_*`, `GITHUB_TOKEN`, and
+  /// whatever else the launching shell exported — are not handed to a
+  /// long-running GUI process that has no use for them.
+  ///
+  /// The list is deliberately generous about display/session/theming vars,
+  /// because the failure mode of omitting one is a confusing GUI breakage
+  /// (missing icons, wrong theme, "cannot open display") rather than an
+  /// obvious error. `XDG_DATA_DIRS` in particular matters on NixOS, where icon
+  /// themes and GSettings schemas are found through it. If an editor
+  /// misbehaves in a way that smells environmental, add the variable here —
+  /// that is the intended maintenance path, not switching back to full
+  /// inheritance.
+  ///
+  /// `PATH` is forwarded because editors shell out to helpers (GIMP plug-ins,
+  /// `code`'s node runtime). It does *not* weaken the `argv[0]` rule above:
+  /// that is resolved by us, before this environment is ever consulted.
+  static Map<String, String> _childEnvironment() {
+    const forwarded = [
+      // Core session identity.
+      'HOME', 'USER', 'LOGNAME', 'SHELL', 'PATH', 'TMPDIR',
+      // Locale — omitting these garbles non-ASCII filenames in the editor's UI.
+      'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE', 'LC_MESSAGES',
+      // Display server.
+      'DISPLAY', 'XAUTHORITY', 'WAYLAND_DISPLAY', 'XDG_SESSION_TYPE',
+      // Desktop integration: portals, theming, icon and schema lookup.
+      'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR', 'XDG_DATA_DIRS',
+      'XDG_CONFIG_DIRS', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME',
+      'XDG_CURRENT_DESKTOP', 'DESKTOP_SESSION',
+      // Toolkit rendering knobs; wrong-looking UI if dropped.
+      'GDK_BACKEND', 'QT_QPA_PLATFORM', 'GTK_THEME', 'QT_STYLE_OVERRIDE',
+      // NixOS-specific lookup paths for GTK/GDK asset bundles.
+      'GDK_PIXBUF_MODULE_FILE', 'GSETTINGS_SCHEMA_DIR', 'FONTCONFIG_FILE',
+      'GIO_EXTRA_MODULES', 'LOCALE_ARCHIVE',
+    ];
+
+    final parent = Platform.environment;
+    // `?parent[name]` drops the entry entirely when the variable is unset,
+    // rather than forwarding an empty string — some toolkits treat "set but
+    // empty" differently from "unset" (an empty DISPLAY is not the same as no
+    // DISPLAY).
+    return {for (final name in forwarded) name: ?parent[name]};
   }
 }

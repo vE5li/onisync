@@ -34,15 +34,17 @@ import '../rust/api.dart' as onisync;
 abstract class EditorLauncher {
   /// Open [path] in an external editor and return once the user is done.
   ///
-  /// [rules] is the daemon-configured tag → command mapping (see
+  /// [rules] is the daemon-configured tag → `argv` mapping (see
   /// [onisync.EditorRuleEntry]); implementations that consult tags (Linux)
   /// walk it in declaration order, first match wins. Implementations that
   /// ignore tags (Android — the OS picks the editor by MIME) may leave it
   /// unused.
   ///
-  /// [appliedTagNames] is the *names* of the tags currently applied to the
+  /// [appliedTagIds] is the string ids of the tags currently applied to the
   /// file, so [rules] can be resolved without the launcher needing a bridge
-  /// handle. Order is not significant; matching is by set membership.
+  /// handle. Ids (not names) are the stable identifier: matching by name
+  /// would break silently on `rename_tag`. Order is not significant;
+  /// matching is by set membership.
   ///
   /// [logicalName] is the file's user-facing name (last component of the
   /// logical path). Used by the Android impl to sniff a MIME hint from the
@@ -54,7 +56,7 @@ abstract class EditorLauncher {
   Future<void> launchAndWait({
     required String path,
     required String logicalName,
-    required List<String> appliedTagNames,
+    required List<String> appliedTagIds,
     required List<onisync.EditorRuleEntry> rules,
   });
 }

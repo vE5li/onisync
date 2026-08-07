@@ -21,6 +21,6 @@ class _PendingBootstrap extends OniSyncBootstrap {
 void main() {
   testWidgets('app renders initial status', (WidgetTester tester) async {
     await tester.pumpWidget(OniSyncApp(bootstrap: _PendingBootstrap()));
-    expect(find.text('onisync'), findsOneWidget);
+    expect(find.text('OniSync'), findsOneWidget);
   });
 }

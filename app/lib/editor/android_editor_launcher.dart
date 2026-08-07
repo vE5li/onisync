@@ -55,13 +55,13 @@ class AndroidEditorLauncher implements EditorLauncher {
   Future<void> launchAndWait({
     required String path,
     required String logicalName,
-    required List<String> appliedTagNames,
+    required List<String> appliedTagIds,
     required List<onisync.EditorRuleEntry> rules,
   }) async {
-    // Rules exist for the Linux CLI-style "run this command" model. Android's
+    // Rules exist for the Linux CLI-style "run this argv" model. Android's
     // dispatch is by MIME, resolved by the OS from the picker the user sees;
-    // there is nothing sensible we can do with a `command` string in this
-    // environment. Ignore `rules` entirely.
+    // there is no way to exec an arbitrary argv in this environment (and no
+    // reason to want to). Ignore `rules` entirely.
     if (_pending != null) {
       throw const EditorLaunchException(
         'another edit is already in progress',

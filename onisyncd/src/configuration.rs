@@ -101,31 +101,62 @@ pub struct TagDeclaration {
     pub color: String,
 }
 
-/// A rule mapping a tag name to an external editor command.
+/// A rule mapping a tag id to an external editor command.
 ///
-/// Used by the desktop UI's "edit" action: when a file carries a tag whose
-/// name matches [`tag`], its bytes are handed to [`command`] instead of the
-/// generic `$VISUAL`/`$EDITOR` fallback. Rules are consulted in declaration
-/// order; the first match wins.
+/// Used by the desktop UI's "edit" action: when a file carries a tag whose id
+/// matches [`tag_id`], its bytes are handed to [`argv`] instead of the generic
+/// `$VISUAL`/`$EDITOR` fallback. Rules are consulted in declaration order; the
+/// first match wins.
 ///
 /// The daemon does not use these rules itself — it has no notion of external
 /// processes — but stores them so every frontend on this device (and any
 /// future non-Flutter client of the same daemon) sees the same set. The
 /// Android app currently has no external-editor concept and simply ignores
 /// them.
+///
+/// # Security
+///
+/// A rule is, by construction, "run this program" — arbitrary code execution
+/// with the desktop app's privileges. That is the feature, not a flaw, but it
+/// makes **write access to the config file equivalent to code execution**, so
+/// the config should be owned by the user running the app and not
+/// group/world-writable.
+///
+/// What the config explicitly is *not* is a place where untrusted data lands:
+/// editor rules are read once at startup from the local config and are never
+/// synced from peers, stored in the database, or mutated at runtime (there is
+/// no setter anywhere in the API or control protocol). A malicious peer
+/// therefore cannot introduce or alter a rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditorRule {
-    /// Tag name to match (not id — names are user-facing, stable across
-    /// devices, and writeable by hand; ids are opaque UUIDs that would be
-    /// hostile to a config file).
-    pub tag: String,
-    /// The editor command. Whitespace-split into `argv`; the file path is
-    /// appended as the final argument. The command must block until the user
-    /// is done editing (e.g. `gimp`, `inkscape`, `code --wait`); a command
-    /// that forks off and returns immediately (`xdg-open`, `nohup ...`) will
-    /// make the UI think the edit finished as soon as the launch call
-    /// returns.
-    pub command: String,
+    /// Tag id to match against the file's applied tags. Ids (not names) are
+    /// the stable, unique identifier: [`crate::api::Api::rename_tag`] can
+    /// change a tag's name at any time — a rule keyed by name would silently
+    /// stop matching after a rename. Pair a rule with the corresponding
+    /// [`TagDeclaration`] to guarantee the id exists on every device.
+    pub tag_id: TagId,
+    /// The editor command as an explicit `argv` vector, e.g.
+    /// `["/run/current-system/sw/bin/gimp"]` or
+    /// `["/usr/bin/code", "--wait"]`. The file path is appended as the final
+    /// argument, and the vector is passed straight to `execvp` — **no shell is
+    /// involved**, so quoting, globbing and metacharacters have no meaning
+    /// here.
+    ///
+    /// This is a list rather than a single string on purpose. A string would
+    /// have to be split into `argv` by the launcher, and every splitting rule
+    /// is either too naive to express an argument containing a space or
+    /// complex enough (quotes, escapes) to be worth getting subtly wrong. A
+    /// list sidesteps the question: the operator states the argument
+    /// boundaries directly.
+    ///
+    /// `argv[0]` **must be an absolute path**. See the Linux launcher
+    /// (`app/lib/editor/linux_editor_launcher.dart`) for the rationale.
+    ///
+    /// The command must block until the user is done editing (e.g. `gimp`,
+    /// `inkscape`, `code --wait`); one that forks and returns immediately
+    /// (`xdg-open`, `nohup ...`) will make the UI think the edit finished as
+    /// soon as the launch call returns.
+    pub argv: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,11 +184,11 @@ pub struct Configuration {
     /// can serve them onward.
     #[serde(default)]
     pub preview_generation_policy: PreviewGenerationPolicy,
-    /// Tag → command mapping consulted by the desktop UI's external-edit
-    /// action. See [`EditorRule`]. Empty (the default) means the UI falls
-    /// back to `$VISUAL` / `$EDITOR` for every file. The daemon does not act
-    /// on these rules; they are stored here so every frontend attached to
-    /// this device sees the same set.
+    /// Tag-id → `argv` mapping consulted by the desktop UI's external-edit
+    /// action. See [`EditorRule`]. Empty (the default) means no file has an
+    /// external editor and the UI reports that rather than guessing. The
+    /// daemon does not act on these rules; they are stored here so every
+    /// frontend attached to this device sees the same set.
     #[serde(default)]
     pub editor_rules: Vec<EditorRule>,
 }

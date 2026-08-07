@@ -173,22 +173,30 @@ pub enum _DeletedRule {
 
 /// An external-editor rule flattened for the Dart UI.
 ///
-/// Mirrors [`EditorRule`] as a DTO with plain `String` fields (rather than an
-/// opaque handle) so the Dart side can read `tag` / `command` directly when
-/// choosing which command to launch; see [`FileEntry`] for the same
-/// DTO-flattening pattern used elsewhere in this crate.
+/// Mirrors [`EditorRule`] as a DTO with plain fields (rather than an opaque
+/// handle) so the Dart side can read `tag_id` / `argv` directly when choosing
+/// which command to launch; see [`FileEntry`] for the same DTO-flattening
+/// pattern used elsewhere in this crate. The tag id is rendered as its UUID
+/// string (matching [`TagEntry::tag_id`]) so the UI can compare it directly
+/// against a file's applied tag ids without touching an opaque [`TagId`]
+/// handle.
 pub struct EditorRuleEntry {
-    /// Tag name to match against the file's applied tags.
-    pub tag: String,
-    /// The editor command (whitespace-split into argv, file path appended).
-    pub command: String,
+    /// Tag id (UUID string) to match against the file's applied tag ids. Ids
+    /// (not names) are the stable identifier: a rule keyed by name would
+    /// break silently after a `rename_tag`.
+    pub tag_id: String,
+    /// The editor command as an explicit `argv` vector; the file path is
+    /// appended as the final argument. Crosses the bridge as a list, not a
+    /// string, so no side has to agree on a tokenisation rule. See
+    /// [`EditorRule::argv`].
+    pub argv: Vec<String>,
 }
 
 impl From<EditorRule> for EditorRuleEntry {
     fn from(rule: EditorRule) -> Self {
         Self {
-            tag: rule.tag,
-            command: rule.command,
+            tag_id: rule.tag_id.to_string(),
+            argv: rule.argv,
         }
     }
 }
@@ -708,11 +716,13 @@ impl OniSyncApp {
     /// flattened [`EditorRuleEntry`] rows the Dart UI reads directly.
     ///
     /// The desktop UI consults these when preparing an edit: it walks the
-    /// list in order, and the first rule whose `tag` matches one of the
-    /// file's applied tag names wins — its `command` is spawned with the
-    /// file path as the final arg. If no rule matches, the UI falls back to
-    /// `$VISUAL` / `$EDITOR`. An empty list means every file goes through
-    /// that fallback.
+    /// list in order, and the first rule whose `tag_id` is among the file's
+    /// applied tag ids wins — its `argv` is spawned with the file path as the
+    /// final arg. If no rule matches, the UI reports that rather than falling
+    /// back to `$VISUAL` / `$EDITOR`: those name terminal editors, which hang
+    /// forever when spawned from a GUI process with no controlling TTY. An
+    /// empty list therefore means no file is externally editable on this
+    /// device.
     pub async fn editor_rules(&self) -> Result<Vec<EditorRuleEntry>, ApiError> {
         Ok(self
             .try_backend()?

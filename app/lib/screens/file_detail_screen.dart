@@ -462,24 +462,18 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
       // just `bar.png`.
       final logicalName = file.path.split('/').last;
 
-      // Fetch the applied tag *names* for the launcher's rule matching.
-      // We already have `_appliedTags` (id → TagEntry) loaded, so pull the
-      // names straight from there rather than a fresh round-trip.
-      final tagNames = [
-        for (final id in _appliedTagIds)
-          if (_appliedTags[id] != null) _appliedTags[id]!.name,
-      ];
-
       // Rules are per-daemon config; fetching them per edit is a cheap
       // round-trip and keeps a live edit reactive to config changes without
-      // an app restart.
+      // an app restart. `_appliedTagIds` is already populated by `_load` —
+      // ids (not names) match rules because a rule's `tagId` is stable, while
+      // a name changes with `renameTag`.
       final rules = await _app.editorRules();
 
       try {
         await launcher.launchAndWait(
           path: beginPath,
           logicalName: logicalName,
-          appliedTagNames: tagNames,
+          appliedTagIds: _appliedTagIds,
           rules: rules,
         );
       } catch (error) {
