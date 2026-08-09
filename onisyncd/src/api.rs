@@ -31,7 +31,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{broadcast, oneshot};
 
 use crate::bus::{DaemonMessage, FetchError, Ingest, PreviewError, RestoreError};
-use crate::configuration::EditorRule;
+use crate::configuration::{CompiledTagRules, EditorRule};
 use crate::database::{DatabaseError, DeletedRule, FileDatabase, QueryTerm, SubtagRule, Tag};
 use crate::directory_manager::SyncDirectoryCommand;
 use crate::fetch::PendingFetches;
@@ -166,6 +166,35 @@ pub enum ApiEvent {
     ProviderReleased { file_id: FileId },
 }
 
+/// What [`Api::retag`] did, or (under `dry_run`) would do.
+///
+/// Counts describe work *enqueued* onto the ingest bus, not yet applied — see
+/// [`Api::retag`] for why the two are separate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetagSummary {
+    /// Live (non-tombstoned) files examined.
+    pub files_scanned: usize,
+    /// Files that were missing at least one tag a rule assigns.
+    pub files_changed: usize,
+    /// Individual file→tag applications. At least `files_changed`, and more
+    /// when a file was missing several tags.
+    pub tags_applied: usize,
+}
+
+/// Diagnostics for the configured tag rules. See [`Api::tag_rule_report`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TagRuleReport {
+    /// Rules that compiled and are being applied.
+    pub active: usize,
+    /// One rendered diagnostic per rule that failed to compile. Such a rule is
+    /// disabled but never prevented the daemon from starting.
+    pub invalid: Vec<String>,
+    /// Tag ids named by a live rule that match no tag in the catalog. Usually
+    /// a typo; harmless but inert, since the rule can only ever apply a tag
+    /// nothing else refers to.
+    pub unknown_tags: Vec<TagId>,
+}
+
 /// The transport-agnostic UI-facing API handle.
 ///
 /// Cheap to clone. Holds the pieces needed to serve reads (the DB path),
@@ -198,6 +227,12 @@ pub struct Api {
     /// configuration; the daemon does not act on these but stores them so
     /// every frontend attached to this device sees the same set.
     editor_rules: Vec<EditorRule>,
+    /// Compiled creation-time tag rules (see
+    /// [`crate::configuration::TagRule`]). Shared with `handle_changes`, which
+    /// applies them to newly-created files; this handle needs the same set to
+    /// re-apply them to the existing catalog on demand ([`Self::retag`]) and
+    /// to report broken rules.
+    tag_rules: Arc<CompiledTagRules>,
 }
 
 impl Api {
@@ -224,6 +259,7 @@ impl Api {
         fetch_temp_dir: PathBuf,
         operations: crate::operations::Operations,
         editor_rules: Vec<EditorRule>,
+        tag_rules: Arc<CompiledTagRules>,
     ) -> Self {
         Self {
             main_db_path,
@@ -234,6 +270,7 @@ impl Api {
             fetch_temp_dir,
             operations,
             editor_rules,
+            tag_rules,
         }
     }
 
@@ -1020,6 +1057,122 @@ impl Api {
             tag_id,
             metadata: None,
             modified_at: crate::database::now_millis(),
+        })
+    }
+
+    /// Re-apply the configured tag rules to the files already in the catalog.
+    ///
+    /// Rules normally run once, when this device creates a file (see
+    /// [`crate::configuration::TagRule`]), so adding or fixing a rule has no
+    /// effect on anything that already exists. This is the escape hatch, and
+    /// the reason a broken rule does not need to be a fatal startup error:
+    /// whatever a rule failed to tag while it was missing or misspelled can be
+    /// tagged afterwards.
+    ///
+    /// # Additive only
+    ///
+    /// Tags are only ever added, never removed — not even for a file that a
+    /// rule *no longer* matches. Nothing records whether a given tag came from
+    /// a rule or from a person, so "remove tags this rule would no longer
+    /// assign" cannot be distinguished from "delete the user's manual
+    /// tagging". Editing a regex must not be able to destroy data.
+    ///
+    /// # Why this is not a bulk database operation
+    ///
+    /// The work is a *read* here plus ordinary [`Change::FileTagged`] messages
+    /// on the ingest bus — exactly what [`Self::tag_file`] produces. Two
+    /// reasons. Iterating the catalog inside `handle_changes` (the sole DB
+    /// writer) would stall every other ingestion for the duration, which on a
+    /// large catalog means sync visibly freezes. And routing through the
+    /// normal change pipeline means retagging inherits last-writer-wins
+    /// semantics, peer propagation, and `reconcile_tag_placement` — so a file
+    /// that gains a tag actually gets copied into the `TagBased` directories
+    /// that now want it — rather than reimplementing all three.
+    ///
+    /// The consequence is that the returned summary describes work
+    /// *enqueued*, not yet applied. Tagging is idempotent, so a re-run after a
+    /// partial application is safe and simply enqueues less.
+    pub fn retag(&self, dry_run: bool) -> Result<RetagSummary, ApiError> {
+        let mut summary = RetagSummary::default();
+
+        // Read the whole plan under one handle, then release it before
+        // enqueuing: a rule matching every file would otherwise hold a read
+        // handle open across thousands of sends.
+        let plan = {
+            let database = self.open_read()?;
+
+            // Tombstoned files are skipped: tagging a deleted file changes
+            // nothing a user can see and would resurrect the relationship in
+            // every peer's catalog for no reason.
+            let files = database.get_all_files(DeletedRule::Exclude)?;
+            summary.files_scanned = files.len();
+
+            let mut plan: Vec<(FileId, TagId)> = Vec::new();
+            for file in files {
+                let wanted = self.tag_rules.tags_for(&file.logical_path);
+                if wanted.is_empty() {
+                    continue;
+                }
+
+                // Only read the file's current tags once we know a rule
+                // matched; for a narrow rule this skips the query entirely on
+                // almost every file.
+                let existing: Vec<TagId> = database
+                    .tag_ids_for_file(file.file_id, SubtagRule::Exclude)?
+                    .into_iter()
+                    .collect();
+
+                let missing = wanted.into_iter().filter(|tag| !existing.contains(tag));
+                let before = plan.len();
+                plan.extend(missing.map(|tag_id| (file.file_id, tag_id)));
+                if plan.len() > before {
+                    summary.files_changed += 1;
+                }
+            }
+            plan
+        };
+
+        summary.tags_applied = plan.len();
+        if dry_run {
+            return Ok(summary);
+        }
+
+        for (file_id, tag_id) in plan {
+            self.tag_file(tag_id, file_id)?;
+        }
+
+        Ok(summary)
+    }
+
+    /// Diagnose the configured tag rules: which failed to compile, and which
+    /// name a tag that does not exist.
+    ///
+    /// The tag check is deliberately made here rather than at startup.
+    /// [`crate::configuration::Configuration::tags`] is a floor, not the set of
+    /// all tags — a tag created through the UI or synced from a peer is equally
+    /// real — so the only meaningful place to ask "does this tag exist?" is
+    /// against the live database, on demand.
+    pub fn tag_rule_report(&self) -> Result<TagRuleReport, ApiError> {
+        let database = self.open_read()?;
+
+        let mut unknown_tags = Vec::new();
+        for tag_id in self.tag_rules.referenced_tags() {
+            if !database.tag_exists(tag_id)? {
+                unknown_tags.push(tag_id);
+            }
+        }
+
+        Ok(TagRuleReport {
+            active: self.tag_rules.len(),
+            // Rendered here so the wire type does not have to carry
+            // `regex::Error`, which is not serializable.
+            invalid: self
+                .tag_rules
+                .errors()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            unknown_tags,
         })
     }
 

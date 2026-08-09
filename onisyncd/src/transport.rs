@@ -42,7 +42,7 @@ use onisync_core::state::Change;
 use onisync_core::{FileId, FileInfo, Preview, TagId};
 use tokio::sync::broadcast;
 
-use crate::api::{Api, ApiError, ApiEvent, EditOutcome, QueryResult};
+use crate::api::{Api, ApiError, ApiEvent, EditOutcome, QueryResult, RetagSummary, TagRuleReport};
 use crate::configuration::EditorRule;
 use crate::database::{DeletedRule, SubtagRule, Tag};
 use crate::operations::{Operation, OperationEvent};
@@ -310,6 +310,15 @@ pub trait TransportBackend {
     /// [`crate::configuration::EditorRule`]). A snapshot read; the desktop UI
     /// calls this once when preparing to launch an editor.
     fn editor_rules(&self) -> impl Future<Output = Result<Vec<EditorRule>, ApiError>> + Send;
+
+    /// Re-apply the configured tag rules to files already in the catalog,
+    /// additively. With `dry_run` the work is planned and reported but nothing
+    /// is enqueued. See [`crate::api::Api::retag`].
+    fn retag(&self, dry_run: bool) -> impl Future<Output = Result<RetagSummary, ApiError>> + Send;
+
+    /// Diagnose the configured tag rules (invalid patterns, unknown tag ids).
+    /// See [`crate::api::Api::tag_rule_report`].
+    fn tag_rule_report(&self) -> impl Future<Output = Result<TagRuleReport, ApiError>> + Send;
 
     /// Subscribe to the live change stream. Returns an [`EventStream`] whose
     /// [`recv`](EventStream::recv) yields [`ApiEvent`]s.
@@ -632,6 +641,14 @@ impl TransportBackend for InProcessBackend {
         Ok(self.api.editor_rules())
     }
 
+    async fn retag(&self, dry_run: bool) -> Result<RetagSummary, ApiError> {
+        self.api.retag(dry_run)
+    }
+
+    async fn tag_rule_report(&self) -> Result<TagRuleReport, ApiError> {
+        self.api.tag_rule_report()
+    }
+
     fn subscribe(&self) -> EventStream {
         EventStream::InProcess(self.api.subscribe())
     }
@@ -918,6 +935,20 @@ impl TransportBackend for Backend {
         match self {
             Backend::InProcess(backend) => backend.editor_rules().await,
             Backend::Ipc(backend) => backend.editor_rules().await,
+        }
+    }
+
+    async fn retag(&self, dry_run: bool) -> Result<RetagSummary, ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.retag(dry_run).await,
+            Backend::Ipc(backend) => backend.retag(dry_run).await,
+        }
+    }
+
+    async fn tag_rule_report(&self) -> Result<TagRuleReport, ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.tag_rule_report().await,
+            Backend::Ipc(backend) => backend.tag_rule_report().await,
         }
     }
 

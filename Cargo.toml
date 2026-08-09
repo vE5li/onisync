@@ -39,6 +39,12 @@ log = "0.4.33"
 notify = "8.2.0"
 owo-colors = "4.3.0"
 rand = "0.10.2"
+# Tag-rule pattern matching (`Configuration::tag_rules`). The default feature
+# set is kept: `unicode` matters because logical paths are arbitrary UTF-8, so
+# `\w`/`.` must not silently mean "ASCII only" for a user whose filenames are
+# not. `regex` guarantees linear-time matching with no backtracking, so an
+# operator cannot write a rule that hangs the ingest path on a crafted filename.
+regex = "1.12"
 rmp-serde = "1.3.1"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }

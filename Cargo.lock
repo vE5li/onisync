@@ -1404,6 +1404,7 @@ dependencies = [
  "onisync-core",
  "pdfium-render",
  "rand",
+ "regex",
  "rmp-serde",
  "rusqlite",
  "serde",

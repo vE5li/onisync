@@ -58,7 +58,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_util::sync::CancellationToken;
 
-use crate::api::{Api, ApiError, ApiEvent, EditOutcome, QueryResult};
+use crate::api::{Api, ApiError, ApiEvent, EditOutcome, QueryResult, RetagSummary, TagRuleReport};
 use crate::configuration::EditorRule;
 use crate::database::{DeletedRule, SubtagRule, Tag};
 use crate::transport::{EventStream, OperationStream, OperationUpdate, TransportBackend};
@@ -232,6 +232,15 @@ pub enum ControlRequest {
     /// Read the daemon's external-editor rules. Answered with
     /// [`ControlResponse::EditorRules`].
     EditorRules,
+    /// Re-apply the configured tag rules to the existing catalog. Answered
+    /// with [`ControlResponse::Retagged`]. With `dry_run` the daemon plans and
+    /// reports the work without enqueuing it.
+    Retag {
+        dry_run: bool,
+    },
+    /// Diagnose the configured tag rules. Answered with
+    /// [`ControlResponse::TagRuleReport`].
+    TagRuleReport,
     /// Snapshot every currently-active sync operation. Answered with
     /// [`ControlResponse::Operations`].
     ListOperations,
@@ -285,6 +294,11 @@ pub enum ControlResponse {
     /// The daemon's external-editor rules (answer to
     /// [`ControlRequest::EditorRules`]).
     EditorRules(Vec<EditorRule>),
+    /// What a retag did, or would do under `dry_run` (answer to
+    /// [`ControlRequest::Retag`]).
+    Retagged(RetagSummary),
+    /// Tag-rule diagnostics (answer to [`ControlRequest::TagRuleReport`]).
+    TagRuleReport(TagRuleReport),
     /// A snapshot of currently-active sync operations (answer to
     /// [`ControlRequest::ListOperations`]).
     Operations(Vec<crate::operations::Operation>),
@@ -792,6 +806,14 @@ async fn dispatch(
             Err(error) => ControlResponse::Error(error),
         },
         ControlRequest::EditorRules => ControlResponse::EditorRules(api.editor_rules()),
+        ControlRequest::Retag { dry_run } => match api.retag(dry_run) {
+            Ok(summary) => ControlResponse::Retagged(summary),
+            Err(error) => ControlResponse::Error(error),
+        },
+        ControlRequest::TagRuleReport => match api.tag_rule_report() {
+            Ok(report) => ControlResponse::TagRuleReport(report),
+            Err(error) => ControlResponse::Error(error),
+        },
         ControlRequest::ListOperations => ControlResponse::Operations(api.list_operations()),
         ControlRequest::SubscribeOperations => {
             *operation_events = Some(OperationStream::InProcess(api.subscribe_operations()));
@@ -1505,6 +1527,20 @@ impl TransportBackend for IpcClientBackend {
     async fn editor_rules(&self) -> Result<Vec<EditorRule>, ApiError> {
         match self.call(ControlRequest::EditorRules).await? {
             ControlResponse::EditorRules(rules) => Ok(rules),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn retag(&self, dry_run: bool) -> Result<RetagSummary, ApiError> {
+        match self.call(ControlRequest::Retag { dry_run }).await? {
+            ControlResponse::Retagged(summary) => Ok(summary),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn tag_rule_report(&self) -> Result<TagRuleReport, ApiError> {
+        match self.call(ControlRequest::TagRuleReport).await? {
+            ControlResponse::TagRuleReport(report) => Ok(report),
             other => Err(unexpected(other)),
         }
     }

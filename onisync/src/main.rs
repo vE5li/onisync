@@ -697,6 +697,28 @@ enum Commands {
     /// demand. Useful after the set of previewable file types changes (e.g. new
     /// PDF/video support). Prints how many cached previews were removed.
     PurgePreviews,
+    /// Re-apply the daemon's configured tag rules to files that already exist.
+    ///
+    /// Tag rules normally run once, when this device first creates a file, so
+    /// adding or fixing a rule leaves everything already in the catalog
+    /// untouched. This command catches those files up.
+    ///
+    /// Only ever *adds* tags. A file that a rule no longer matches keeps the
+    /// tags it has: nothing records which tag came from a rule and which from
+    /// a person, so removing them could not be distinguished from deleting
+    /// your own tagging.
+    ///
+    /// The daemon reads its configuration once at startup, so restart it
+    /// before running this if you have just edited the rules.
+    Retag {
+        /// Report what would be tagged without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Only validate the rules — report invalid patterns and rule tags
+        /// that match no known tag — without scanning or tagging any file.
+        #[arg(long, conflicts_with = "dry_run")]
+        check: bool,
+    },
 }
 
 #[tokio::main]
@@ -1134,8 +1156,104 @@ async fn run(
                 OutputMode::Json => print_json(&json!({ "purged": purged })),
             }
         }
+        Commands::Retag { dry_run, check } => {
+            // Always fetch the diagnostics, even for a real run. A rule that
+            // failed to compile is exactly the situation someone runs `retag`
+            // to recover from, and silently retagging with it still broken
+            // would look like the command simply did nothing.
+            let report = backend
+                .tag_rule_report()
+                .await
+                .map_err(|error| error.to_string())?;
+
+            if check {
+                match output_mode {
+                    OutputMode::Human => print_tag_rule_report(&report),
+                    OutputMode::Json => print_json(&json!({
+                        "active": report.active,
+                        "invalid": report.invalid,
+                        "unknown_tags": report
+                            .unknown_tags
+                            .iter()
+                            .map(|tag_id| tag_id.to_string())
+                            .collect::<Vec<_>>(),
+                    })),
+                }
+                return Ok(());
+            }
+
+            // Warnings go to stderr so they survive a `| jq` and do not
+            // corrupt the JSON on stdout.
+            for problem in &report.invalid {
+                eprintln!("Warning: {problem}");
+            }
+
+            let summary = backend
+                .retag(dry_run)
+                .await
+                .map_err(|error| error.to_string())?;
+
+            match output_mode {
+                OutputMode::Human => {
+                    if summary.tags_applied == 0 {
+                        println!(
+                            "Nothing to do: {} files scanned, all already carry the tags their \
+                             rules assign",
+                            summary.files_scanned
+                        );
+                    } else if dry_run {
+                        println!(
+                            "Would apply {} tags across {} of {} files (dry run; nothing changed)",
+                            summary.tags_applied, summary.files_changed, summary.files_scanned
+                        );
+                    } else {
+                        println!(
+                            "Applied {} tags across {} of {} files",
+                            summary.tags_applied, summary.files_changed, summary.files_scanned
+                        );
+                    }
+                }
+                OutputMode::Json => print_json(&json!({
+                    "dry_run": dry_run,
+                    "files_scanned": summary.files_scanned,
+                    "files_changed": summary.files_changed,
+                    "tags_applied": summary.tags_applied,
+                })),
+            }
+        }
     }
     Ok(())
+}
+
+/// Render tag-rule diagnostics for `retag --check`.
+///
+/// Both problem classes are reported as warnings rather than errors: neither
+/// stops the daemon, and neither stops the *other* rules from working.
+fn print_tag_rule_report(report: &onisyncd::api::TagRuleReport) {
+    println!(
+        "{} tag rule{} active",
+        report.active,
+        if report.active == 1 { "" } else { "s" }
+    );
+
+    if report.invalid.is_empty() && report.unknown_tags.is_empty() {
+        println!("No problems found");
+        return;
+    }
+
+    if !report.invalid.is_empty() {
+        println!("\nInvalid patterns (these rules are disabled):");
+        for problem in &report.invalid {
+            println!("  {problem}");
+        }
+    }
+
+    if !report.unknown_tags.is_empty() {
+        println!("\nRules name tags that do not exist (they will never be useful):");
+        for tag_id in &report.unknown_tags {
+            println!("  {}", tag_id.to_string());
+        }
+    }
 }
 
 /// The `edit` flow — a thin driver over the daemon's stateless edit protocol.

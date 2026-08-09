@@ -373,6 +373,7 @@ mod tests {
             tags: Vec::new(),
             preview_generation_policy: crate::configuration::PreviewGenerationPolicy::Lazy,
             editor_rules: Vec::new(),
+            tag_rules: Vec::new(),
         };
         let runtime = Arc::new(RwLock::new(RuntimeConfiguration::new(&configuration)));
         PendingPreviews::new(runtime)
