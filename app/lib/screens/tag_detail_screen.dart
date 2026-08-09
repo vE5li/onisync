@@ -15,7 +15,6 @@ import 'package:flutter/material.dart';
 
 import '../bootstrap/bootstrap.dart';
 import '../rust/api.dart' as onisync;
-import '../onisync_service.dart';
 import '../widgets/property_tile.dart';
 import '../widgets/tag_chip.dart';
 
@@ -96,11 +95,11 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
         tagId: widget.tagId,
         deletedRule: onisync.DeletedRule.include,
       );
-      final parents = await _app.tagIdsForTagString(
+      final parents = await _app.tagIdsForTag(
         tagId: widget.tagId,
         subtagRule: onisync.SubtagRule.exclude,
       );
-      final subtags = await _app.subtagIdsForTagString(
+      final subtags = await _app.subtagIdsForTag(
         tagId: widget.tagId,
         subtagRule: onisync.SubtagRule.exclude,
       );
@@ -158,7 +157,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
     final trimmed = result.trim();
     if (trimmed.isEmpty || trimmed == tag.name) return;
     try {
-      await _app.renameTagByString(tagId: tag.tagId, name: trimmed);
+      await _app.renameTag(tagId: tag.tagId, name: trimmed);
       // Live update flows in via the change stream.
     } catch (error) {
       if (!mounted) return;
@@ -177,7 +176,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
     );
     if (result == null || result == tag.color) return;
     try {
-      await _app.setTagColorByString(tagId: tag.tagId, color: result);
+      await _app.setTagColor(tagId: tag.tagId, color: result);
     } catch (error) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -249,7 +248,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
     if (chosen == null) return;
     try {
       // The chosen tag becomes a parent of this tag: parent = chosen, subtag = this.
-      await _app.tagTagByString(
+      await _app.tagTag(
         parentId: chosen.tagId,
         subtagId: widget.tagId,
       );
@@ -267,7 +266,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
     if (chosen == null) return;
     try {
       // The chosen tag becomes a subtag of this tag: parent = this, subtag = chosen.
-      await _app.tagTagByString(
+      await _app.tagTag(
         parentId: widget.tagId,
         subtagId: chosen.tagId,
       );
@@ -278,7 +277,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
 
   Future<void> _removeParent(String parentId) async {
     try {
-      await _app.untagTagByString(
+      await _app.untagTag(
         parentId: parentId,
         subtagId: widget.tagId,
       );
@@ -304,7 +303,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
 
   Future<void> _removeSubtag(String subtagId) async {
     try {
-      await _app.untagTagByString(
+      await _app.untagTag(
         parentId: widget.tagId,
         subtagId: subtagId,
       );
@@ -341,7 +340,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
     if (confirmed != true) return;
     try {
       _deleted = true;
-      await _app.deleteTagByString(tag.tagId);
+      await _app.deleteTag(tagId: tag.tagId);
       if (!mounted) return;
       Navigator.of(context).maybePop();
     } catch (error) {
@@ -362,7 +361,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
     if (tag == null) return;
     setState(() => _restoring = true);
     try {
-      await _app.restoreTagByString(tag.tagId);
+      await _app.restoreTag(tagId: tag.tagId);
       if (!mounted) return;
       _deleted = false;
       _snack('Restored "${tag.name}".');

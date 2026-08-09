@@ -297,7 +297,7 @@ change. This belongs in `AGENTS.md`.
 
 Sizes are rough: **S** < 1h, **M** a focused session, **L** a day or more.
 
-## Phase 0 — Standalone fixes
+## Phase 0 — Standalone fixes — **COMPLETE**
 
 No structural change. Each is independently landable today and none blocks any
 other. 0.6 is a live user-visible bug.
@@ -307,7 +307,7 @@ other. 0.6 is a live user-visible bug.
 Typo, 4 sites in `directory_manager.rs`. A full misspelling scan of the repo
 found nothing else.
 
-### 0.2 — Spelling convention: American everywhere — **S**
+### 0.2 — Spelling convention: American everywhere — **S** — **DONE**
 
 - **Why** One British identifier (`normalise_id_prefix`) against 15 American
   ones; prose is uniformly British. See *Naming decisions → Spelling*.
@@ -320,21 +320,21 @@ found nothing else.
 - **Verify** `cargo test --workspace` (204 pass); `rg -i 'normalis|serialis|materialis|initialis|recognis'` returns nothing outside `target/`.
 - **Depends on** —
 
-### 0.3 — `initial_sync_tagged` → `initial_sync_tag_based` — **S**
+### 0.3 — `initial_sync_tagged` → `initial_sync_tag_based` — **S** — **DONE**
 
 - **Why** Mismatch with `SyncType::TagBased`.
 - **Change** Rename in `directory_manager.rs` (2 sites).
 - **Verify** `cargo check -p onisyncd`
 - **Depends on** —
 
-### 0.4 — Delete `SpecialType` — **S**
+### 0.4 — Delete `SpecialType` — **S** — **DONE**
 
 - **Why** Dead code with a meaningless name (`configuration.rs:66–70`).
 - **Change** Delete the enum. Confirm no serde config field references it.
 - **Verify** `cargo test --workspace`
 - **Depends on** —
 
-### 0.5 — Delete `EntryType`, use `RelationshipKind` — **S**
+### 0.5 — Delete `EntryType`, use `RelationshipKind` — **S** — **DONE**
 
 - **Why** Two names for one two-variant enum, with `From` impls both ways
   (`database.rs:248–289`) purely to translate between them.
@@ -347,7 +347,7 @@ found nothing else.
 - **Verify** `cargo test --workspace`
 - **Depends on** —
 
-### 0.6 — Fix the FFI error boundary — **M** — ⚠ live bug
+### 0.6 — Fix the FFI error boundary — **M** — ⚠ live bug — **DONE**
 
 - **Why** `ApiError` crosses FFI as an opaque handle
   (`api.dart:16` → `abstract class ApiError implements RustOpaqueInterface {}`),
@@ -384,7 +384,7 @@ found nothing else.
   a file whose peer is offline (expect "Preview unavailable").
 - **Depends on** —
 
-### 0.7 — Drop `_by_string` / `_string`, delete `onisync_service.dart` — **M**
+### 0.7 — Drop `_by_string` / `_string`, delete `onisync_service.dart` — **M** — **DONE**
 
 - **Why** Two suffixes for one concept (`_string` on 3 methods, `_by_string` on
   12) — but the deeper problem is that the suffix marks the *wrong* method as
@@ -406,7 +406,7 @@ found nothing else.
 - **Depends on** — (independent of 0.6, but both need codegen; consider landing
   0.6 first so there is only one codegen churn on `ApiError`)
 
-### 0.8 — Query lexer: `chunk` → `token` — **S**
+### 0.8 — Query lexer: `chunk` → `token` — **S** — **DONE**
 
 - **Why** Head-on collision with the transfer protocol's byte chunks. See
   *Naming decisions → Collisions*.
@@ -416,7 +416,7 @@ found nothing else.
 - **Verify** `cargo test --workspace` — 204 pass, count unchanged.
 - **Depends on** —
 
-### 0.9 — Move `hash_file` out of `control.rs` — **S**
+### 0.9 — Move `hash_file` out of `control.rs` — **S** — **DONE**
 
 - **Why** `api.rs:785` calls `crate::control::hash_file`, while `control.rs`
   is built on `api` — a genuine module cycle, hidden from both import blocks
@@ -427,7 +427,7 @@ found nothing else.
 - **Verify** `cargo test --workspace`
 - **Depends on** —
 
-### 0.10 — Move `HOP_TIMEOUT` out of `fetch.rs` — **S**
+### 0.10 — Move `HOP_TIMEOUT` out of `fetch.rs` — **S** — **DONE**
 
 - **Why** Second hidden cycle: `transfer.rs:209, 222` reach into
   `crate::fetch::HOP_TIMEOUT` while `fetch.rs:43` imports from `transfer`.
@@ -943,6 +943,12 @@ Identified during analysis, not scheduled:
   build.
 - **`app.dart:70–91`** — bootstrap failure only `debugPrint`s (has a TODO).
 - **`api.rs::parse_query`** silently drops the `/p` (physical path) prefix.
+- **`ApiEvent` is still an opaque handle** and is the last data type on the Dart
+  surface that is (the other three — `OniSyncApp`, `EventSubscription`,
+  `OperationSubscription` — are deliberately opaque resources). Dart cannot read
+  it, so every screen's change-stream loop reloads its entire state on *any*
+  change anywhere. Mirroring it would let a screen filter by the affected
+  file/tag id. Same treatment as `ApiError` in 0.6.
 - **The Dart tree is not `dart format`-clean** against the SDK pinned in
   `flake.nix` (Flutter 3.41.9). Running `dart format` on a screen reflows
   20–100 unrelated lines, which buries real changes in review noise. Either

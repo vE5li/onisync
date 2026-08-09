@@ -15,7 +15,6 @@ import 'package:share_plus/share_plus.dart';
 import '../bootstrap/bootstrap.dart';
 import '../editor/editor_launcher.dart';
 import '../rust/api.dart' as onisync;
-import '../onisync_service.dart';
 import '../widgets/file_preview.dart';
 import '../widgets/property_tile.dart';
 import '../widgets/remote_preview.dart';
@@ -112,7 +111,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
       );
       // Direct tags only (Exclude = no subtag recursion) — these are the ones
       // the user can meaningfully add/remove on this file.
-      final applied = await _app.tagIdsForFileString(
+      final applied = await _app.tagIdsForFile(
         fileId: widget.fileId,
         subtagRule: onisync.SubtagRule.exclude,
       );
@@ -125,7 +124,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
       // Best-effort: absence (not-synced-here) is expected, not an error. Any
       // hard failure surfaces below as `_error` via the outer catch.
       final localPath =
-          await _app.localPathForFileByString(fileId: widget.fileId);
+          await _app.localPathForFile(fileId: widget.fileId);
       if (!mounted) return;
       setState(() {
         _file = file;
@@ -171,7 +170,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     final trimmed = result.trim();
     if (trimmed.isEmpty || trimmed == file.path) return;
     try {
-      await _app.moveFileByString(
+      await _app.moveFile(
         fileId: widget.fileId,
         logicalPath: trimmed,
       );
@@ -183,7 +182,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
 
   Future<void> _removeTag(String tagId) async {
     try {
-      await _app.untagFileByString(tagId: tagId, fileId: widget.fileId);
+      await _app.untagFile(tagId: tagId, fileId: widget.fileId);
     } catch (error) {
       _snack('Failed to remove tag: $error');
     }
@@ -236,7 +235,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     );
     if (chosen == null) return;
     try {
-      await _app.tagFileByString(tagId: chosen.tagId, fileId: widget.fileId);
+      await _app.tagFile(tagId: chosen.tagId, fileId: widget.fileId);
     } catch (error) {
       _snack('Failed to add tag: $error');
     }
@@ -265,7 +264,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     if (confirmed != true) return;
     try {
       _deleted = true;
-      await _app.deleteFileByString(widget.fileId);
+      await _app.deleteFile(fileId: widget.fileId);
       if (!mounted) return;
       Navigator.of(context).maybePop();
     } catch (error) {
@@ -283,7 +282,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     if (file == null) return;
     setState(() => _restoring = true);
     try {
-      await _app.restoreFileByString(widget.fileId);
+      await _app.restoreFile(fileId: widget.fileId);
       if (!mounted) return;
       _deleted = false;
       _snack('Restored "${file.path}".');
@@ -328,7 +327,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
         // Not present locally: fetch the bytes to a daemon-owned temp file.
         // The daemon materializes it with the correct basename, so we can
         // share the fetched path in place — no renaming, no extra staging.
-        path = await _app.fetchFileByString(
+        path = await _app.fetchFile(
           fileId: widget.fileId,
           expectedHash: file.contentHash,
         );
@@ -380,7 +379,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
       if (localPath != null) {
         source = localPath;
       } else {
-        source = await _app.fetchFileByString(
+        source = await _app.fetchFile(
           fileId: widget.fileId,
           expectedHash: file.contentHash,
         );
@@ -431,14 +430,14 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
   ///
   /// A thin driver over the daemon's stateless edit protocol:
   ///
-  ///   1. `beginEditByString` returns a path — either the real sync-dir
+  ///   1. `beginEdit` returns a path — either the real sync-dir
   ///      file (Branch A) or a daemon-owned temp under `fetch_temp_dir`
   ///      named with the file's logical basename (Branch B, extension
   ///      preserving so editors dispatch by MIME correctly).
   ///   2. The platform-specific [EditorLauncher] opens the editor and
   ///      blocks until the user is done (Linux: `await exitCode`; Android:
   ///      `ACTION_EDIT` + first `onResume` wins).
-  ///   3. `finishEditByString` re-hashes the bytes; if different from the
+  ///   3. `finishEdit` re-hashes the bytes; if different from the
   ///      DB, streams the new content to peers. Either way it cleans up any
   ///      daemon-owned temp.
   ///
@@ -455,7 +454,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     setState(() => _editing = true);
     String? beginPath;
     try {
-      beginPath = await _app.beginEditByString(fileId: widget.fileId);
+      beginPath = await _app.beginEdit(fileId: widget.fileId);
 
       // The user-facing name (extension included) is what the Linux launcher
       // shows in errors and the Android launcher sniffs a MIME from. Take
@@ -490,7 +489,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
         return;
       }
 
-      final changed = await _app.finishEditByString(
+      final changed = await _app.finishEdit(
         fileId: widget.fileId,
         path: beginPath,
       );

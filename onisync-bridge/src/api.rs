@@ -6,6 +6,13 @@
 //! [`Api`](onisyncd::api::Api). The Dart UI holds one [`OniSyncApp`] and never
 //! learns which transport backs it.
 //!
+//! Two conventions make this layer usable from Dart, and both are load-bearing:
+//! every id is a `String` (see the string-id section on [`OniSyncApp`]), and
+//! every type crossing the boundary is either a flat DTO defined here or a
+//! mirrored enum — never an opaque Rust handle. An opaque handle reaches Dart
+//! as a pointer with no fields and no `toString()`, which is unusable and
+//! fails silently rather than loudly.
+//!
 //! The `#[flutter_rust_bridge::frb]` annotations are applied only when the
 //! `flutter_rust_bridge` feature is enabled (via `cfg_attr`), so the crate
 //! still compiles — and `cargo check` still passes — without the generator's
@@ -16,7 +23,7 @@
 // exactly how `flutter_rust_bridge_codegen` references them in the generated
 // `frb_generated.rs`. A plain private `use` would not be visible through that
 // glob and the generated code fails to compile.
-pub use onisync_core::{FileId, FileInfo, Preview, TagId};
+pub use onisync_core::{FileInfo, Preview};
 pub use onisyncd::api::{ApiError, ApiEvent};
 pub use onisyncd::configuration::EditorRule;
 pub use onisyncd::database::{DeletedRule, SubtagRule, Tag};
@@ -394,6 +401,22 @@ fn flatten_status(status: &OperationStatus) -> (OperationStatusDto, Option<u64>,
 /// the Android foreground service (see [`crate::service`]) so it survives the
 /// UI closing. This handle just reads/writes through that global's
 /// [`Backend`]; dropping it (UI closed) leaves the runtime running.
+///
+/// # The string-id convention
+///
+/// **Every id crossing this boundary is a `String`**, never an opaque
+/// `FileId`/`TagId` handle. Ids are accepted as full-or-short prefixes and
+/// resolved daemon-side; they are returned as full UUID strings, matching what
+/// the DTOs (`FileEntry::file_id`, `TagEntry::tag_id`) already carry.
+///
+/// This is not a convenience layer over a "real" handle-based API — it is the
+/// only workable shape. An opaque handle is *consumed* when it crosses the
+/// bridge, so Dart cannot reuse one across two calls (tag three files with the
+/// same tag, say), cannot compare two ids, and cannot render one. A handle
+/// obtained from a DTO does not even exist: the DTO carries a string. Every
+/// handle-taking method therefore forced the Dart side into a
+/// resolve-then-call dance, which is now done here instead — once, in one
+/// place, where the resolution error can be reported precisely.
 #[cfg_attr(feature = "flutter_rust_bridge", flutter_rust_bridge::frb(opaque))]
 pub struct OniSyncApp {
     _private: (),
@@ -460,42 +483,8 @@ impl OniSyncApp {
         crate::service::public_key().unwrap_or_default()
     }
 
-    /// Resolve a full-or-short file id prefix (see
-    /// [`FileInfo::short_id_length`]) to a single [`FileId`]. Errors with
-    /// `UnknownId` if nothing matches or `AmbiguousId` if several do.
-    pub async fn resolve_file_id(&self, prefix: String) -> Result<FileId, ApiError> {
-        self.try_backend()?.resolve_file_id(prefix).await
-    }
-
-    /// Resolve a full-or-short tag id `prefix` to a single [`TagId`]. Errors
-    /// with `UnknownId` if nothing matches or `AmbiguousId` if several do. The
-    /// tag counterpart of [`resolve_file_id`].
-    ///
-    /// This is how the Dart UI turns a `TagEntry.tag_id` string back into the
-    /// opaque [`TagId`] that the write/query methods (`delete_tag`, `tag_file`,
-    /// `untag_file`) require.
-    pub async fn resolve_tag_id(&self, prefix: String) -> Result<TagId, ApiError> {
-        self.try_backend()?.resolve_tag_id(prefix).await
-    }
-
-    /// List the tags applied to `file_id`.
-    pub async fn tags_for_file(
-        &self,
-        file_id: FileId,
-        subtag_rule: SubtagRule,
-    ) -> Result<Vec<TagId>, ApiError> {
-        self.try_backend()?
-            .tags_for_file(file_id, subtag_rule)
-            .await
-    }
-
-    // The raw `tags_for_file` returns *opaque* id handles the Dart UI cannot
-    // render. These variants take id *strings* (full-or-short prefixes resolved
-    // by `resolve_file_id`) and return either id strings or flattened
-    // FileEntry/TagEntry rows, so the UI never touches an opaque handle.
-
     /// The string ids of the tags applied to the file identified by `file_id`.
-    pub async fn tag_ids_for_file_string(
+    pub async fn tag_ids_for_file(
         &self,
         file_id: String,
         subtag_rule: SubtagRule,
@@ -512,8 +501,8 @@ impl OniSyncApp {
 
     /// The string ids of the tags applied to the tag identified by `tag_id`
     /// (its parents in the hierarchy). The tag analogue of
-    /// [`Self::tag_ids_for_file_string`].
-    pub async fn tag_ids_for_tag_string(
+    /// [`Self::tag_ids_for_file`].
+    pub async fn tag_ids_for_tag(
         &self,
         tag_id: String,
         subtag_rule: SubtagRule,
@@ -530,7 +519,7 @@ impl OniSyncApp {
 
     /// The string ids of the subtags (children) of the tag identified by
     /// `tag_id`.
-    pub async fn subtag_ids_for_tag_string(
+    pub async fn subtag_ids_for_tag(
         &self,
         tag_id: String,
         subtag_rule: SubtagRule,
@@ -547,11 +536,7 @@ impl OniSyncApp {
 
     /// Make `subtag_id` a subtag (child) of `parent_id` in the tag hierarchy.
     /// String-id variant of the underlying `tag_tag` call.
-    pub async fn tag_tag_by_string(
-        &self,
-        parent_id: String,
-        subtag_id: String,
-    ) -> Result<(), ApiError> {
+    pub async fn tag_tag(&self, parent_id: String, subtag_id: String) -> Result<(), ApiError> {
         let backend = self.try_backend()?;
         let parent_id = backend.resolve_tag_id(parent_id).await?;
         let subtag_id = backend.resolve_tag_id(subtag_id).await?;
@@ -560,11 +545,7 @@ impl OniSyncApp {
 
     /// Remove `subtag_id` as a subtag of `parent_id`. String-id variant of
     /// the underlying `untag_tag` call.
-    pub async fn untag_tag_by_string(
-        &self,
-        parent_id: String,
-        subtag_id: String,
-    ) -> Result<(), ApiError> {
+    pub async fn untag_tag(&self, parent_id: String, subtag_id: String) -> Result<(), ApiError> {
         let backend = self.try_backend()?;
         let parent_id = backend.resolve_tag_id(parent_id).await?;
         let subtag_id = backend.resolve_tag_id(subtag_id).await?;
@@ -621,10 +602,7 @@ impl OniSyncApp {
     ///
     /// The UI uses this to render an inline preview from disk without pulling
     /// bytes across the bridge. Errors `UnknownId` if the id itself is unknown.
-    pub async fn local_path_for_file_by_string(
-        &self,
-        file_id: String,
-    ) -> Result<Option<String>, ApiError> {
+    pub async fn local_path_for_file(&self, file_id: String) -> Result<Option<String>, ApiError> {
         let backend = self.try_backend()?;
         let file_id = backend.resolve_file_id(file_id).await?;
         Ok(backend
@@ -641,7 +619,7 @@ impl OniSyncApp {
     /// know which. A file whose content has no preview comes back with
     /// `PreviewEntry.kind == PreviewKind::None` (a successful result). Errors
     /// `UnknownId` only if the id itself is unknown.
-    pub async fn get_preview_by_string(&self, file_id: String) -> Result<PreviewEntry, ApiError> {
+    pub async fn get_preview(&self, file_id: String) -> Result<PreviewEntry, ApiError> {
         let backend = self.try_backend()?;
         let file_id = backend.resolve_file_id(file_id).await?;
         Ok(PreviewEntry::from(backend.get_preview(file_id).await?))
@@ -657,8 +635,8 @@ impl OniSyncApp {
     /// caller must consume it (e.g. hand it to the OS share sheet) and delete
     /// it afterwards. The UI uses this to share a file that is not present
     /// locally; for a locally-held file prefer
-    /// [`Self::local_path_for_file_by_string`].
-    pub async fn fetch_file_by_string(
+    /// [`Self::local_path_for_file`].
+    pub async fn fetch_file(
         &self,
         file_id: String,
         expected_hash: String,
@@ -686,11 +664,11 @@ impl OniSyncApp {
     ///   correctly).
     ///
     /// Move semantics: the UI must consume the returned path by calling
-    /// [`Self::finish_edit_by_string`] (upload if bytes changed) or
+    /// [`Self::finish_edit`] (upload if bytes changed) or
     /// [`Self::cancel_edit`] (abort + cleanup). A missed follow-up only leaks
     /// a temp file that the daemon bulk-cleans on next start; no state is
     /// tracked between calls.
-    pub async fn begin_edit_by_string(&self, file_id: String) -> Result<String, ApiError> {
+    pub async fn begin_edit(&self, file_id: String) -> Result<String, ApiError> {
         let backend = self.try_backend()?;
         let file_id = backend.resolve_file_id(file_id).await?;
         Ok(backend
@@ -700,7 +678,7 @@ impl OniSyncApp {
             .into_owned())
     }
 
-    /// Complete an external edit started with [`Self::begin_edit_by_string`].
+    /// Complete an external edit started with [`Self::begin_edit`].
     ///
     /// The daemon re-hashes the bytes at `path`; if different from the file's
     /// current recorded content it publishes a new version (streaming from
@@ -717,11 +695,7 @@ impl OniSyncApp {
     /// bool here so the Dart side gets a plain value rather than an opaque
     /// handle it would then need a getter for; see [`FileEntry`] for the
     /// same DTO-flattening pattern used elsewhere in this crate.
-    pub async fn finish_edit_by_string(
-        &self,
-        file_id: String,
-        path: String,
-    ) -> Result<bool, ApiError> {
+    pub async fn finish_edit(&self, file_id: String, path: String) -> Result<bool, ApiError> {
         let backend = self.try_backend()?;
         let file_id = backend.resolve_file_id(file_id).await?;
         Ok(backend
@@ -774,13 +748,10 @@ impl OniSyncApp {
         Ok(TagEntry::from(backend.get_tag(tag_id, deleted_rule).await?))
     }
 
-    /// Create a tag; returns the freshly-minted id as a string.
-    ///
-    /// Returns the id *string* (not the opaque [`TagId`] handle) so the Dart
-    /// UI can round-trip it through the usual `*_string` methods — e.g. resolve
-    /// it back for `upload_file`, or fetch its flattened [`TagEntry`] to render
-    /// a chip. Matches the string-id convention used by the other UI-facing
-    /// methods here (see [`Self::tag_ids_for_file_string`]).
+    /// Create a tag; returns the freshly-minted id as a string, which the Dart
+    /// UI can pass straight back to any other method here or use to fetch the
+    /// tag's flattened [`TagEntry`] for a chip. See the string-id convention
+    /// on [`OniSyncApp`].
     pub async fn create_tag(&self, name: String, color: String) -> Result<String, ApiError> {
         Ok(self
             .try_backend()?
@@ -790,27 +761,35 @@ impl OniSyncApp {
     }
 
     /// Delete a tag.
-    pub async fn delete_tag(&self, tag_id: TagId) -> Result<(), ApiError> {
-        self.try_backend()?.delete_tag(tag_id).await
+    pub async fn delete_tag(&self, tag_id: String) -> Result<(), ApiError> {
+        let backend = self.try_backend()?;
+        let tag_id = backend.resolve_tag_id(tag_id).await?;
+        backend.delete_tag(tag_id).await
     }
 
     /// Restore a soft-deleted tag. Unlike a file restore this always succeeds
     /// for a known tag (a tag carries no content to recover): it re-announces
     /// the tag definition with a fresh timestamp, winning last-writer-wins over
     /// the delete.
-    pub async fn restore_tag(&self, tag_id: TagId) -> Result<(), ApiError> {
-        self.try_backend()?.restore_tag(tag_id).await
+    pub async fn restore_tag(&self, tag_id: String) -> Result<(), ApiError> {
+        let backend = self.try_backend()?;
+        let tag_id = backend.resolve_tag_id(tag_id).await?;
+        backend.restore_tag(tag_id).await
     }
 
     /// Rename a tag. The change propagates through the usual event stream, so
     /// live UI (list, detail) refreshes without an explicit reload.
-    pub async fn rename_tag(&self, tag_id: TagId, name: String) -> Result<(), ApiError> {
-        self.try_backend()?.rename_tag(tag_id, name).await
+    pub async fn rename_tag(&self, tag_id: String, name: String) -> Result<(), ApiError> {
+        let backend = self.try_backend()?;
+        let tag_id = backend.resolve_tag_id(tag_id).await?;
+        backend.rename_tag(tag_id, name).await
     }
 
     /// Change a tag's color. Same propagation rules as [`Self::rename_tag`].
-    pub async fn set_tag_color(&self, tag_id: TagId, color: String) -> Result<(), ApiError> {
-        self.try_backend()?.set_tag_color(tag_id, color).await
+    pub async fn set_tag_color(&self, tag_id: String, color: String) -> Result<(), ApiError> {
+        let backend = self.try_backend()?;
+        let tag_id = backend.resolve_tag_id(tag_id).await?;
+        backend.set_tag_color(tag_id, color).await
     }
 
     /// Upload a file from a path on disk; returns the freshly-minted id.
@@ -822,38 +801,39 @@ impl OniSyncApp {
     ///
     /// `tags` are the string ids (full-or-short prefixes, as carried by
     /// `TagEntry.tag_id`) to apply to the new file; they are resolved to
-    /// [`TagId`] handles here. Taking strings — rather than the opaque
-    /// handles — matches the string-id convention of the other UI-facing
-    /// methods and, crucially, lets the Dart caller upload several files in a
-    /// row with the same tags: an opaque [`TagId`] handle is consumed when it
-    /// crosses the bridge, so it cannot be reused across calls, whereas an id
-    /// string can.
+    /// `TagId` handles here. Returns the new file's id as a string, for the
+    /// same reason (see the type-level docs on the string-id convention).
     pub async fn upload_file(
         &self,
         path: String,
         path_name: String,
         tags: Vec<String>,
-    ) -> Result<FileId, ApiError> {
+    ) -> Result<String, ApiError> {
         let backend = self.try_backend()?;
         let mut tag_ids = Vec::with_capacity(tags.len());
         for tag in tags {
             tag_ids.push(backend.resolve_tag_id(tag).await?);
         }
-        backend
+        Ok(backend
             .upload_file(std::path::PathBuf::from(path), path_name, tag_ids)
-            .await
+            .await?
+            .to_string())
     }
 
     /// Delete a file.
-    pub async fn delete_file(&self, file_id: FileId) -> Result<(), ApiError> {
-        self.try_backend()?.delete_file(file_id).await
+    pub async fn delete_file(&self, file_id: String) -> Result<(), ApiError> {
+        let backend = self.try_backend()?;
+        let file_id = backend.resolve_file_id(file_id).await?;
+        backend.delete_file(file_id).await
     }
 
     /// Restore a soft-deleted file (best-effort). Fails with
     /// `ApiError::ContentUnavailable` if no source (local `keep_deleted_files`
     /// vault or a connected peer) still holds the file's bytes.
-    pub async fn restore_file(&self, file_id: FileId) -> Result<(), ApiError> {
-        self.try_backend()?.restore_file(file_id).await
+    pub async fn restore_file(&self, file_id: String) -> Result<(), ApiError> {
+        let backend = self.try_backend()?;
+        let file_id = backend.resolve_file_id(file_id).await?;
+        backend.restore_file(file_id).await
     }
 
     /// Purge the daemon's cached file previews, returning how many were
@@ -869,24 +849,26 @@ impl OniSyncApp {
     /// Move (rename) a file to a new logical path. String-id variant of the
     /// underlying `move_file` call — the Dart UI passes the `FileEntry.fileId`
     /// string it already has.
-    pub async fn move_file_by_string(
-        &self,
-        file_id: String,
-        logical_path: String,
-    ) -> Result<(), ApiError> {
+    pub async fn move_file(&self, file_id: String, logical_path: String) -> Result<(), ApiError> {
         let backend = self.try_backend()?;
         let file_id = backend.resolve_file_id(file_id).await?;
         backend.move_file(file_id, logical_path).await
     }
 
     /// Apply `tag_id` to `file_id`.
-    pub async fn tag_file(&self, tag_id: TagId, file_id: FileId) -> Result<(), ApiError> {
-        self.try_backend()?.tag_file(tag_id, file_id).await
+    pub async fn tag_file(&self, tag_id: String, file_id: String) -> Result<(), ApiError> {
+        let backend = self.try_backend()?;
+        let tag_id = backend.resolve_tag_id(tag_id).await?;
+        let file_id = backend.resolve_file_id(file_id).await?;
+        backend.tag_file(tag_id, file_id).await
     }
 
     /// Remove `tag_id` from `file_id`.
-    pub async fn untag_file(&self, tag_id: TagId, file_id: FileId) -> Result<(), ApiError> {
-        self.try_backend()?.untag_file(tag_id, file_id).await
+    pub async fn untag_file(&self, tag_id: String, file_id: String) -> Result<(), ApiError> {
+        let backend = self.try_backend()?;
+        let tag_id = backend.resolve_tag_id(tag_id).await?;
+        let file_id = backend.resolve_file_id(file_id).await?;
+        backend.untag_file(tag_id, file_id).await
     }
 
     /// Subscribe to the live change stream.

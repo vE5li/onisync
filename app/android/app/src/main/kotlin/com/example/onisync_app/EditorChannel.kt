@@ -27,7 +27,7 @@ import java.io.File
  *    That is the strongest "editing finished" signal available on Android:
  *    `ACTION_EDIT` targets do not reliably return a result via
  *    `startActivityForResult`. If the user came back for another reason
- *    (task switcher, notification) the follow-up `finishEditByString` will
+ *    (task switcher, notification) the follow-up `finishEdit` will
  *    hash the bytes and no-op — correctness is preserved.
  *
  * The FileProvider authority is declared in the manifest as

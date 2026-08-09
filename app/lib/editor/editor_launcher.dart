@@ -2,8 +2,8 @@
 // waiting until the user is done editing it.
 //
 // The Flutter "edit" action in the file detail screen is a thin driver over
-// the daemon's stateless edit protocol (see OniSyncApp.beginEditByString /
-// finishEditByString / cancelEdit): it asks the daemon for a path, hands the
+// the daemon's stateless edit protocol (see OniSyncApp.beginEdit /
+// finishEdit / cancelEdit): it asks the daemon for a path, hands the
 // path to a launcher implementing this interface, and — once the launcher
 // resolves — hands the path back for hash-and-maybe-upload.
 //
@@ -52,7 +52,7 @@ abstract class EditorLauncher {
   ///
   /// Throws on any launch/wait failure; the caller uses that to distinguish
   /// "abort — clean up the daemon temp" from "editor exited normally — hand
-  /// the path back to `finishEditByString`".
+  /// the path back to `finishEdit`".
   Future<void> launchAndWait({
     required String path,
     required String logicalName,

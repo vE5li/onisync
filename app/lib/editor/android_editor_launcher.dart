@@ -16,7 +16,7 @@
 //      Kotlin side surfaces via the `editorReturned` MethodChannel event.
 //      First `onResume` after launch wins; if the user got distracted (task
 //      switcher, notification) and hit onisync's icon without ever opening
-//      the editor, we still hand the path to `finishEditByString`, which
+//      the editor, we still hand the path to `finishEdit`, which
 //      re-hashes and no-ops when nothing changed.
 //
 // A crash between `launch` and the resume event only leaks a temp file, which

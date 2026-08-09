@@ -5,7 +5,7 @@ import '../rust/api.dart' as onisync;
 /// Preview for a file whose bytes are **not** present locally.
 ///
 /// Unlike [FilePreview] (which reads full-fidelity bytes off disk), this asks
-/// the daemon for a small, cacheable preview via [OniSyncApp.getPreviewByString]
+/// the daemon for a small, cacheable preview via [OniSyncApp.getPreview]
 /// — a low-resolution image or a short text snippet. The daemon generates it
 /// from a peer that holds the content (first responder wins) and caches it, so
 /// repeat opens are cheap. A file that no peer holds, or whose content is not
@@ -41,7 +41,7 @@ class _RemotePreviewState extends State<RemotePreview> {
   @override
   void initState() {
     super.initState();
-    _future = widget.app.getPreviewByString(fileId: widget.fileId);
+    _future = widget.app.getPreview(fileId: widget.fileId);
   }
 
   @override
@@ -50,7 +50,7 @@ class _RemotePreviewState extends State<RemotePreview> {
     // Refetch if the file or its content changed underneath us.
     if (oldWidget.fileId != widget.fileId ||
         oldWidget.contentHash != widget.contentHash) {
-      _future = widget.app.getPreviewByString(fileId: widget.fileId);
+      _future = widget.app.getPreview(fileId: widget.fileId);
     }
   }
 
