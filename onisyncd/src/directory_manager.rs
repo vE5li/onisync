@@ -766,7 +766,7 @@ impl SyncDirectoryManager {
         }
     }
 
-    async fn initial_sync_tagged(
+    async fn initial_sync_tag_based(
         &self,
         sync_directory: &RichSyncDirectory,
         files: Vec<SyncDirectoryFile>,
@@ -911,7 +911,7 @@ impl SyncDirectoryManager {
                         .await
                 }
                 SyncType::TagBased { tags } => {
-                    self.initial_sync_tagged(sync_directory, files, tags, last_known_hashes)
+                    self.initial_sync_tag_based(sync_directory, files, tags, last_known_hashes)
                         .await
                 }
             }
