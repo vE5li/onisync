@@ -1102,37 +1102,6 @@ impl IpcClientBackend {
     }
 }
 
-/// Stream `path` to compute its BLAKE3 hex digest without loading it into
-/// memory, returning `(content_hash, size_in_bytes)`. The size is the exact
-/// number of bytes streamed, captured at the same time as the hash.
-pub async fn hash_file(path: &Path) -> Result<(String, u64), ApiError> {
-    use tokio::io::AsyncReadExt;
-
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .map_err(|error| ApiError::Transport(format!("open {}: {error}", path.display())))?;
-
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0u8; 64 * 1024];
-    let mut size: u64 = 0;
-
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .await
-            .map_err(|error| ApiError::Transport(format!("read {}: {error}", path.display())))?;
-
-        if read == 0 {
-            break;
-        }
-
-        size += read as u64;
-        hasher.update(&buffer[..read]);
-    }
-
-    Ok((hasher.finalize().to_hex().to_string(), size))
-}
-
 /// Block until the daemon reports `file_id` has been handed off
 /// ([`ApiEvent::ProviderReleased`]), or the event stream ends.
 async fn wait_for_release(
@@ -1333,7 +1302,7 @@ impl TransportBackend for IpcClientBackend {
         path_name: String,
         tags: Vec<TagId>,
     ) -> Result<FileId, ApiError> {
-        let (content_hash, size) = hash_file(&path).await?;
+        let (content_hash, size) = crate::file_bytes::hash_and_len(&path).await?;
         // Subscribe before sending so we cannot miss the release event.
         let mut events = self.inner.events.subscribe();
         *self.inner.provider_path.lock().await = Some(path);
@@ -1359,7 +1328,7 @@ impl TransportBackend for IpcClientBackend {
     /// Edit (replace) a file's content, serving the new bytes as a temporary
     /// provider. Same handoff semantics as [`Self::upload_file`].
     async fn edit_file(&self, file_id: FileId, path: PathBuf) -> Result<(), ApiError> {
-        let (content_hash, size) = hash_file(&path).await?;
+        let (content_hash, size) = crate::file_bytes::hash_and_len(&path).await?;
         let mut events = self.inner.events.subscribe();
         *self.inner.provider_path.lock().await = Some(path);
 

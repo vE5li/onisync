@@ -216,29 +216,7 @@ impl FileBytes {
         match self {
             FileBytes::InMemory(bytes) => Ok(blake3::hash(bytes).to_hex().to_string()),
             FileBytes::FileToCopy(path) | FileBytes::FileToMove(path) => {
-                let mut file =
-                    tokio::fs::File::open(path)
-                        .await
-                        .map_err(|source| FileBytesError::Io {
-                            path: Some(path.clone()),
-                            source,
-                        })?;
-                let mut hasher = blake3::Hasher::new();
-                let mut buffer = vec![0u8; STREAM_CHUNK];
-                loop {
-                    let read =
-                        file.read(&mut buffer)
-                            .await
-                            .map_err(|source| FileBytesError::Io {
-                                path: Some(path.clone()),
-                                source,
-                            })?;
-                    if read == 0 {
-                        break;
-                    }
-                    hasher.update(&buffer[..read]);
-                }
-                Ok(hasher.finalize().to_hex().to_string())
+                hash_and_len(path).await.map(|(hash, _)| hash)
             }
         }
     }
@@ -305,6 +283,41 @@ impl FileBytes {
             },
         }
     }
+}
+
+/// Stream `path` once to compute both its BLAKE3 hex digest and its exact
+/// length in bytes, without ever holding the file in memory.
+///
+/// The two values come from the same pass, so they always describe the same
+/// bytes — unlike hashing and then stat-ing, which can disagree if the file is
+/// rewritten in between. Callers that publish a `(content_hash, size)` pair to
+/// peers depend on that: the size is what the receiver uses to know when a
+/// transfer is complete, and the hash is what it verifies against.
+///
+/// Lives here rather than in the control or API layers because it is pure
+/// content handling with no protocol content, and this module already owns the
+/// streaming primitives and the I/O error type.
+pub async fn hash_and_len(path: &Path) -> Result<(String, u64), FileBytesError> {
+    let io_error = |source| FileBytesError::Io {
+        path: Some(path.to_path_buf()),
+        source,
+    };
+
+    let mut file = tokio::fs::File::open(path).await.map_err(io_error)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; STREAM_CHUNK];
+    let mut size: u64 = 0;
+
+    loop {
+        let read = file.read(&mut buffer).await.map_err(io_error)?;
+        if read == 0 {
+            break;
+        }
+        size += read as u64;
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok((hasher.finalize().to_hex().to_string(), size))
 }
 
 /// Stream-copy `source` into `dest` without buffering the whole file.

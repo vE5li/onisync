@@ -37,6 +37,7 @@ use crate::database::{
 };
 use crate::directory_manager::SyncDirectoryCommand;
 use crate::fetch::PendingFetches;
+use crate::file_bytes::FileBytesError;
 use crate::transfer::ChunkSource;
 
 /// Errors surfaced to the UI.
@@ -119,6 +120,16 @@ impl From<PreviewError> for ApiError {
             PreviewError::UnknownFile => ApiError::NotFound,
             PreviewError::ShuttingDown => ApiError::Internal(error.to_string()),
         }
+    }
+}
+
+impl From<FileBytesError> for ApiError {
+    fn from(error: FileBytesError) -> Self {
+        // Reading a caller-supplied local path (an upload source or an edit
+        // result) failed. That is a failure of the client's side of the
+        // exchange rather than of the catalog, so it maps to `Transport`.
+        // `FileBytesError`'s own `Display` already names the path.
+        ApiError::Transport(error.to_string())
     }
 }
 
@@ -783,7 +794,7 @@ impl Api {
         // If they match there is nothing to publish — either the editor
         // produced no change, or the watcher already ingested the in-place
         // save and updated the DB.
-        let (edited_hash, edited_size) = crate::control::hash_file(&path).await?;
+        let (edited_hash, edited_size) = crate::file_bytes::hash_and_len(&path).await?;
         let current_hash = self.get_file(file_id, DeletedRule::Include)?.content_hash;
 
         if edited_hash == current_hash {

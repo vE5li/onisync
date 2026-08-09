@@ -463,12 +463,6 @@ impl InProcessBackend {
     }
 }
 
-/// Map a [`FileBytes::hash`](crate::file_bytes::FileBytes::hash) failure (an
-/// I/O error reading the local upload source) into an [`ApiError`].
-fn hash_error(error: crate::file_bytes::FileBytesError) -> ApiError {
-    ApiError::Transport(format!("hashing upload source: {error}"))
-}
-
 impl TransportBackend for InProcessBackend {
     async fn resolve_file_id(&self, prefix: String) -> Result<FileId, ApiError> {
         self.api.resolve_file_id(&prefix)
@@ -554,9 +548,8 @@ impl TransportBackend for InProcessBackend {
         // on demand straight from disk (never buffering the whole file). This is
         // the same provider mechanism the IPC/CLI path uses, sourced from the
         // local filesystem instead of the control socket.
+        let (content_hash, size) = crate::file_bytes::hash_and_len(&path).await?;
         let source = crate::file_bytes::FileBytes::FileToCopy(path);
-        let content_hash = source.hash().await.map_err(hash_error)?;
-        let size = source.byte_len().await.map_err(hash_error)?;
         let file_id = self
             .api
             .upload_file(path_name, content_hash.clone(), size, tags)?;
@@ -567,9 +560,8 @@ impl TransportBackend for InProcessBackend {
     }
 
     async fn edit_file(&self, file_id: FileId, path: PathBuf) -> Result<(), ApiError> {
+        let (content_hash, size) = crate::file_bytes::hash_and_len(&path).await?;
         let source = crate::file_bytes::FileBytes::FileToCopy(path);
-        let content_hash = source.hash().await.map_err(hash_error)?;
-        let size = source.byte_len().await.map_err(hash_error)?;
         self.api.edit_file(file_id, content_hash.clone(), size)?;
         self.api
             .register_provider(file_id, content_hash, std::sync::Arc::new(source))
