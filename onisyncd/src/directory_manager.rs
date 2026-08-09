@@ -646,7 +646,7 @@ impl SyncDirectoryManager {
         base.clone()
     }
 
-    async fn intial_sync_universal(
+    async fn initial_sync_universal(
         &self,
         sync_directory: &RichSyncDirectory,
         files: Vec<SyncDirectoryFile>,
@@ -766,7 +766,7 @@ impl SyncDirectoryManager {
         }
     }
 
-    async fn intial_sync_tagged(
+    async fn initial_sync_tagged(
         &self,
         sync_directory: &RichSyncDirectory,
         files: Vec<SyncDirectoryFile>,
@@ -907,11 +907,11 @@ impl SyncDirectoryManager {
 
             match &sync_directory.sync_type {
                 SyncType::Universal { .. } => {
-                    self.intial_sync_universal(sync_directory, files, last_known_hashes)
+                    self.initial_sync_universal(sync_directory, files, last_known_hashes)
                         .await
                 }
                 SyncType::TagBased { tags } => {
-                    self.intial_sync_tagged(sync_directory, files, tags, last_known_hashes)
+                    self.initial_sync_tagged(sync_directory, files, tags, last_known_hashes)
                         .await
                 }
             }
