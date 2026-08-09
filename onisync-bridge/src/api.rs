@@ -171,6 +171,34 @@ pub enum _DeletedRule {
     Exclude,
 }
 
+/// Mirror of [`ApiError`] so every fallible bridge call rejects with a real
+/// Dart sealed class the UI can pattern-match on.
+///
+/// Without this, `ApiError` crosses as a `RustOpaque` handle whose `toString()`
+/// is `Instance of 'ApiErrorImpl'` — carrying no variant, no message, and no
+/// way to tell "this file is gone" from "no peer is online". The UI is then
+/// reduced to substring-matching rendered text, which fails silently.
+///
+/// Variants MUST stay in sync with [`onisyncd::api::ApiError`]; see the
+/// sibling [`_SubtagRule`] doc for why mirror declarations exist at all. Keep
+/// every payload a `String`: a variant carrying a foreign type cannot be
+/// mirrored and would push Dart back onto opaque handles.
+#[cfg(feature = "flutter_rust_bridge")]
+#[flutter_rust_bridge::frb(mirror(ApiError))]
+pub enum _ApiError {
+    /// The id is not in the catalog. Permanent — navigate away rather than
+    /// offering a retry.
+    UnknownId,
+    /// The entity exists but no reachable device holds its bytes. Transient —
+    /// worth retrying once a holder comes online.
+    ContentUnavailable,
+    /// A short-id prefix matched more than one row. Carries the prefix.
+    AmbiguousId(String),
+    InvalidArgument(String),
+    Transport(String),
+    Internal(String),
+}
+
 /// An external-editor rule flattened for the Dart UI.
 ///
 /// Mirrors [`EditorRule`] as a DTO with plain fields (rather than an opaque
@@ -434,13 +462,13 @@ impl OniSyncApp {
 
     /// Resolve a full-or-short file id prefix (see
     /// [`FileInfo::short_id_length`]) to a single [`FileId`]. Errors with
-    /// `NotFound` if nothing matches or `Ambiguous` if several do.
+    /// `UnknownId` if nothing matches or `AmbiguousId` if several do.
     pub async fn resolve_file_id(&self, prefix: String) -> Result<FileId, ApiError> {
         self.try_backend()?.resolve_file_id(prefix).await
     }
 
     /// Resolve a full-or-short tag id `prefix` to a single [`TagId`]. Errors
-    /// with `NotFound` if nothing matches or `Ambiguous` if several do. The
+    /// with `UnknownId` if nothing matches or `AmbiguousId` if several do. The
     /// tag counterpart of [`resolve_file_id`].
     ///
     /// This is how the Dart UI turns a `TagEntry.tag_id` string back into the
@@ -567,10 +595,10 @@ impl OniSyncApp {
     }
 
     /// Get a single file's flattened [`FileEntry`] by id string (a full or
-    /// short id prefix). Errors `NotFound` if unknown.
+    /// short id prefix). Errors `UnknownId` if unknown.
     ///
     /// `deleted_rule` mirrors [`Self::run_query`]: under
-    /// [`DeletedRule::Exclude`] a tombstoned file reads as `NotFound` (the
+    /// [`DeletedRule::Exclude`] a tombstoned file reads as `UnknownId` (the
     /// default for pickers and operational lookups); under
     /// [`DeletedRule::Include`] it comes back with `FileEntry::deleted =
     /// true`, so a detail screen opened from the "show deleted" search can
@@ -592,7 +620,7 @@ impl OniSyncApp {
     /// file is known by metadata but hasn't been fetched yet). Read-only.
     ///
     /// The UI uses this to render an inline preview from disk without pulling
-    /// bytes across the bridge. Errors `NotFound` if the id itself is unknown.
+    /// bytes across the bridge. Errors `UnknownId` if the id itself is unknown.
     pub async fn local_path_for_file_by_string(
         &self,
         file_id: String,
@@ -612,7 +640,7 @@ impl OniSyncApp {
     /// fetches one from a peer (first responder wins) — the UI does not need to
     /// know which. A file whose content has no preview comes back with
     /// `PreviewEntry.kind == PreviewKind::None` (a successful result). Errors
-    /// `NotFound` only if the id itself is unknown.
+    /// `UnknownId` only if the id itself is unknown.
     pub async fn get_preview_by_string(&self, file_id: String) -> Result<PreviewEntry, ApiError> {
         let backend = self.try_backend()?;
         let file_id = backend.resolve_file_id(file_id).await?;
@@ -734,7 +762,7 @@ impl OniSyncApp {
     }
 
     /// Get a single tag's flattened [`TagEntry`] by id string (a full or short
-    /// id prefix). Errors `NotFound` if unknown. See
+    /// id prefix). Errors `UnknownId` if unknown. See
     /// [`Self::get_file_entry`] for the `deleted_rule` semantics.
     pub async fn get_tag_entry(
         &self,
@@ -822,8 +850,8 @@ impl OniSyncApp {
     }
 
     /// Restore a soft-deleted file (best-effort). Fails with
-    /// `ApiError::NotFound` if no source (local `keep_deleted_files` vault
-    /// or a connected peer) still holds the file's bytes.
+    /// `ApiError::ContentUnavailable` if no source (local `keep_deleted_files`
+    /// vault or a connected peer) still holds the file's bytes.
     pub async fn restore_file(&self, file_id: FileId) -> Result<(), ApiError> {
         self.try_backend()?.restore_file(file_id).await
     }

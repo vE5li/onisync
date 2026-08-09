@@ -125,10 +125,10 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
       });
     } catch (error) {
       if (!mounted) return;
-      // `getTagEntry` throws NotFound when the tag is gone; treat that as
-      // "deleted underneath us" and pop back to the list. Other errors
+      // `getTagEntry` rejects with `UnknownId` when the tag is gone; treat
+      // that as "deleted underneath us" and pop back to the list. Other errors
       // (transport, etc.) surface normally.
-      final isMissing = '$error'.contains('NotFound');
+      final isMissing = error is onisync.ApiError_UnknownId;
       setState(() {
         if (isMissing) {
           _tag = null;

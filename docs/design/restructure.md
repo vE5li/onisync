@@ -943,3 +943,8 @@ Identified during analysis, not scheduled:
   build.
 - **`app.dart:70–91`** — bootstrap failure only `debugPrint`s (has a TODO).
 - **`api.rs::parse_query`** silently drops the `/p` (physical path) prefix.
+- **The Dart tree is not `dart format`-clean** against the SDK pinned in
+  `flake.nix` (Flutter 3.41.9). Running `dart format` on a screen reflows
+  20–100 unrelated lines, which buries real changes in review noise. Either
+  reformat the whole tree once, in its own commit, or add a CI check — but do
+  not let it happen incidentally inside a behaviour change.

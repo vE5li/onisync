@@ -43,23 +43,35 @@ use crate::transfer::ChunkSource;
 /// Errors surfaced to the UI.
 ///
 /// A single serializable error type so the transport can carry one shape over
-/// the wire. It wraps the crate's [`DatabaseError`] rather than leaking it raw,
-/// and adds UI-facing variants.
+/// the wire, and — because every variant is either a unit or a `String` — one
+/// that `flutter_rust_bridge` can mirror into a real Dart sealed class rather
+/// than an opaque handle. Keep it that way: a variant carrying a foreign type
+/// (as `Database(DatabaseError)` once did) forces Dart back to matching on
+/// rendered text, which is silently wrong the moment the text changes.
+///
+/// The distinction the UI actually depends on is
+/// [`UnknownId`](Self::UnknownId) versus
+/// [`ContentUnavailable`](Self::ContentUnavailable): "this entity does not
+/// exist" is permanent and should navigate away, while "nobody reachable has
+/// these bytes" is transient and should offer to retry.
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
 pub enum ApiError {
-    /// Unknown `FileId`/`TagId`.
+    /// No such `FileId`/`TagId` in the catalog. Permanent: the entity is gone
+    /// (or never existed), and retrying will not help.
     #[error("not found")]
-    NotFound,
-    /// A short-id prefix matched more than one file, so it could not be
+    UnknownId,
+    /// The entity exists, but its bytes could not be obtained: no reachable
+    /// peer currently holds the requested content hash. Transient — a retry
+    /// once the holder is online will succeed.
+    #[error("content unavailable: no reachable device holds it")]
+    ContentUnavailable,
+    /// A short-id prefix matched more than one row, so it could not be
     /// resolved to a single id. Carries the ambiguous prefix.
     #[error("ambiguous id prefix '{0}': matches multiple files")]
-    Ambiguous(String),
+    AmbiguousId(String),
     /// A caller-supplied argument was invalid (e.g. empty tag name).
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
-    /// A database-layer failure.
-    #[error("database error: {0}")]
-    Database(#[source] DatabaseError),
     /// IPC-only: socket/protocol failure. Never produced in-process.
     #[error("transport error: {0}")]
     Transport(String),
@@ -72,8 +84,8 @@ pub enum ApiError {
 impl From<DatabaseError> for ApiError {
     fn from(error: DatabaseError) -> Self {
         match error {
-            DatabaseError::MissingFile | DatabaseError::MissingTag => ApiError::NotFound,
-            DatabaseError::AmbiguousIdPrefix(prefix) => ApiError::Ambiguous(prefix),
+            DatabaseError::MissingFile | DatabaseError::MissingTag => ApiError::UnknownId,
+            DatabaseError::AmbiguousIdPrefix(prefix) => ApiError::AmbiguousId(prefix),
             DatabaseError::InvalidTagName => {
                 ApiError::InvalidArgument("invalid tag name".to_owned())
             }
@@ -81,10 +93,12 @@ impl From<DatabaseError> for ApiError {
             DatabaseError::CantTagItself => {
                 ApiError::InvalidArgument("a tag cannot be its own subtag".to_owned())
             }
-            // A raw SQL failure is not actionable by the UI, so it is reported
-            // as an internal error rather than a structured database error.
-            sqlite @ DatabaseError::Sqlite { .. } => ApiError::Internal(sqlite.to_string()),
-            other => ApiError::Database(other),
+            // Everything left — a raw SQL failure, an unopenable database, a
+            // non-UTF-8 path — is a storage-layer fault the UI can do nothing
+            // about. Rendering it into `Internal` keeps `ApiError` free of
+            // foreign payloads (see the type docs) at no cost to the UI, which
+            // only ever displayed the text anyway.
+            other => ApiError::Internal(other.to_string()),
         }
     }
 }
@@ -92,8 +106,8 @@ impl From<DatabaseError> for ApiError {
 impl From<FetchError> for ApiError {
     fn from(error: FetchError) -> Self {
         match error {
-            // No peer had the content: surface as a plain not-found to the UI.
-            FetchError::NotAvailable => ApiError::NotFound,
+            // The file is in the catalog; no reachable peer has its bytes.
+            FetchError::NotAvailable => ApiError::ContentUnavailable,
             FetchError::TimedOut | FetchError::ShuttingDown => {
                 ApiError::Internal(error.to_string())
             }
@@ -104,9 +118,8 @@ impl From<FetchError> for ApiError {
 impl From<RestoreError> for ApiError {
     fn from(error: RestoreError) -> Self {
         match error {
-            // No source held the bytes, or the file was not deleted: surface as
-            // a plain not-found/invalid so the UI can show a clear failure.
-            RestoreError::NotAvailable => ApiError::NotFound,
+            // No source still held the bytes to restore from.
+            RestoreError::NotAvailable => ApiError::ContentUnavailable,
             RestoreError::NotDeleted => ApiError::InvalidArgument(error.to_string()),
             RestoreError::ShuttingDown => ApiError::Internal(error.to_string()),
         }
@@ -117,7 +130,7 @@ impl From<PreviewError> for ApiError {
     fn from(error: PreviewError) -> Self {
         match error {
             // The file id isn't in the catalog at all.
-            PreviewError::UnknownFile => ApiError::NotFound,
+            PreviewError::UnknownFile => ApiError::UnknownId,
             PreviewError::ShuttingDown => ApiError::Internal(error.to_string()),
         }
     }
@@ -323,8 +336,8 @@ impl Api {
     /// short ids, or a pasted full id) to a single [`FileId`]. Backed by
     /// `FileDatabase::resolve_file_id_prefix`.
     ///
-    /// Returns [`ApiError::NotFound`] if nothing matches and
-    /// [`ApiError::Ambiguous`] if more than one file matches.
+    /// Returns [`ApiError::UnknownId`] if nothing matches and
+    /// [`ApiError::AmbiguousId`] if more than one file matches.
     pub fn resolve_file_id(&self, prefix: &str) -> Result<FileId, ApiError> {
         let database = self.open_read()?;
         Ok(database.resolve_file_id_prefix(prefix)?)
@@ -335,8 +348,8 @@ impl Api {
     /// counterpart of [`resolve_file_id`](Self::resolve_file_id). Backed by
     /// `FileDatabase::resolve_tag_id_prefix`.
     ///
-    /// Returns [`ApiError::NotFound`] if nothing matches and
-    /// [`ApiError::Ambiguous`] if more than one tag matches.
+    /// Returns [`ApiError::UnknownId`] if nothing matches and
+    /// [`ApiError::AmbiguousId`] if more than one tag matches.
     pub fn resolve_tag_id(&self, prefix: &str) -> Result<TagId, ApiError> {
         let database = self.open_read()?;
         Ok(database.resolve_tag_id_prefix(prefix)?)
@@ -411,7 +424,7 @@ impl Api {
         // draws file ids from the tag `entries` table, which can reference a file
         // that has no `file_versions` row yet (tagged before its content
         // materialized). Such a file is not listable, so skip it rather than
-        // failing the whole query with `NotFound`. Same tolerance for tags.
+        // failing the whole query with `UnknownId`. Same tolerance for tags.
         let mut files = Vec::new();
         for file_id in database.file_ids_for_query(&terms, subtag_rule, deleted_rule)? {
             match database.file_info_from_id(file_id, deleted_rule) {
@@ -445,13 +458,13 @@ impl Api {
         Ok(QueryResult { files, tags })
     }
 
-    /// Get a single file's [`FileInfo`] by id, or [`ApiError::NotFound`] if no
+    /// Get a single file's [`FileInfo`] by id, or [`ApiError::UnknownId`] if no
     /// such file exists. The by-id read that replaces scanning a full listing
     /// (used by `onisync edit`/`download` to find one file's metadata). Backed
     /// by `FileDatabase::file_info_from_id`.
     ///
     /// `deleted_rule` governs tombstone visibility: `Exclude` treats a
-    /// tombstoned file as `NotFound` (the standard behavior for pickers and
+    /// tombstoned file as `UnknownId` (the standard behavior for pickers and
     /// operational lookups); `Include` returns it with `FileInfo::deleted =
     /// true`, so a detail screen opened from a "search deleted" result can
     /// still render its metadata.
@@ -464,9 +477,9 @@ impl Api {
         Ok(database.file_info_from_id(file_id, deleted_rule)?)
     }
 
-    /// Get a single tag by id, or [`ApiError::NotFound`] if no such tag exists.
-    /// Backed by `FileDatabase::tag_from_id`. See [`Self::get_file`] for the
-    /// `deleted_rule` semantics.
+    /// Get a single tag by id, or [`ApiError::UnknownId`] if no such tag
+    /// exists. Backed by `FileDatabase::tag_from_id`. See
+    /// [`Self::get_file`] for the `deleted_rule` semantics.
     pub fn get_tag(&self, tag_id: TagId, deleted_rule: DeletedRule) -> Result<Tag, ApiError> {
         let database = self.open_read()?;
         Ok(database.tag_from_id(tag_id, deleted_rule)?)
@@ -617,7 +630,7 @@ impl Api {
     /// a bespoke wire variant, and is fire-and-forget (no bytes to recover,
     /// so it cannot "fail to find a source" the way a file restore can).
     ///
-    /// Returns [`ApiError::NotFound`] if the tag is unknown. Reading it with
+    /// Returns [`ApiError::UnknownId`] if the tag is unknown. Reading it with
     /// `Include` means an already-live tag is re-announced harmlessly (the LWW
     /// guard makes it a no-op if nothing changed).
     pub fn restore_tag(&self, tag_id: TagId) -> Result<(), ApiError> {
@@ -865,7 +878,7 @@ impl Api {
     /// record the restored version, announce a `Change::FileRestored` to peers,
     /// and pull the bytes into whichever local sync directories want them. If
     /// nothing holds the bytes the tombstone is left in place and this returns
-    /// [`ApiError::NotFound`].
+    /// [`ApiError::ContentUnavailable`].
     ///
     /// Request-reply (unlike `delete_file`) because the outcome is only known
     /// after the async availability probe.
@@ -996,7 +1009,7 @@ impl Api {
     /// wins), caching the result in `previews_v1` before replying.
     ///
     /// A file with no previewable content resolves to [`Preview::None`] — that
-    /// is a successful result, not an error. `ApiError::NotFound` means the
+    /// is a successful result, not an error. `ApiError::UnknownId` means the
     /// file id itself is unknown to the catalog.
     pub async fn get_preview(&self, file_id: FileId) -> Result<Preview, ApiError> {
         // End-to-end stopwatch for the whole daemon-side request (bus enqueue →

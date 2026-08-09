@@ -382,7 +382,7 @@ async fn resolve_tag_names(
             Ok(tag) => tag.name,
             // A referenced tag that no longer resolves: show its id rather than
             // failing the whole listing.
-            Err(onisyncd::api::ApiError::NotFound) => tag_id.to_string(),
+            Err(onisyncd::api::ApiError::UnknownId) => tag_id.to_string(),
             Err(error) => return Err(error.to_string()),
         };
         cache.insert(*tag_id, name.clone());
@@ -401,7 +401,7 @@ async fn tags_from_ids(
     for tag_id in tag_ids {
         match backend.get_tag(tag_id, DeletedRule::Exclude).await {
             Ok(tag) => tags.push(tag),
-            Err(onisyncd::api::ApiError::NotFound) => {}
+            Err(onisyncd::api::ApiError::UnknownId) => {}
             Err(error) => return Err(error.to_string()),
         }
     }
@@ -470,7 +470,7 @@ async fn resolve_file_id(backend: &IpcClientBackend, input: &str) -> Result<File
         .resolve_file_id(input.to_owned())
         .await
         .map_err(|error| match error {
-            onisyncd::api::ApiError::NotFound => format!("no file matches id '{input}'"),
+            onisyncd::api::ApiError::UnknownId => format!("no file matches id '{input}'"),
             other => other.to_string(),
         })
 }
@@ -486,7 +486,7 @@ async fn resolve_tag_id(backend: &IpcClientBackend, input: &str) -> Result<TagId
         .resolve_tag_id(input.to_owned())
         .await
         .map_err(|error| match error {
-            onisyncd::api::ApiError::NotFound => format!("no tag matches id '{input}'"),
+            onisyncd::api::ApiError::UnknownId => format!("no tag matches id '{input}'"),
             other => other.to_string(),
         })
 }
@@ -1283,7 +1283,7 @@ async fn edit_file(
 ) -> Result<(), String> {
     let path = match backend.begin_edit(file_id).await {
         Ok(path) => path,
-        Err(onisyncd::api::ApiError::NotFound) => {
+        Err(onisyncd::api::ApiError::UnknownId) => {
             return Err(format!("unknown file id: {}", file_id.to_string()));
         }
         Err(error) => return Err(error.to_string()),
@@ -1332,7 +1332,7 @@ async fn download_file(
     // output filename.
     let file = match backend.get_file(file_id, DeletedRule::Exclude).await {
         Ok(file) => file,
-        Err(onisyncd::api::ApiError::NotFound) => {
+        Err(onisyncd::api::ApiError::UnknownId) => {
             return Err(format!("unknown file id: {}", file_id.to_string()));
         }
         Err(error) => return Err(error.to_string()),

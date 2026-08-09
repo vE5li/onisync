@@ -62,14 +62,14 @@ use crate::operations::{Operation, OperationEvent};
 /// multi-threaded runtime — can move them across threads.
 pub trait TransportBackend {
     /// Resolve a full-or-short file id `prefix` to a single [`FileId`]. Errors
-    /// with `NotFound` if nothing matches or `Ambiguous` if several do.
+    /// with `UnknownId` if nothing matches or `AmbiguousId` if several do.
     fn resolve_file_id(
         &self,
         prefix: String,
     ) -> impl Future<Output = Result<FileId, ApiError>> + Send;
 
     /// Resolve a full-or-short tag id `prefix` to a single [`TagId`]. Errors
-    /// with `NotFound` if nothing matches or `Ambiguous` if several do.
+    /// with `UnknownId` if nothing matches or `AmbiguousId` if several do.
     fn resolve_tag_id(
         &self,
         prefix: String,
@@ -94,8 +94,8 @@ pub trait TransportBackend {
         deleted_rule: DeletedRule,
     ) -> impl Future<Output = Result<QueryResult, ApiError>> + Send;
 
-    /// Get a single file's [`FileInfo`] by id (`NotFound` if unknown).
-    /// `deleted_rule` controls whether a tombstoned file reads as `NotFound`
+    /// Get a single file's [`FileInfo`] by id (`UnknownId` if unknown).
+    /// `deleted_rule` controls whether a tombstoned file reads as `UnknownId`
     /// or is returned with `FileInfo::deleted = true` (see
     /// [`Api::get_file`](crate::api::Api::get_file)).
     fn get_file(
@@ -104,7 +104,7 @@ pub trait TransportBackend {
         deleted_rule: DeletedRule,
     ) -> impl Future<Output = Result<FileInfo, ApiError>> + Send;
 
-    /// Get a single tag by id (`NotFound` if unknown). See [`Self::get_file`]
+    /// Get a single tag by id (`UnknownId` if unknown). See [`Self::get_file`]
     /// for the `deleted_rule` semantics.
     fn get_tag(
         &self,

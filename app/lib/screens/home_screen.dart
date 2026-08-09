@@ -183,15 +183,14 @@ class _HomeScreenState extends State<HomeScreen> {
       // Mid-typing tag tokens (`$fo`) legitimately fail to resolve; treat those
       // as "no matches" so the UI doesn't flash red at every keystroke. Other
       // errors (transport, etc.) still surface.
-      final message = '$error';
-      final looksLikeUnresolved =
-          message.contains('NotFound') || message.contains('Ambiguous');
+      final looksLikeUnresolved = error is onisync.ApiError_UnknownId ||
+          error is onisync.ApiError_AmbiguousId;
       setState(() {
         if (looksLikeUnresolved) {
           _results = const onisync.QueryEntries(files: [], tags: []);
           _error = null;
         } else {
-          _error = message;
+          _error = '$error';
         }
         _loading = false;
       });

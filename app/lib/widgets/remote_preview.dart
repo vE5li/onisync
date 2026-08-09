@@ -72,17 +72,17 @@ class _RemotePreviewState extends State<RemotePreview> {
           );
         }
         if (snapshot.hasError) {
-          final error = '${snapshot.error}';
-          // NotFound means no peer could serve the content at all.
-          final unavailable = error.contains('NotFound');
+          final error = snapshot.error;
+          // A file no peer can serve is *not* an error: `getPreview` resolves
+          // it to `PreviewKind.none`, handled in `_buildPreview`. The only
+          // meaningful rejection here is the file id itself being gone.
+          final missing = error is onisync.ApiError_UnknownId;
           return _PreviewTile(
-            icon: Icons.cloud_off_outlined,
-            title: unavailable
-                ? 'Preview unavailable'
-                : 'Failed to load preview',
-            subtitle: unavailable
-                ? 'No device that holds this file is currently reachable.'
-                : error,
+            icon: missing ? Icons.help_outline : Icons.cloud_off_outlined,
+            title: missing ? 'File no longer exists' : 'Failed to load preview',
+            subtitle: missing
+                ? 'It was deleted while this screen was open.'
+                : '$error',
           );
         }
         return _buildPreview(context, snapshot.data!);

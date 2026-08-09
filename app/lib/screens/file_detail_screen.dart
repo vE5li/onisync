@@ -138,9 +138,10 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     } catch (error) {
       if (!mounted) return;
       // `getFileEntry` (or a tag lookup on a just-deleted-then-recreated race)
-      // throws NotFound when the entity is gone; treat NotFound on the file
-      // itself as "deleted underneath us" and pop back to the previous route.
-      final isMissing = '$error'.contains('NotFound');
+      // rejects with `UnknownId` when the entity is gone; treat that on the
+      // file itself as "deleted underneath us" and pop back to the previous
+      // route.
+      final isMissing = error is onisync.ApiError_UnknownId;
       setState(() {
         if (isMissing) {
           _file = null;
@@ -289,9 +290,9 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
       await _load();
     } catch (error) {
       if (!mounted) return;
-      // NotFound means no source still holds the bytes — the best-effort
-      // restore failed and the file remains deleted.
-      final message = '$error'.contains('NotFound')
+      // `ContentUnavailable` means no source still holds the bytes — the
+      // best-effort restore failed and the file remains deleted.
+      final message = error is onisync.ApiError_ContentUnavailable
           ? 'Cannot restore: the file\'s contents are no longer available on '
               'any device.'
           : 'Failed to restore file: $error';
@@ -335,7 +336,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
       }
       await Share.shareXFiles([XFile(path, name: name)]);
     } catch (error) {
-      final message = '$error'.contains('NotFound')
+      final message = error is onisync.ApiError_ContentUnavailable
           ? 'Cannot share: the file\'s contents are not available on any '
               'device.'
           : 'Failed to share file: $error';
@@ -406,7 +407,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
       }
       _snack('Saved "${dest.split('/').last}" to Downloads.');
     } catch (error) {
-      final message = '$error'.contains('NotFound')
+      final message = error is onisync.ApiError_ContentUnavailable
           ? 'Cannot download: the file\'s contents are not available on any '
               'device.'
           : 'Failed to download file: $error';

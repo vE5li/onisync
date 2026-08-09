@@ -350,7 +350,7 @@ pub enum PrefixResolution {
 /// [`FileDatabase::resolve_file_id_prefix`]).
 ///
 /// Ids are stored in canonical simple-hex form, so a prefix match is a plain
-/// string-prefix test. We fetch up to two matches: zero → `NotFound`, one →
+/// string-prefix test. We fetch up to two matches: zero → not found, one →
 /// `Unique`, two → `Ambiguous`. With the primary-key index on the id column
 /// this is a bounded index range scan (`LIMIT 2`), not a full-table scan.
 ///

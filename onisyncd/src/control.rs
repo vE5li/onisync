@@ -95,14 +95,14 @@ pub enum ControlRequest {
         deleted_rule: DeletedRule,
     },
     /// Get a single file's info by id. Answered with [`ControlResponse::File`]
-    /// (or `Error(NotFound)`). `deleted_rule` toggles tombstone visibility;
+    /// (or `Error(UnknownId)`). `deleted_rule` toggles tombstone visibility;
     /// see [`Api::get_file`](crate::api::Api::get_file).
     GetFile {
         file_id: FileId,
         deleted_rule: DeletedRule,
     },
     /// Get a single tag by id. Answered with [`ControlResponse::Tag`] (or
-    /// `Error(NotFound)`).
+    /// `Error(UnknownId)`).
     GetTag {
         tag_id: TagId,
         deleted_rule: DeletedRule,
