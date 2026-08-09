@@ -399,7 +399,7 @@ pub enum PrefixResolution {
 /// this is a bounded index range scan (`LIMIT 2`), not a full-table scan.
 ///
 /// `prefix` **must** be validated as lowercase hex by the caller (see
-/// [`normalise_id_prefix`]); this keeps the `LIKE` pattern free of `%`/`_`
+/// [`normalize_id_prefix`]); this keeps the `LIKE` pattern free of `%`/`_`
 /// wildcards and the query injection-safe (the prefix is still bound as a
 /// parameter; `table`/`column` are internal constants, never user input).
 fn resolve_id_prefix(
@@ -423,7 +423,7 @@ fn resolve_id_prefix(
     }
 }
 
-/// Normalise a user-supplied id or short-id into the canonical lowercase-hex
+/// Normalize a user-supplied id or short-id into the canonical lowercase-hex
 /// form used for prefix matching.
 ///
 /// Accepts hyphenated UUIDs, full simple-hex ids, and short prefixes of either.
@@ -431,7 +431,7 @@ fn resolve_id_prefix(
 /// lowercased. Returns `None` if any remaining character is not a hex digit —
 /// this both rejects junk early and guarantees the value is safe to splice into
 /// a `LIKE` pattern (no wildcards).
-pub fn normalise_id_prefix(input: &str) -> Option<String> {
+pub fn normalize_id_prefix(input: &str) -> Option<String> {
     let cleaned: String = input
         .chars()
         .filter(|character| *character != '-')
@@ -1214,7 +1214,7 @@ impl FileDatabase {
     /// Note: the returned length reflects the database *at call time*. It is
     /// not stored and not stable across concurrent inserts — a prefix that
     /// is unique now may become ambiguous if a colliding file is added
-    /// later. That is the intended behaviour (resolution re-checks
+    /// later. That is the intended behavior (resolution re-checks
     /// uniqueness on use).
     ///
     /// Returns the full id length if the file has no neighbours (e.g. it is the
@@ -1268,13 +1268,13 @@ impl FileDatabase {
     /// - [`DatabaseError::AmbiguousIdPrefix`] if more than one file matches
     ///   (e.g. a colliding file was added since the short id was displayed).
     pub fn resolve_file_id_prefix(&self, prefix: &str) -> Result<FileId, DatabaseError> {
-        let normalised = normalise_id_prefix(prefix).ok_or(DatabaseError::MissingFile)?;
-        match resolve_id_prefix(&self.connection, "files_v2", "id", &normalised)? {
+        let normalized = normalize_id_prefix(prefix).ok_or(DatabaseError::MissingFile)?;
+        match resolve_id_prefix(&self.connection, "files_v2", "id", &normalized)? {
             PrefixResolution::Unique(id) => {
                 FileId::from_string(&id).ok_or(DatabaseError::MissingFile)
             }
             PrefixResolution::NotFound => Err(DatabaseError::MissingFile),
-            PrefixResolution::Ambiguous => Err(DatabaseError::AmbiguousIdPrefix(normalised)),
+            PrefixResolution::Ambiguous => Err(DatabaseError::AmbiguousIdPrefix(normalized)),
         }
     }
 
@@ -1337,13 +1337,13 @@ impl FileDatabase {
     /// - [`DatabaseError::MissingTag`] if no tag matches the prefix.
     /// - [`DatabaseError::AmbiguousIdPrefix`] if more than one tag matches.
     pub fn resolve_tag_id_prefix(&self, prefix: &str) -> Result<TagId, DatabaseError> {
-        let normalised = normalise_id_prefix(prefix).ok_or(DatabaseError::MissingTag)?;
-        match resolve_id_prefix(&self.connection, "tags_v1", "id", &normalised)? {
+        let normalized = normalize_id_prefix(prefix).ok_or(DatabaseError::MissingTag)?;
+        match resolve_id_prefix(&self.connection, "tags_v1", "id", &normalized)? {
             PrefixResolution::Unique(id) => {
                 TagId::from_string(&id).ok_or(DatabaseError::MissingTag)
             }
             PrefixResolution::NotFound => Err(DatabaseError::MissingTag),
-            PrefixResolution::Ambiguous => Err(DatabaseError::AmbiguousIdPrefix(normalised)),
+            PrefixResolution::Ambiguous => Err(DatabaseError::AmbiguousIdPrefix(normalized)),
         }
     }
 
@@ -2451,7 +2451,7 @@ impl FileDatabase {
         }
 
         // Id prefix (only when the token is a valid hex id prefix at all).
-        if let Some(prefix) = normalise_id_prefix(token) {
+        if let Some(prefix) = normalize_id_prefix(token) {
             let id_pattern = format!("{prefix}%");
             let id_sql = format!(
                 "SELECT id FROM tags_v1 WHERE id LIKE ?1{}",
@@ -3125,7 +3125,7 @@ mod tests {
     #[test]
     fn resolve_file_id_prefix_rejects_non_hex() {
         let database = memory_db();
-        // `zzzz` is not hex; normalisation fails and it resolves to nothing.
+        // `zzzz` is not hex; normalization fails and it resolves to nothing.
         assert!(matches!(
             database.resolve_file_id_prefix("zzzz"),
             Err(DatabaseError::MissingFile)

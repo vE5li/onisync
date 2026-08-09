@@ -829,12 +829,12 @@ async fn read_handshake(
 /// Drive a fully-handshaken WebSocket connection until it closes.
 ///
 /// Shared between inbound (`handle_connection`) and outbound
-/// (`connect_to_peer`) paths because the post-handshake behaviour is identical:
+/// (`connect_to_peer`) paths because the post-handshake behavior is identical:
 /// build and send our manifest, register an outbound channel, then loop over
 /// outbound `Frame`s and inbound WebSocket frames.
 ///
 /// Opens its own read-only handle on the main DB. The DB is shared with
-/// `handle_changes` and with other connection tasks; SQLite serialises these
+/// `handle_changes` and with other connection tasks; SQLite serializes these
 /// accesses at the file level. Writes still only happen from `handle_changes`.
 #[allow(clippy::too_many_arguments)]
 async fn run_peer_session<S>(
@@ -2735,7 +2735,7 @@ fn build_local_tag_manifest(
 ///   translate it into the matching relationship `Change` (tag/untag) stamped
 ///   with the peer's `modified_at` and hand it to the single DB-writer, which
 ///   enforces last-writer-wins. This routes through the same code path as a
-///   live relationship change, keeping behaviour uniform.
+///   live relationship change, keeping behavior uniform.
 ///
 /// Pure of `.await` and holds no lock: takes `&FileDatabase` synchronously so
 /// the caller's future stays `Send`.

@@ -94,7 +94,7 @@ class EditorChannel(private val activity: Activity) {
         }
 
         // MIME sniff from the file's *logical* extension (the on-disk name
-        // matches, since the daemon materialises fetches as
+        // matches, since the daemon materializes fetches as
         // <uuid>/<logical_basename>). Falls back to */*  so at least
         // something gets offered even for extensionless files.
         val ext = logicalName.substringAfterLast('.', missingDelimiterValue = "")

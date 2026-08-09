@@ -306,7 +306,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
   /// the bytes we share that path directly; otherwise we fetch the content to a
   /// daemon-owned temp file first (from a peer if needed) and share that.
   ///
-  /// Both branches share the fetched path directly. The daemon materialises
+  /// Both branches share the fetched path directly. The daemon materializes
   /// fetches as `<fetch_temp_dir>/<uuid>/<logical_basename>` so the on-disk
   /// name already carries the file's real extension — receiving apps
   /// dispatch by MIME correctly without any client-side renaming. Move
@@ -325,7 +325,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
       var path = _localPath;
       if (path == null) {
         // Not present locally: fetch the bytes to a daemon-owned temp file.
-        // The daemon materialises it with the correct basename, so we can
+        // The daemon materializes it with the correct basename, so we can
         // share the fetched path in place — no renaming, no extra staging.
         path = await _app.fetchFileByString(
           fileId: widget.fileId,

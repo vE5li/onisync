@@ -150,7 +150,7 @@ WaiterEntry {
 }
 ```
 
-Behaviour:
+Behavior:
 
 - **On `ChunkRequest` from a downstream link:**
   - If we hold and verify the content, answer `ChunkData` directly.
@@ -317,7 +317,7 @@ This keeps one protocol for both "is it there?" and "give it to me".
   gate for every future protocol change.
   - Adding the field itself changes the handshake wire shape, so an old peer and
     a new peer fail to exchange handshakes at all (deserialize error) — which is
-    the desired fail-closed behaviour for the very first version gate.
+    the desired fail-closed behavior for the very first version gate.
   - The signature still covers only the peer's public key (unchanged); the
     version field is advisory metadata checked *after* signature verification, so
     it does not weaken the auth proof. (If desired later, fold the version into

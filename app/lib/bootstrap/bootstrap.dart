@@ -54,7 +54,7 @@ class OniSyncSession {
 /// `--dart-define=ONISYNC_BACKEND=...`; the shared UI never imports them
 /// directly.
 abstract class OniSyncBootstrap {
-  /// Initialise the generated Rust bindings and connect to the backend
+  /// Initialize the generated Rust bindings and connect to the backend
   /// (in-process engine on Android, daemon IPC on Linux). Throws on failure;
   /// the caller renders the error.
   Future<OniSyncSession> connect();

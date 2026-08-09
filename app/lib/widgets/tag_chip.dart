@@ -57,7 +57,7 @@ class TagColorSwatch extends StatelessWidget {
 /// [onPressed] fires when the pill body is tapped (e.g. to open the tag
 /// detail); [onDeleted] fires when the trailing X is tapped (untag). Either
 /// or both can be null; when both are non-null the pill body and the X are
-/// independent hit targets thanks to [InputChip]'s built-in split behaviour.
+/// independent hit targets thanks to [InputChip]'s built-in split behavior.
 class TagChip extends StatelessWidget {
   const TagChip({
     super.key,

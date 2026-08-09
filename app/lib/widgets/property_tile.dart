@@ -2,7 +2,7 @@
 // above the value, an optional trailing widget, and single-tap / long-press
 // handlers so the whole row is one hit target for both edit (tap) and copy
 // (long-press). Used by the tag detail and file detail screens to keep those
-// two surfaces visually and behaviourally consistent.
+// two surfaces visually and behaviorally consistent.
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';

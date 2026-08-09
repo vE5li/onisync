@@ -778,7 +778,7 @@ mod tests {
 
     /// An invalid pattern disables only itself: compilation still succeeds, the
     /// surviving rules still match, and the failure is retained for reporting.
-    /// This is the behaviour that lets the daemon start with a broken rule.
+    /// This is the behavior that lets the daemon start with a broken rule.
     #[test]
     fn invalid_pattern_disables_only_its_own_rule() {
         let good = TagId::new();

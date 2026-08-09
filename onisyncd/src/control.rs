@@ -37,7 +37,7 @@
 //!   [`ControlRequest`]s, dispatches them to the in-process [`Api`], and
 //!   streams [`ApiEvent`]s back as [`ControlFrame::Event`].
 //! - [`IpcClientBackend`] is the **client side** IPC-client backend: it
-//!   connects to the socket, serialises API calls, and returns results/events.
+//!   connects to the socket, serializes API calls, and returns results/events.
 //!   It implements [`TransportBackend`], so the Dart UI (via
 //!   `flutter_rust_bridge`) and the `onisync` CLI talk to it exactly as they
 //!   would the in-process backend.
@@ -253,7 +253,7 @@ pub enum ControlRequest {
 /// The result of a [`ControlRequest`], returned as [`ControlFrame::Response`].
 ///
 /// Every variant is either the success payload of the matching request or the
-/// single serialisable [`ApiError`]. The client maps these back onto
+/// single serializable [`ApiError`]. The client maps these back onto
 /// the [`TransportBackend`] return types.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlResponse {
@@ -857,7 +857,7 @@ async fn send_control(
 /// The IPC-client transport backend.
 ///
 /// A thin embedded Rust client that connects to the daemon's control socket,
-/// serialises [`TransportBackend`] calls into [`ControlRequest`]s, and awaits
+/// serializes [`TransportBackend`] calls into [`ControlRequest`]s, and awaits
 /// the matching [`ControlResponse`]. It is the Linux-daemon counterpart to
 /// `InProcessBackend`; the Dart UI (and the `onisync` CLI) never learn which
 /// they hold.
@@ -908,7 +908,7 @@ async fn read_provider_chunk(path: &Path, offset: u64) -> (Vec<u8>, bool) {
 
 struct IpcClientInner {
     /// Write half of the control socket, behind a mutex so concurrent API
-    /// calls serialise their frames without interleaving bytes.
+    /// calls serialize their frames without interleaving bytes.
     writer: Mutex<SplitSink<WebSocketStream<UnixStream>, Message>>,
     /// Correlation-id -> oneshot for the response of an in-flight request.
     pending: Mutex<HashMap<u64, oneshot::Sender<ControlResponse>>>,

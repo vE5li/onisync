@@ -619,7 +619,7 @@ impl SyncDirectoryManager {
         // `std::path` do the parsing: `file_stem`/`extension` peel just the last
         // extension (`bar.tar.gz` -> `bar.tar` + `gz`) and treat a dotfile as a
         // stem with no extension (`.env` -> `.env` + none), which is exactly the
-        // behaviour we want. The parent directory is preserved verbatim.
+        // behavior we want. The parent directory is preserved verbatim.
         let base_path = Path::new(base.as_str());
         let parent = base_path.parent();
         let stem = base_path.file_stem().unwrap_or_default().to_string_lossy();

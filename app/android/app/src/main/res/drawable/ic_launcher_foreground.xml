@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   Adaptive-icon foreground for onisync: the Material "tag/label" glyph, white,
-  centred on the 108x108dp canvas. The glyph is scaled/translated to sit inside
+  centered on the 108x108dp canvas. The glyph is scaled/translated to sit inside
   the launcher safe zone (the outer edges of an adaptive icon may be masked).
 
   The base Material `local_offer` path is authored on a 24x24 viewport; the
-  group scales it ~2.6x and centres it so it fills roughly the middle 62dp.
+  group scales it ~2.6x and centers it so it fills roughly the middle 62dp.
 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"

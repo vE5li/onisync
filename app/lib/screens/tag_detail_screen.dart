@@ -619,10 +619,10 @@ class _RecolorTagDialogState extends State<_RecolorTagDialog> {
     super.dispose();
   }
 
-  /// Returns the normalised `#RRGGBB[AA]` form of the current input, or `null`
+  /// Returns the normalized `#RRGGBB[AA]` form of the current input, or `null`
   /// if it doesn't parse. Accepts input with or without a leading `#` and
   /// treats it case-insensitively.
-  String? get _normalised {
+  String? get _normalized {
     var text = _controller.text.trim();
     if (text.startsWith('#')) text = text.substring(1);
     if (text.length != 6 && text.length != 8) return null;
@@ -632,7 +632,7 @@ class _RecolorTagDialogState extends State<_RecolorTagDialog> {
 
   @override
   Widget build(BuildContext context) {
-    final normalised = _normalised;
+    final normalized = _normalized;
     return AlertDialog(
       title: const Text('Tag color'),
       content: Column(
@@ -648,19 +648,19 @@ class _RecolorTagDialogState extends State<_RecolorTagDialog> {
                   decoration: InputDecoration(
                     labelText: 'Hex color',
                     hintText: '#RRGGBB',
-                    errorText: normalised == null && _controller.text.isNotEmpty
+                    errorText: normalized == null && _controller.text.isNotEmpty
                         ? 'Expected #RRGGBB or #RRGGBBAA'
                         : null,
                   ),
                   onSubmitted: (_) {
-                    if (normalised != null) Navigator.pop(context, normalised);
+                    if (normalized != null) Navigator.pop(context, normalized);
                   },
                 ),
               ),
               const SizedBox(width: 12),
               // Live preview of whatever is currently typed. Falls back to grey
               // via [parseTagColor] when the input is invalid.
-              TagColorSwatch(color: normalised ?? _controller.text),
+              TagColorSwatch(color: normalized ?? _controller.text),
             ],
           ),
           const SizedBox(height: 16),
@@ -680,8 +680,8 @@ class _RecolorTagDialogState extends State<_RecolorTagDialog> {
                   },
                   child: TagColorSwatch(
                     color: color,
-                    selected: normalised != null &&
-                        color.toUpperCase() == normalised,
+                    selected: normalized != null &&
+                        color.toUpperCase() == normalized,
                   ),
                 ),
             ],
@@ -694,9 +694,9 @@ class _RecolorTagDialogState extends State<_RecolorTagDialog> {
           child: const Text('Cancel'),
         ),
         TextButton(
-          onPressed: normalised == null
+          onPressed: normalized == null
               ? null
-              : () => Navigator.pop(context, normalised),
+              : () => Navigator.pop(context, normalized),
           child: const Text('Save'),
         ),
       ],

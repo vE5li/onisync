@@ -26,7 +26,7 @@ enum OutputMode {
 }
 
 /// A serializable tag row, shared by every command that prints tags. Mirrors
-/// the human [`tag_table`] columns: the tag's id, name, colour, and the names
+/// the human [`tag_table`] columns: the tag's id, name, color, and the names
 /// of the tags applied to it.
 ///
 /// `deleted` mirrors the daemon's tombstone flag and is always `false` for

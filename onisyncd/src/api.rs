@@ -246,7 +246,7 @@ impl Api {
     /// Build an API handle from the runtime's shared pieces.
     ///
     /// - `main_db_path`: the main DB path; each read opens its own read-only
-    ///   handle on it (SQLite serialises file-level access).
+    ///   handle on it (SQLite serializes file-level access).
     /// - `change_sender`: the ingest bus every mutation is pushed onto.
     /// - `command_sender`: the sync-directory manager command channel, used for
     ///   read-only path lookups.
@@ -741,7 +741,7 @@ impl Api {
             return Ok(path);
         }
 
-        // Otherwise materialise into a caller-visible temp. `fetch_file`
+        // Otherwise materialize into a caller-visible temp. `fetch_file`
         // handles the extension-preserving naming and the on-demand peer
         // pull. Getting the expected hash costs one by-id read; the file
         // must exist for us to fetch it.
@@ -825,7 +825,7 @@ impl Api {
         if !path.starts_with(&self.fetch_temp_dir) {
             return;
         }
-        // `fetch_file` materialises as `<fetch_temp_dir>/<uuid>/<basename>`,
+        // `fetch_file` materializes as `<fetch_temp_dir>/<uuid>/<basename>`,
         // so removing the parent (`<uuid>`) drops both the file and the
         // now-empty subdir.
         if let Some(parent) = path.parent()
@@ -907,11 +907,11 @@ impl Api {
     /// on disk, and a locally-held copy is streamed into the fetch temp
     /// dir.
     ///
-    /// The materialised path has the shape
+    /// The materialized path has the shape
     /// `<fetch_temp_dir>/<uuid>/<logical_basename>` (an isolated
     /// per-request subdirectory whose leaf carries the file's logical name,
     /// including extension). The extension is load-bearing: editors, share
-    /// sheets, and downloads all key their behaviour off it. Callers should
+    /// sheets, and downloads all key their behavior off it. Callers should
     /// clean up the *parent* directory (`<fetch_temp_dir>/<uuid>`) rather
     /// than just the file, so an unmoved temp leaves nothing behind. Any
     /// leftover subdirectories are also wiped in bulk on the next daemon
@@ -1575,7 +1575,7 @@ pub(crate) mod chunk {
 
         #[test]
         fn unknown_backslash_escape_is_kept_literally() {
-            // `\n` is not a recognised escape; we keep it verbatim rather than
+            // `\n` is not a recognized escape; we keep it verbatim rather than
             // silently interpreting it, to match the "quotes are only for
             // whitespace capture" contract.
             assert_eq!(lex_query(r#""a\nb""#), vec![any(r"a\nb")]);

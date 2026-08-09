@@ -6,7 +6,7 @@
 //! so a host-side harness can still link the bridge without a second logger
 //! fighting `env_logger`.
 
-/// Initialise log routing appropriately for the current platform.
+/// Initialize log routing appropriately for the current platform.
 ///
 /// Safe to call more than once; only the first call installs a logger. The
 /// frontend should call this once at startup (before

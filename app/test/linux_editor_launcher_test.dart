@@ -1,7 +1,7 @@
 // Tests for the Linux editor launcher's rule resolution.
 //
 // These cover the resolution/guard logic only, not the actual spawn: the
-// interesting behaviour is *which* argv gets chosen and which rules are
+// interesting behavior is *which* argv gets chosen and which rules are
 // refused, and that is what the security properties described in
 // `linux_editor_launcher.dart` rest on. Spawning a real process would test
 // `Process.run` rather than anything of ours.

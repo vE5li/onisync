@@ -793,7 +793,7 @@ pub fn validate_relative_path(path: &str) -> Result<(), RelativePathError> {
     }
 
     // Tolerate exactly one trailing slash (`foo/bar/`) so the documented
-    // `basename` behaviour keeps working, then split the rest strictly.
+    // `basename` behavior keeps working, then split the rest strictly.
     let trimmed = path.strip_suffix('/').unwrap_or(path);
     if trimmed.is_empty() {
         return Err(RelativePathError::Empty);
@@ -895,7 +895,7 @@ impl LogicalPath {
     ///
     /// This is the "file name" as far as OS-level tools (editors, share
     /// sheets) are concerned: the extension it carries determines MIME/type
-    /// dispatch on both Linux and Android. Used when materialising a file
+    /// dispatch on both Linux and Android. Used when materializing a file
     /// into a caller-visible temp path so the on-disk name matches the user's
     /// mental model rather than an opaque UUID.
     pub fn basename(&self) -> &str {

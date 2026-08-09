@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// [`HandshakeError::IncompatibleProtocol`]. Adding this field also changes the
 /// handshake wire shape, so an old peer (which never sent it) fails to
 /// deserialize a new peer's handshake at all — the desired fail-closed
-/// behaviour for the very first version gate.
+/// behavior for the very first version gate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeMessage {
     pub public_key: String,

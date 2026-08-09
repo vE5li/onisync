@@ -6,7 +6,7 @@
 //! - **In-process** (Android, and optional single-process desktop): calls
 //!   straight into [`Api`](crate::api::Api) / the change pipeline.
 //! - **IPC-client** (Linux daemon mode): a thin embedded Rust client that
-//!   connects to the daemon's control socket, serialises API calls, and returns
+//!   connects to the daemon's control socket, serializes API calls, and returns
 //!   results/events.
 //!
 //! This module defines the transport-agnostic surface as the
@@ -339,7 +339,7 @@ pub trait TransportBackend {
 /// The transport-agnostic event stream returned by
 /// [`TransportBackend::subscribe`].
 ///
-/// It normalises the two delivery mechanisms behind one type so the UI (and
+/// It normalizes the two delivery mechanisms behind one type so the UI (and
 /// `flutter_rust_bridge`) sees a single stream shape regardless of transport.
 /// Poll it with [`EventStream::recv`].
 pub enum EventStream {
@@ -387,7 +387,7 @@ impl EventStream {
     }
 }
 
-/// A live update on the operation stream, normalised across transports.
+/// A live update on the operation stream, normalized across transports.
 ///
 /// Mirrors the [`ApiEvent`] shape for the change stream: an in-process or IPC
 /// subscriber that lags past the channel capacity gets a

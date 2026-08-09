@@ -56,7 +56,7 @@
 // editor: we always pass it through `.absolute`, so it begins with `/` even if
 // the peer-chosen filename begins with `-`. (onisync-core deliberately permits
 // leading-dash filenames, since they are legal on Linux — see
-// `validate_relative_path` — so this normalisation is what actually closes the
+// `validate_relative_path` — so this normalization is what actually closes the
 // argument-injection case, not a restriction upstream.)
 
 import 'dart:io';

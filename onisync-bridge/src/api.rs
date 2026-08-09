@@ -382,7 +382,7 @@ impl OniSyncApp {
     ///
     /// Parses `configuration_json` with
     /// [`Configuration::from_str`](onisyncd::configuration::Configuration::from_str)
-    /// and initialises log routing (logcat on Android). Blocks only until the
+    /// and initializes log routing (logcat on Android). Blocks only until the
     /// engine is ready or startup fails.
     #[cfg_attr(feature = "flutter_rust_bridge", flutter_rust_bridge::frb(sync))]
     pub fn start(
