@@ -84,6 +84,8 @@ pub mod tag {
 pub mod state {
     use std::path::PathBuf;
 
+    use rusqlite::ToSql;
+    use rusqlite::types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef};
     use serde::{Deserialize, Serialize};
 
     use crate::tag::{MetadataFormat, MetadataValues};
@@ -347,14 +349,36 @@ pub mod state {
         pub restored_at: i64,
     }
 
-    /// What a tag relationship attaches a tag to. Mirrors the daemon's
-    /// `EntryType` (`File = 0`, `Tag = 1`) but lives in the wire crate so the
-    /// protocol does not depend on the daemon's database types. The `target_id`
-    /// it accompanies is a stringified `FileId` or `TagId` accordingly.
+    /// What a tag relationship attaches a tag to. The `target_id` it
+    /// accompanies is a stringified [`FileId`] or [`TagId`] accordingly.
+    ///
+    /// This is both the wire representation and the storage representation:
+    /// the daemon persists it as the `type` column of `entries_v1`, encoded as
+    /// `File = 0` / `Tag = 1` by the [`ToSql`]/[`FromSql`] impls below. Those
+    /// two integers are an on-disk format and must not be reassigned.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub enum RelationshipKind {
         File,
         Tag,
+    }
+
+    impl ToSql for RelationshipKind {
+        fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+            match self {
+                RelationshipKind::File => Ok(0.into()),
+                RelationshipKind::Tag => Ok(1.into()),
+            }
+        }
+    }
+
+    impl FromSql for RelationshipKind {
+        fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+            match value.as_i64()? {
+                0 => Ok(Self::File),
+                1 => Ok(Self::Tag),
+                invalid => panic!("invalid relationship kind {}", invalid),
+            }
+        }
     }
 
     /// A tag *definition* as advertised in a tag manifest: just its id and the

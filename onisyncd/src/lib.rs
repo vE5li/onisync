@@ -2809,7 +2809,7 @@ fn reconcile_peer_tag_manifest(
         let ours = match database.relationship_modified_at(
             relationship.tag_id,
             &relationship.target_id,
-            relationship.kind.into(),
+            relationship.kind,
         ) {
             Ok(value) => value,
             Err(error) => {

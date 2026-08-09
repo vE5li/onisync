@@ -6,8 +6,7 @@ use onisync_core::state::{RelationshipKind, RelationshipManifestEntry, TagManife
 use onisync_core::tag::MetadataFormat;
 use onisync_core::{FileId, FileInfo, LogicalPath, PhysicalPath, Preview, TagId};
 use regex::{Regex, RegexBuilder};
-use rusqlite::types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef};
-use rusqlite::{Connection, OptionalExtension, ToSql};
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 /// A file's version history as `(version_number, content_hash, size)` triples
@@ -241,49 +240,6 @@ impl CompiledPattern {
             CompiledPattern::Substring(needle) => lowercased.contains(needle.as_str()),
             CompiledPattern::Regex(regex) => regex.is_match(original),
             CompiledPattern::Never => false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EntryType {
-    File,
-    Tag,
-}
-
-impl ToSql for EntryType {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        match self {
-            EntryType::File => Ok(0.into()),
-            EntryType::Tag => Ok(1.into()),
-        }
-    }
-}
-
-impl FromSql for EntryType {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        match value.as_i64()? {
-            0 => Ok(Self::File),
-            1 => Ok(Self::Tag),
-            invalid => panic!("invalid entry type {}", invalid),
-        }
-    }
-}
-
-impl From<EntryType> for RelationshipKind {
-    fn from(value: EntryType) -> Self {
-        match value {
-            EntryType::File => RelationshipKind::File,
-            EntryType::Tag => RelationshipKind::Tag,
-        }
-    }
-}
-
-impl From<RelationshipKind> for EntryType {
-    fn from(value: RelationshipKind) -> Self {
-        match value {
-            RelationshipKind::File => EntryType::File,
-            RelationshipKind::Tag => EntryType::Tag,
         }
     }
 }
@@ -1091,12 +1047,11 @@ impl FileDatabase {
             .prepare("SELECT tag_id, target_id, type, modified_at, deleted FROM entries_v1")?;
         let entries = statement
             .query_map([], |row| {
-                let kind: EntryType = row.get(2)?;
                 let deleted: i64 = row.get(4)?;
                 Ok(RelationshipManifestEntry {
                     tag_id: row.get(0)?,
                     target_id: row.get(1)?,
-                    kind: kind.into(),
+                    kind: row.get(2)?,
                     modified_at: row.get(3)?,
                     deleted: deleted != 0,
                 })
@@ -1112,7 +1067,7 @@ impl FileDatabase {
         &self,
         tag_id: TagId,
         target_id: &str,
-        kind: EntryType,
+        kind: RelationshipKind,
     ) -> Result<Option<i64>, DatabaseError> {
         self.connection
             .query_row(
@@ -1164,7 +1119,7 @@ impl FileDatabase {
         &self,
         entry: &RelationshipManifestEntry,
     ) -> Result<(), DatabaseError> {
-        let kind: EntryType = entry.kind.into();
+        let kind = entry.kind;
         self.connection.execute(
             "INSERT INTO entries_v1 (id, tag_id, target_id, type, modified_at, deleted)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -1690,7 +1645,12 @@ impl FileDatabase {
         file_id: FileId,
         modified_at: i64,
     ) -> Result<(), DatabaseError> {
-        self.upsert_entry(tag_id, file_id.to_string(), EntryType::File, modified_at)
+        self.upsert_entry(
+            tag_id,
+            file_id.to_string(),
+            RelationshipKind::File,
+            modified_at,
+        )
     }
 
     /// Tag a tag with the provided tag. See [`tag_file`] for the LWW/upsert
@@ -1705,7 +1665,12 @@ impl FileDatabase {
             return Err(DatabaseError::CantTagItself);
         }
 
-        self.upsert_entry(tag_id, subtag_id.to_string(), EntryType::Tag, modified_at)
+        self.upsert_entry(
+            tag_id,
+            subtag_id.to_string(),
+            RelationshipKind::Tag,
+            modified_at,
+        )
     }
 
     /// Remove a tag from a file (soft delete). See [`untag_entry`].
@@ -1715,7 +1680,12 @@ impl FileDatabase {
         file_id: FileId,
         modified_at: i64,
     ) -> Result<(), DatabaseError> {
-        self.untag_entry(tag_id, file_id.to_string(), EntryType::File, modified_at)
+        self.untag_entry(
+            tag_id,
+            file_id.to_string(),
+            RelationshipKind::File,
+            modified_at,
+        )
     }
 
     /// Remove a tag from a tag (soft delete). See [`untag_entry`].
@@ -1725,7 +1695,12 @@ impl FileDatabase {
         subtag_id: TagId,
         modified_at: i64,
     ) -> Result<(), DatabaseError> {
-        self.untag_entry(tag_id, subtag_id.to_string(), EntryType::Tag, modified_at)
+        self.untag_entry(
+            tag_id,
+            subtag_id.to_string(),
+            RelationshipKind::Tag,
+            modified_at,
+        )
     }
 
     /// Shared upsert for the two "add relationship" paths. Inserts a live
@@ -1737,7 +1712,7 @@ impl FileDatabase {
         &self,
         tag_id: TagId,
         target_id: String,
-        entry_type: EntryType,
+        entry_type: RelationshipKind,
         modified_at: i64,
     ) -> Result<(), DatabaseError> {
         self.connection.execute(
@@ -1767,7 +1742,7 @@ impl FileDatabase {
         &self,
         tag_id: TagId,
         target_id: String,
-        entry_type: EntryType,
+        entry_type: RelationshipKind,
         modified_at: i64,
     ) -> Result<(), DatabaseError> {
         self.connection.execute(
@@ -1798,13 +1773,13 @@ impl FileDatabase {
 
         let iterator = statement
             .query_map([tag_id], |row| {
-                let r#type: EntryType = row.get(1)?;
+                let r#type: RelationshipKind = row.get(1)?;
 
                 let entry = match r#type {
-                    EntryType::File => Entry::File {
+                    RelationshipKind::File => Entry::File {
                         file_id: row.get(0)?,
                     },
-                    EntryType::Tag => Entry::Tag {
+                    RelationshipKind::Tag => Entry::Tag {
                         tag_id: row.get(0)?,
                     },
                 };
