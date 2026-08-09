@@ -250,8 +250,8 @@ pub struct Api {
 
 impl Api {
     /// The overall deadline a caller waits for an on-demand fetch to complete.
-    /// Must exceed [`crate::fetch::HOP_TIMEOUT`] so intermediate hops can time
-    /// out and report before this outer deadline fires.
+    /// Must exceed [`crate::transfer::HOP_TIMEOUT`] so intermediate hops can
+    /// time out and report before this outer deadline fires.
     const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// Build an API handle from the runtime's shared pieces.

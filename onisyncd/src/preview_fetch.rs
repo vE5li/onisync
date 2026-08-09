@@ -31,7 +31,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
 
 use crate::configuration::RuntimeConfiguration;
-use crate::fetch::HOP_TIMEOUT;
+use crate::transfer::HOP_TIMEOUT;
 
 /// The content key identifying one canonical preview across all peers.
 type PreviewKey = (FileId, String);

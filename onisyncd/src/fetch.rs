@@ -32,7 +32,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 
 use onisync_core::FileId;
 use onisync_core::state::{Frame, Sync as SyncMessage};
@@ -40,12 +39,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
 
 use crate::configuration::RuntimeConfiguration;
-use crate::transfer::{ChunkReply, ChunkSource};
-
-/// How long a relay waiter entry lives before it is presumed dead, and how long
-/// the receiver's per-chunk liveness guard waits with no progress. One tunable
-/// across the relay layer and the receiver.
-pub const HOP_TIMEOUT: Duration = Duration::from_secs(8);
+use crate::transfer::{ChunkReply, ChunkSource, HOP_TIMEOUT};
 
 /// The content key identifying one canonical chunk across all peers.
 type ChunkKey = (FileId, String, u64);
@@ -540,6 +534,8 @@ fn short_hash(hash: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::configuration::{Configuration, RuntimeConfiguration, RuntimePeer};
 

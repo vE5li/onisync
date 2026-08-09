@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -59,6 +59,15 @@ pub const CHUNK_SIZE: usize = 64 * 1024;
 /// window hides per-chunk round-trip latency. Kept small so a relayed transfer
 /// bounds in-flight bytes per hop to `WINDOW * CHUNK_SIZE`.
 pub const WINDOW: u64 = 8;
+
+/// How long a relay waiter entry lives before it is presumed dead, and how long
+/// the receiver's per-chunk liveness guard waits with no progress. One tunable
+/// across the relay layer and the receiver.
+///
+/// Lives here, at the bottom of the byte-movement stack, so that both halves
+/// can see it: [`crate::fetch`] and [`crate::preview_fetch`] already depend on
+/// this module, and the receiver below uses it directly.
+pub const HOP_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// A reply to one of the receiver's outstanding `ChunkRequest`s, demuxed by the
 /// peer session for a specific in-flight receive. The `file_id` /
@@ -90,7 +99,7 @@ pub enum TransferError {
     #[error("chunk at offset {offset} unavailable from any peer")]
     ChunkUnavailable { offset: u64 },
     /// A *connected* peer accepted the request but went silent for
-    /// [`HOP_TIMEOUT`](crate::fetch::HOP_TIMEOUT): no chunk was written within
+    /// [`HOP_TIMEOUT`]: no chunk was written within
     /// the per-chunk liveness window. The one guard against hanging forever.
     #[error("transfer stalled (liveness timeout)")]
     LivenessTimeout,
@@ -206,7 +215,7 @@ async fn receive_inner(
     loop {
         // Per-chunk liveness timeout: reset on each successful write (below).
         // A connected-but-silent peer trips this rather than hanging forever.
-        let message = match tokio::time::timeout(crate::fetch::HOP_TIMEOUT, replies.recv()).await {
+        let message = match tokio::time::timeout(HOP_TIMEOUT, replies.recv()).await {
             Ok(Some(message)) => message,
             Ok(None) => {
                 log::warn!(
@@ -219,7 +228,7 @@ async fn receive_inner(
                 log::warn!(
                     "receive[{short}]: liveness timeout ({:?}) at \
                      write_offset={write_offset}/{expected_size}, in_flight={in_flight}",
-                    crate::fetch::HOP_TIMEOUT
+                    HOP_TIMEOUT
                 );
                 return Err(TransferError::LivenessTimeout);
             }
