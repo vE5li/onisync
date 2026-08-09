@@ -2363,13 +2363,13 @@ impl FileDatabase {
         Ok(file_id)
     }
 
-    /// Find every tag id a query token `$foo`/`!foo` should match.
+    /// Find every tag id a query token's payload should match.
     ///
     /// A tag matches if **either**:
-    /// - its name contains `token` as a case-insensitive substring (so `foo`
-    ///   matches `foo`, `foobar`, and `barfoo`), **or**
-    /// - its id starts with `token` interpreted as a hex id prefix (so a pasted
-    ///   partial id still works).
+    /// - its name contains the pattern as a case-insensitive substring (so
+    ///   `foo` matches `foo`, `foobar`, and `barfoo`), **or**
+    /// - its id starts with the pattern interpreted as a hex id prefix (so a
+    ///   pasted partial id still works).
     ///
     /// Returns all matches (deduplicated); an empty result means nothing
     /// matched, which callers treat as "matches no tag" rather than an
@@ -2377,10 +2377,10 @@ impl FileDatabase {
     ///
     /// `deleted_rule` controls whether tombstoned tags participate in the
     /// resolution: search callers that want to find deleted tags pass
-    /// [`DeletedRule::Include`] so a token whose only matches are tombstoned
+    /// [`DeletedRule::Include`] so a pattern whose only matches are tombstoned
     /// tags still resolves; every other caller passes
     /// [`DeletedRule::Exclude`].
-    pub fn tag_ids_matching_token(
+    pub fn tag_ids_matching_pattern(
         &self,
         pattern: &TextPattern,
         deleted_rule: DeletedRule,
@@ -2392,8 +2392,8 @@ impl FileDatabase {
         // opaque hex, so a pattern over them answers no question anyone asks,
         // and supporting it would make `%a%` resolve to a near-arbitrary set
         // of tags on top of its name matches.
-        let token = match pattern {
-            TextPattern::Substring(token) => token,
+        let text = match pattern {
+            TextPattern::Substring(text) => text,
             TextPattern::Regex(_) => {
                 let compiled = pattern.compile();
                 return Ok(self
@@ -2408,9 +2408,9 @@ impl FileDatabase {
         let mut ids: BTreeSet<TagId> = BTreeSet::new();
 
         // Name substring, case-insensitive. Escape LIKE metacharacters in the
-        // user token so `%`/`_` are matched literally; `LIKE` is case-insensitive
+        // user text so `%`/`_` are matched literally; `LIKE` is case-insensitive
         // for ASCII in SQLite by default.
-        let escaped = token
+        let escaped = text
             .replace('\\', "\\\\")
             .replace('%', "\\%")
             .replace('_', "\\_");
@@ -2425,8 +2425,8 @@ impl FileDatabase {
             ids.insert(id?);
         }
 
-        // Id prefix (only when the token is a valid hex id prefix at all).
-        if let Some(prefix) = normalize_id_prefix(token) {
+        // Id prefix (only when the text is a valid hex id prefix at all).
+        if let Some(prefix) = normalize_id_prefix(text) {
             let id_pattern = format!("{prefix}%");
             let id_sql = format!(
                 "SELECT id FROM tags_v1 WHERE id LIKE ?1{}",
@@ -3556,7 +3556,7 @@ mod tests {
 
         // A different case still matches (case-insensitive substring).
         let matched: BTreeSet<TagId> = database
-            .tag_ids_matching_token(
+            .tag_ids_matching_pattern(
                 &TextPattern::Substring("FOO".to_owned()),
                 DeletedRule::Exclude,
             )
@@ -3578,7 +3578,7 @@ mod tests {
 
         assert!(
             database
-                .tag_ids_matching_token(
+                .tag_ids_matching_pattern(
                     &TextPattern::Substring("nope".to_owned()),
                     DeletedRule::Exclude
                 )
@@ -3730,7 +3730,7 @@ mod tests {
         database.add_tag(done, "done", "red", 1).unwrap();
 
         let matched = database
-            .tag_ids_matching_token(&regex("^wip-"), DeletedRule::Exclude)
+            .tag_ids_matching_pattern(&regex("^wip-"), DeletedRule::Exclude)
             .unwrap();
         assert_eq!(matched, vec![wip]);
     }
@@ -3747,14 +3747,14 @@ mod tests {
         // *would* resolve.
         let id = tag_id.to_string();
         let matched = database
-            .tag_ids_matching_token(&regex(&format!("^{}", &id[..6])), DeletedRule::Exclude)
+            .tag_ids_matching_pattern(&regex(&format!("^{}", &id[..6])), DeletedRule::Exclude)
             .unwrap();
         assert!(matched.is_empty(), "ids are not a regex surface");
 
         // The substring path still resolves that same prefix, proving the test
         // is comparing the two paths rather than a typo.
         let matched = database
-            .tag_ids_matching_token(
+            .tag_ids_matching_pattern(
                 &TextPattern::Substring(id[..6].to_owned()),
                 DeletedRule::Exclude,
             )
@@ -4347,7 +4347,7 @@ mod tests {
         // Exclude hides the tombstoned tag.
         assert!(
             database
-                .tag_ids_matching_token(
+                .tag_ids_matching_pattern(
                     &TextPattern::Substring("receipt".to_owned()),
                     DeletedRule::Exclude
                 )
@@ -4356,7 +4356,7 @@ mod tests {
         );
         // Include finds it.
         let matched = database
-            .tag_ids_matching_token(
+            .tag_ids_matching_pattern(
                 &TextPattern::Substring("receipt".to_owned()),
                 DeletedRule::Include,
             )
