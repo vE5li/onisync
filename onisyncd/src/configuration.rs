@@ -64,12 +64,6 @@ impl SyncType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SpecialType {
-    Upload,
-    Copy,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncDirectory {
     pub path: PathBuf,
     pub sync_type: SyncType,
