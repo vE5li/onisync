@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use onisync_core::state::{RelationshipKind, RelationshipManifestEntry, TagManifestEntry};
 use onisync_core::tag::MetadataFormat;
 use onisync_core::{FileId, FileInfo, LogicalPath, PhysicalPath, Preview, TagId};
+use regex::{Regex, RegexBuilder};
 use rusqlite::types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, ToSql};
 use serde::{Deserialize, Serialize};
@@ -141,26 +142,107 @@ pub enum QueryTerm {
     HasTag(Vec<TagId>),
     /// Must carry *none* of the tags in this set.
     NotTag(Vec<TagId>),
-    /// The logical path of the file or name of the tag must contain the
-    /// substring (case-insensitive).
-    NameContains(String),
-    /// The logical path of the file or name of the tag must *not* contain the
-    /// substring (case-insensitive).
-    NotNameContains(String),
-    /// The logical path of the file must contain the substring
-    /// (case-insensitive).
-    LogicalContains(String),
-    /// The logical path of the file must *not* contain the substring
-    /// (case-insensitive).
-    NotLogicalContains(String),
-    /// Matches on *either* substring OR tag (union across
-    /// both axes). The [`String`] is the substring; the [`Vec<TagId>`] is the
-    /// resolved tag set for the same token. An empty tag set here does **not**
-    /// mean "matches nothing" — the substring side still stands.
-    AnyMatch(String, Vec<TagId>),
-    /// Negation of [`AnyMatch`]: must match *neither* the substring nor any
-    /// tag in the set.
-    NotAnyMatch(String, Vec<TagId>),
+    /// The logical path of the file or name of the tag must match the pattern.
+    NameMatches(TextPattern),
+    /// The logical path of the file or name of the tag must *not* match the
+    /// pattern.
+    NotNameMatches(TextPattern),
+    /// The logical path of the file must match the pattern.
+    LogicalMatches(TextPattern),
+    /// The logical path of the file must *not* match the pattern.
+    NotLogicalMatches(TextPattern),
+    /// Matches on *either* text OR tag (union across both axes). The
+    /// [`TextPattern`] is the text side; the [`Vec<TagId>`] is the resolved tag
+    /// set for the same token. An empty tag set here does **not** mean "matches
+    /// nothing" — the text side still stands.
+    AnyMatch(TextPattern, Vec<TagId>),
+    /// Negation of [`AnyMatch`]: must match *neither* the text nor any tag in
+    /// the set.
+    NotAnyMatch(TextPattern, Vec<TagId>),
+}
+
+/// How the text half of a [`QueryTerm`] should be interpreted.
+///
+/// Which one a chunk produces is decided purely by how the user delimited it
+/// (see the `chunk` module in `api.rs`): a bare or `"`-quoted payload is a
+/// [`Substring`](Self::Substring), a `%`-delimited one is a
+/// [`Regex`](Self::Regex).
+///
+/// The pattern is carried as a [`String`], not a compiled `Regex`, so that
+/// `QueryTerm` stays `Clone + PartialEq + Eq` (a compiled regex is none of
+/// those) and so the parsed query remains a plain value that is cheap to
+/// inspect and compare in tests. Compilation happens once per query inside
+/// [`FileDatabase::file_ids_for_query`] / [`FileDatabase::tag_ids_for_query`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextPattern {
+    /// A literal substring, matched case-insensitively.
+    Substring(String),
+    /// A regular expression, matched case-insensitively by default. The
+    /// default is inverted rather than fixed: an author who wants case to
+    /// matter writes `(?-i)` at the front of the pattern.
+    ///
+    /// Case-insensitive is the default because everything else in search is,
+    /// and a `%Cat%` that quietly behaved differently from `Cat` would be
+    /// impossible to predict.
+    Regex(String),
+}
+
+impl TextPattern {
+    /// Prepare this pattern for repeated matching.
+    ///
+    /// Done once per query rather than per candidate: compiling a regex costs
+    /// far more than running one, and search is re-issued on every keystroke
+    /// (the UI debounces at 200 ms).
+    fn compile(&self) -> CompiledPattern {
+        match self {
+            TextPattern::Substring(needle) => CompiledPattern::Substring(needle.to_lowercase()),
+            TextPattern::Regex(pattern) => {
+                match RegexBuilder::new(pattern).case_insensitive(true).build() {
+                    Ok(regex) => CompiledPattern::Regex(regex),
+                    // A pattern that does not compile matches nothing.
+                    //
+                    // Silently dropping the *term* instead would widen the
+                    // result set, so a half-typed `%foo(%` would flash the
+                    // user's entire library on screen. Matching nothing keeps
+                    // a broken term restrictive, which is both safer and what
+                    // an empty result set already communicates. Unlike the
+                    // lexer's other recoveries this is not invisible: the user
+                    // typed `%`, so they know they asked for a regex.
+                    Err(error) => {
+                        log::debug!("query regex {pattern:?} did not compile: {error}");
+                        CompiledPattern::Never
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A [`TextPattern`] prepared for matching. See [`TextPattern::compile`].
+enum CompiledPattern {
+    /// Pre-lowercased needle, tested against the pre-lowercased haystack.
+    Substring(String),
+    Regex(Regex),
+    /// A regex that failed to compile.
+    Never,
+}
+
+impl CompiledPattern {
+    /// Test both spellings of one haystack.
+    ///
+    /// Callers already hold a lowercased copy of every candidate's text (built
+    /// once per query), so substring matching can use it directly instead of
+    /// allocating per comparison. Regex matching deliberately uses the
+    /// *original* text: the case-insensitivity is baked into the compiled
+    /// regex, so feeding it a lowercased haystack would silently defeat a
+    /// `(?-i)` opt-out.
+    fn is_match(&self, original: &str, lowercased: &str) -> bool {
+        match self {
+            CompiledPattern::Substring(needle) => lowercased.contains(needle.as_str()),
+            CompiledPattern::Regex(regex) => regex.is_match(original),
+            CompiledPattern::Never => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1775,16 +1857,16 @@ impl FileDatabase {
     ///   (subtag traversal governed by `subtag_rule`).
     /// - [`QueryTerm::NotTag`]: it carries *none* of the tags in the set (same
     ///   traversal).
-    /// - [`QueryTerm::LogicalContains`] / [`QueryTerm::NotLogicalContains`]:
-    ///   its logical path contains / does not contain the substring, compared
-    ///   case-insensitively.
+    /// - [`QueryTerm::LogicalMatches`] / [`QueryTerm::NotLogicalMatches`]: its
+    ///   logical path matches / does not match the [`TextPattern`],
+    ///   case-insensitively either way.
     /// - [`QueryTerm::AnyMatch`] / [`QueryTerm::NotAnyMatch`]: its logical path
-    ///   contains the substring **or** it carries any tag in the set — the
+    ///   matches the pattern **or** it carries any tag in the set — the
     ///   "prefix-less" chunk semantics.
     ///
     /// An empty term list matches every file; an empty tag set inside a term
     /// matches no tag (so `HasTag([])` matches nothing and `NotTag([])`
-    /// excludes nothing). For [`QueryTerm::AnyMatch`] the substring side
+    /// excludes nothing). For [`QueryTerm::AnyMatch`] the text side
     /// still stands when the tag set is empty. Composes
     /// [`Self::file_ids_for_tag`] and [`Self::get_all_files`]; no new SQL.
     ///
@@ -1862,55 +1944,64 @@ impl FileDatabase {
         let has_text_term = terms.iter().any(|term| {
             matches!(
                 term,
-                QueryTerm::NameContains(_)
-                    | QueryTerm::NotNameContains(_)
-                    | QueryTerm::LogicalContains(_)
-                    | QueryTerm::NotLogicalContains(_)
+                QueryTerm::NameMatches(_)
+                    | QueryTerm::NotNameMatches(_)
+                    | QueryTerm::LogicalMatches(_)
+                    | QueryTerm::NotLogicalMatches(_)
                     | QueryTerm::AnyMatch(_, _)
                     | QueryTerm::NotAnyMatch(_, _),
             )
         });
 
         if has_text_term {
-            let paths: std::collections::BTreeMap<FileId, String> = self
+            // Both spellings of each path: the original for regex matching and
+            // a lowercased copy for substring matching. See
+            // `CompiledPattern::is_match` for why the regex side must not see
+            // the lowercased form.
+            let paths: std::collections::BTreeMap<FileId, (String, String)> = self
                 .get_all_files(deleted_rule)?
                 .into_iter()
-                .map(|file| (file.file_id, file.logical_path.as_str().to_lowercase()))
+                .map(|file| {
+                    let path = file.logical_path.as_str().to_owned();
+                    let lowercased = path.to_lowercase();
+                    (file.file_id, (path, lowercased))
+                })
                 .collect();
 
-            // Precompute the file set for every `Any` variant so we don't hit
-            // the DB inside the retain closure.
-            let mut any_tag_sets: Vec<(String, BTreeSet<FileId>, bool)> = Vec::new();
+            // Compile every pattern, and precompute the file set for every
+            // `Any` variant, before entering the retain closure: neither a
+            // regex build nor a DB hit belongs inside a per-candidate loop.
+            let mut patterns: Vec<(CompiledPattern, bool)> = Vec::new();
+            let mut any_tag_sets: Vec<(CompiledPattern, BTreeSet<FileId>, bool)> = Vec::new();
             for term in terms {
-                let (needle, tag_ids, negated) = match term {
-                    QueryTerm::AnyMatch(needle, tag_ids) => (needle, tag_ids, false),
-                    QueryTerm::NotAnyMatch(needle, tag_ids) => (needle, tag_ids, true),
+                match term {
+                    QueryTerm::NameMatches(pattern) | QueryTerm::LogicalMatches(pattern) => {
+                        patterns.push((pattern.compile(), false));
+                    }
+                    QueryTerm::NotNameMatches(pattern) | QueryTerm::NotLogicalMatches(pattern) => {
+                        patterns.push((pattern.compile(), true));
+                    }
+                    QueryTerm::AnyMatch(pattern, tag_ids) => {
+                        any_tag_sets.push((pattern.compile(), files_for_any_tag(tag_ids)?, false));
+                    }
+                    QueryTerm::NotAnyMatch(pattern, tag_ids) => {
+                        any_tag_sets.push((pattern.compile(), files_for_any_tag(tag_ids)?, true));
+                    }
                     _ => continue,
-                };
-                any_tag_sets.push((needle.to_lowercase(), files_for_any_tag(tag_ids)?, negated));
+                }
             }
 
             candidates.retain(|file_id| {
-                let Some(path) = paths.get(file_id) else {
+                let Some((path, lowercased)) = paths.get(file_id) else {
                     return false;
                 };
-                for term in terms {
-                    let ok = match term {
-                        QueryTerm::NameContains(needle) | QueryTerm::LogicalContains(needle) => {
-                            path.contains(&needle.to_lowercase())
-                        }
-                        QueryTerm::NotNameContains(needle)
-                        | QueryTerm::NotLogicalContains(needle) => {
-                            !path.contains(&needle.to_lowercase())
-                        }
-                        _ => continue,
-                    };
-                    if !ok {
+                for (pattern, negated) in &patterns {
+                    if pattern.is_match(path, lowercased) == *negated {
                         return false;
                     }
                 }
-                for (needle, tagged_files, negated) in &any_tag_sets {
-                    let hit = path.contains(needle) || tagged_files.contains(file_id);
+                for (pattern, tagged_files, negated) in &any_tag_sets {
+                    let hit = pattern.is_match(path, lowercased) || tagged_files.contains(file_id);
                     if hit == *negated {
                         return false;
                     }
@@ -1930,17 +2021,17 @@ impl FileDatabase {
     ///   analogue of "a file carries this tag".
     /// - [`QueryTerm::NotTag`]: the tag must *not* be a subtag of any tag in
     ///   the set.
-    /// - [`QueryTerm::NameContains`] / [`QueryTerm::NotNameContains`]: the
-    ///   tag's name contains / does not contain the substring, compared
+    /// - [`QueryTerm::NameMatches`] / [`QueryTerm::NotNameMatches`]: the tag's
+    ///   name matches / does not match the [`TextPattern`], compared
     ///   case-insensitively.
-    /// - [`QueryTerm::LogicalContains`] / [`QueryTerm::NotLogicalContains`]:
+    /// - [`QueryTerm::LogicalMatches`] / [`QueryTerm::NotLogicalMatches`]:
     ///   doesn't match.
     /// - [`QueryTerm::AnyMatch`] / [`QueryTerm::NotAnyMatch`]: the tag's name
-    ///   contains the substring **or** the tag is a subtag of any tag in the
-    ///   set — the tag analogue of the file-side `Any` semantics.
+    ///   matches the pattern **or** the tag is a subtag of any tag in the set —
+    ///   the tag analogue of the file-side `Any` semantics.
     ///
     /// An empty term list matches every tag; an empty tag set inside a term
-    /// matches no tag. For [`QueryTerm::AnyMatch`] the substring side still
+    /// matches no tag. For [`QueryTerm::AnyMatch`] the text side still
     /// stands when the tag set is empty. Composes [`Self::subtag_ids_for_tag`]
     /// and [`Self::get_all_tags`]; no new SQL.
     ///
@@ -1999,7 +2090,7 @@ impl FileDatabase {
 
         for term in terms {
             match term {
-                QueryTerm::LogicalContains(..) | QueryTerm::NotLogicalContains(..) => {
+                QueryTerm::LogicalMatches(..) | QueryTerm::NotLogicalMatches(..) => {
                     candidates.clear();
                     return Ok(candidates);
                 }
@@ -2014,48 +2105,54 @@ impl FileDatabase {
         let has_text_term = terms.iter().any(|term| {
             matches!(
                 term,
-                QueryTerm::NameContains(_)
-                    | QueryTerm::NotNameContains(_)
+                QueryTerm::NameMatches(_)
+                    | QueryTerm::NotNameMatches(_)
                     | QueryTerm::AnyMatch(_, _)
                     | QueryTerm::NotAnyMatch(_, _),
             )
         });
 
         if has_text_term {
-            let names: std::collections::BTreeMap<TagId, String> = self
+            // Original + lowercased, for the same reason as in
+            // `file_ids_for_query`.
+            let names: std::collections::BTreeMap<TagId, (String, String)> = self
                 .get_all_tags(deleted_rule)?
                 .into_iter()
-                .map(|tag| (tag.id, tag.name.to_lowercase()))
+                .map(|tag| {
+                    let lowercased = tag.name.to_lowercase();
+                    (tag.id, (tag.name, lowercased))
+                })
                 .collect();
 
-            let mut any_tag_sets: Vec<(String, BTreeSet<TagId>, bool)> = Vec::new();
+            let mut patterns: Vec<(CompiledPattern, bool)> = Vec::new();
+            let mut any_tag_sets: Vec<(CompiledPattern, BTreeSet<TagId>, bool)> = Vec::new();
             for term in terms {
-                let (needle, tag_ids, negated) = match term {
-                    QueryTerm::AnyMatch(needle, tag_ids) => (needle, tag_ids, false),
-                    QueryTerm::NotAnyMatch(needle, tag_ids) => (needle, tag_ids, true),
+                match term {
+                    QueryTerm::NameMatches(pattern) => patterns.push((pattern.compile(), false)),
+                    QueryTerm::NotNameMatches(pattern) => {
+                        patterns.push((pattern.compile(), true));
+                    }
+                    QueryTerm::AnyMatch(pattern, tag_ids) => {
+                        any_tag_sets.push((pattern.compile(), subtags_of_any(tag_ids)?, false));
+                    }
+                    QueryTerm::NotAnyMatch(pattern, tag_ids) => {
+                        any_tag_sets.push((pattern.compile(), subtags_of_any(tag_ids)?, true));
+                    }
                     _ => continue,
-                };
-                any_tag_sets.push((needle.to_lowercase(), subtags_of_any(tag_ids)?, negated));
+                }
             }
 
             candidates.retain(|tag_id| {
-                let Some(name) = names.get(tag_id) else {
+                let Some((name, lowercased)) = names.get(tag_id) else {
                     return false;
                 };
-                for term in terms {
-                    let ok = match term {
-                        QueryTerm::NameContains(needle) => name.contains(&needle.to_lowercase()),
-                        QueryTerm::NotNameContains(needle) => {
-                            !name.contains(&needle.to_lowercase())
-                        }
-                        _ => continue,
-                    };
-                    if !ok {
+                for (pattern, negated) in &patterns {
+                    if pattern.is_match(name, lowercased) == *negated {
                         return false;
                     }
                 }
-                for (needle, subtagged, negated) in &any_tag_sets {
-                    let hit = name.contains(needle) || subtagged.contains(tag_id);
+                for (pattern, subtagged, negated) in &any_tag_sets {
+                    let hit = pattern.is_match(name, lowercased) || subtagged.contains(tag_id);
                     if hit == *negated {
                         return false;
                     }
@@ -2310,9 +2407,29 @@ impl FileDatabase {
     /// [`DeletedRule::Exclude`].
     pub fn tag_ids_matching_token(
         &self,
-        token: &str,
+        pattern: &TextPattern,
         deleted_rule: DeletedRule,
     ) -> Result<Vec<TagId>, DatabaseError> {
+        // A regex resolves against tag *names* only, and is evaluated in Rust
+        // rather than SQL (SQLite has no regex without an extension).
+        //
+        // The id-prefix half is deliberately not offered for regexes: ids are
+        // opaque hex, so a pattern over them answers no question anyone asks,
+        // and supporting it would make `%a%` resolve to a near-arbitrary set
+        // of tags on top of its name matches.
+        let token = match pattern {
+            TextPattern::Substring(token) => token,
+            TextPattern::Regex(_) => {
+                let compiled = pattern.compile();
+                return Ok(self
+                    .get_all_tags(deleted_rule)?
+                    .into_iter()
+                    .filter(|tag| compiled.is_match(&tag.name, &tag.name.to_lowercase()))
+                    .map(|tag| tag.id)
+                    .collect());
+            }
+        };
+
         let mut ids: BTreeSet<TagId> = BTreeSet::new();
 
         // Name substring, case-insensitive. Escape LIKE metacharacters in the
@@ -3464,7 +3581,10 @@ mod tests {
 
         // A different case still matches (case-insensitive substring).
         let matched: BTreeSet<TagId> = database
-            .tag_ids_matching_token("FOO", DeletedRule::Exclude)
+            .tag_ids_matching_token(
+                &TextPattern::Substring("FOO".to_owned()),
+                DeletedRule::Exclude,
+            )
             .unwrap()
             .into_iter()
             .collect();
@@ -3483,11 +3603,188 @@ mod tests {
 
         assert!(
             database
-                .tag_ids_matching_token("nope", DeletedRule::Exclude)
+                .tag_ids_matching_token(
+                    &TextPattern::Substring("nope".to_owned()),
+                    DeletedRule::Exclude
+                )
                 .unwrap()
                 .is_empty(),
             "an unmatched token yields an empty set, not an error"
         );
+    }
+
+    /// Build a catalog of files at the given logical paths, returning the ids
+    /// in the same order.
+    fn files_at(database: &mut FileDatabase, paths: &[&str]) -> Vec<FileId> {
+        paths
+            .iter()
+            .map(|path| {
+                let file_id = FileId::new();
+                database
+                    .add_file(file_id, &LogicalPath::new(*path), 0)
+                    .unwrap();
+                database
+                    .record_version(file_id, "hash", "local", 1)
+                    .unwrap();
+                file_id
+            })
+            .collect()
+    }
+
+    fn matching_files(database: &FileDatabase, terms: &[QueryTerm]) -> BTreeSet<FileId> {
+        database
+            .file_ids_for_query(terms, SubtagRule::Exclude, DeletedRule::Exclude)
+            .unwrap()
+            .into_iter()
+            .collect()
+    }
+
+    fn regex(pattern: &str) -> TextPattern {
+        TextPattern::Regex(pattern.to_owned())
+    }
+
+    #[test]
+    fn regex_term_matches_against_the_full_logical_path() {
+        let mut database = memory_db();
+        let files = files_at(&mut database, &[
+            "photos/holiday/cat.jpg",
+            "archive/photos/cat.jpg",
+            "notes/todo.md",
+        ]);
+
+        let terms = vec![QueryTerm::LogicalMatches(regex("^photos/"))];
+        assert_eq!(
+            matching_files(&database, &terms),
+            BTreeSet::from([files[0]]),
+            "anchoring must bind to the whole path, not the basename"
+        );
+    }
+
+    /// Slashes in a pattern need no escaping — the reason the delimiter is `%`
+    /// rather than the conventional `/`.
+    #[test]
+    fn regex_term_may_contain_slashes() {
+        let mut database = memory_db();
+        let files = files_at(&mut database, &[
+            "photos/2024/raw/a.dng",
+            "photos/2024/a.jpg",
+        ]);
+
+        let terms = vec![QueryTerm::LogicalMatches(regex(r"^photos/.*/raw/.*\.dng$"))];
+        assert_eq!(
+            matching_files(&database, &terms),
+            BTreeSet::from([files[0]])
+        );
+    }
+
+    /// Regexes are case-insensitive by default, matching every other text term.
+    #[test]
+    fn regex_term_is_case_insensitive_by_default() {
+        let mut database = memory_db();
+        let files = files_at(&mut database, &["Photos/Cat.JPG"]);
+
+        let terms = vec![QueryTerm::LogicalMatches(regex(r"^photos/cat\.jpg$"))];
+        assert_eq!(
+            matching_files(&database, &terms),
+            BTreeSet::from([files[0]])
+        );
+    }
+
+    /// ...and `(?-i)` opts back out. This is the case that breaks if the
+    /// matcher is handed a pre-lowercased haystack.
+    #[test]
+    fn regex_term_case_sensitivity_can_be_opted_into() {
+        let mut database = memory_db();
+        let files = files_at(&mut database, &["Photos/Cat.JPG", "photos/cat.jpg"]);
+
+        let terms = vec![QueryTerm::LogicalMatches(regex(r"(?-i)^Photos/"))];
+        assert_eq!(
+            matching_files(&database, &terms),
+            BTreeSet::from([files[0]]),
+            "(?-i) must see the original casing"
+        );
+    }
+
+    /// A pattern that does not compile matches nothing, rather than being
+    /// dropped (which would *widen* the result set).
+    #[test]
+    fn invalid_regex_term_matches_nothing() {
+        let mut database = memory_db();
+        files_at(&mut database, &["notes/todo.md", "notes/todo.txt"]);
+
+        let terms = vec![QueryTerm::LogicalMatches(regex("*.md"))];
+        assert!(matching_files(&database, &terms).is_empty());
+    }
+
+    #[test]
+    fn negated_regex_term_excludes_matches() {
+        let mut database = memory_db();
+        let files = files_at(&mut database, &["notes/todo.md", "notes/todo.txt"]);
+
+        let terms = vec![QueryTerm::NotLogicalMatches(regex(r"\.md$"))];
+        assert_eq!(
+            matching_files(&database, &terms),
+            BTreeSet::from([files[1]])
+        );
+    }
+
+    /// A substring term keeps meaning exactly what it did: regex metacharacters
+    /// in it are literal.
+    #[test]
+    fn substring_term_treats_metacharacters_literally() {
+        let mut database = memory_db();
+        let files = files_at(&mut database, &["notes/todo.md", "notes/todoXmd"]);
+
+        let terms = vec![QueryTerm::LogicalMatches(TextPattern::Substring(
+            "todo.md".to_owned(),
+        ))];
+        assert_eq!(
+            matching_files(&database, &terms),
+            BTreeSet::from([files[0]]),
+            "`.` must not behave as a wildcard in a substring term"
+        );
+    }
+
+    /// `/t %...%` resolves tags by regex over their names.
+    #[test]
+    fn regex_token_resolves_tags_by_name() {
+        let database = memory_db();
+        let wip = TagId::new();
+        let done = TagId::new();
+        database.add_tag(wip, "wip-draft", "red", 1).unwrap();
+        database.add_tag(done, "done", "red", 1).unwrap();
+
+        let matched = database
+            .tag_ids_matching_token(&regex("^wip-"), DeletedRule::Exclude)
+            .unwrap();
+        assert_eq!(matched, vec![wip]);
+    }
+
+    /// Tag *ids* stay out of regex resolution: a pattern that would match a
+    /// hex id prefix must not sweep tags in by id.
+    #[test]
+    fn regex_token_does_not_resolve_tags_by_id() {
+        let database = memory_db();
+        let tag_id = TagId::new();
+        database.add_tag(tag_id, "unrelated", "red", 1).unwrap();
+
+        // A pattern matching the tag's own id prefix, which the substring path
+        // *would* resolve.
+        let id = tag_id.to_string();
+        let matched = database
+            .tag_ids_matching_token(&regex(&format!("^{}", &id[..6])), DeletedRule::Exclude)
+            .unwrap();
+        assert!(matched.is_empty(), "ids are not a regex surface");
+
+        // The substring path still resolves that same prefix, proving the test
+        // is comparing the two paths rather than a typo.
+        let matched = database
+            .tag_ids_matching_token(
+                &TextPattern::Substring(id[..6].to_owned()),
+                DeletedRule::Exclude,
+            )
+            .unwrap();
+        assert_eq!(matched, vec![tag_id]);
     }
 
     #[test]
@@ -4075,13 +4372,19 @@ mod tests {
         // Exclude hides the tombstoned tag.
         assert!(
             database
-                .tag_ids_matching_token("receipt", DeletedRule::Exclude)
+                .tag_ids_matching_token(
+                    &TextPattern::Substring("receipt".to_owned()),
+                    DeletedRule::Exclude
+                )
                 .unwrap()
                 .is_empty()
         );
         // Include finds it.
         let matched = database
-            .tag_ids_matching_token("receipt", DeletedRule::Include)
+            .tag_ids_matching_token(
+                &TextPattern::Substring("receipt".to_owned()),
+                DeletedRule::Include,
+            )
             .unwrap();
         assert_eq!(matched, vec![dead]);
     }

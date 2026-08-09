@@ -32,7 +32,9 @@ use tokio::sync::{broadcast, oneshot};
 
 use crate::bus::{DaemonMessage, FetchError, Ingest, PreviewError, RestoreError};
 use crate::configuration::{CompiledTagRules, EditorRule};
-use crate::database::{DatabaseError, DeletedRule, FileDatabase, QueryTerm, SubtagRule, Tag};
+use crate::database::{
+    DatabaseError, DeletedRule, FileDatabase, QueryTerm, SubtagRule, Tag, TextPattern,
+};
 use crate::directory_manager::SyncDirectoryCommand;
 use crate::fetch::PendingFetches;
 use crate::transfer::ChunkSource;
@@ -488,25 +490,33 @@ impl Api {
 
         let mut terms = Vec::new();
         for chunk in lex_query(query) {
+            // The delimiter the user chose decides how the text half is
+            // interpreted, independently of the kind prefix.
+            let pattern = if chunk.regex {
+                TextPattern::Regex(chunk.text)
+            } else {
+                TextPattern::Substring(chunk.text)
+            };
+
+            // Resolved before the match so the pattern can be moved into the
+            // term afterwards. Only the tag-bearing kinds need it, and the
+            // lookup is the one fallible step here.
+            let tag_ids = match chunk.kind {
+                ChunkKind::Tag | ChunkKind::Any => {
+                    database.tag_ids_matching_token(&pattern, deleted_rule)?
+                }
+                _ => Vec::new(),
+            };
+
             let term = match (chunk.kind, chunk.negated) {
-                (ChunkKind::Tag, false) => {
-                    QueryTerm::HasTag(database.tag_ids_matching_token(&chunk.text, deleted_rule)?)
-                }
-                (ChunkKind::Tag, true) => {
-                    QueryTerm::NotTag(database.tag_ids_matching_token(&chunk.text, deleted_rule)?)
-                }
-                (ChunkKind::Name, false) => QueryTerm::NameContains(chunk.text),
-                (ChunkKind::Name, true) => QueryTerm::NotNameContains(chunk.text),
-                (ChunkKind::Logical, false) => QueryTerm::LogicalContains(chunk.text),
-                (ChunkKind::Logical, true) => QueryTerm::NotLogicalContains(chunk.text),
-                (ChunkKind::Any, false) => QueryTerm::AnyMatch(
-                    chunk.text.clone(),
-                    database.tag_ids_matching_token(&chunk.text, deleted_rule)?,
-                ),
-                (ChunkKind::Any, true) => QueryTerm::NotAnyMatch(
-                    chunk.text.clone(),
-                    database.tag_ids_matching_token(&chunk.text, deleted_rule)?,
-                ),
+                (ChunkKind::Tag, false) => QueryTerm::HasTag(tag_ids),
+                (ChunkKind::Tag, true) => QueryTerm::NotTag(tag_ids),
+                (ChunkKind::Name, false) => QueryTerm::NameMatches(pattern),
+                (ChunkKind::Name, true) => QueryTerm::NotNameMatches(pattern),
+                (ChunkKind::Logical, false) => QueryTerm::LogicalMatches(pattern),
+                (ChunkKind::Logical, true) => QueryTerm::NotLogicalMatches(pattern),
+                (ChunkKind::Any, false) => QueryTerm::AnyMatch(pattern, tag_ids),
+                (ChunkKind::Any, true) => QueryTerm::NotAnyMatch(pattern, tag_ids),
                 // `/p` is reserved but not yet supported — drop the chunk so
                 // the rest of the query still works, matching the "forgiving
                 // search box" contract.
@@ -1269,13 +1279,35 @@ impl Api {
 ///
 ///    Unknown `/x` tokens are **not** prefixes: they become literal chunks
 ///    whose payload starts with `/`. This keeps `/home/lucas` searchable.
-/// 3. A *payload*, either:
-///    - A double-quoted string `"..."` — captures whitespace verbatim. Supports
-///      backslash escapes `\"` and `\\`; any other `\c` is left as-is (`\c`).
-///    - Or a bare run of non-whitespace characters.
+/// 3. A *payload*, one of:
+///    - A double-quoted string `"..."` — a literal substring, capturing
+///      whitespace verbatim. Supports backslash escapes `\"` and `\\`; any
+///      other `\c` is left as-is (`\c`).
+///    - A `%`-delimited string `%...%` — a **regular expression**, also
+///      capturing whitespace verbatim, passed to the regex engine with no
+///      escape processing of its own (see [`read_regex`]).
+///    - Or a bare run of non-whitespace characters — a literal substring.
 ///
 /// A chunk without a kind prefix is [`ChunkKind::Any`] — the resolver will
 /// match its payload against *both* names and tags (union).
+///
+/// # Why the delimiter selects the matcher
+///
+/// The payload's *delimiter* chooses how to match (literal vs regex) while the
+/// *prefix* chooses what to match against. Keeping them on separate axes means
+/// they compose without the grammar enumerating combinations: `/l %^photos/%`,
+/// `/t %^wip-%` and `! %\.tmp$%` all work by construction.
+///
+/// `%` rather than the conventional `/.../`: this is a *path* search language,
+/// so `/` is both extremely common inside the patterns being written (making
+/// `/^photos\/.*/` the normal case) and already spoken for as the prefix
+/// sigil, which would make `/tmp/foo` ambiguous between a literal path search
+/// and a regex. `%` is rare inside logical paths, has no shell meaning, and
+/// its SQL `LIKE` association points the right way.
+///
+/// Quoting therefore doubles as the escape hatch for a payload that starts
+/// with `%`: `"%20"` searches for the literal text `%20`, where a bare `%20`
+/// would begin an unterminated regex and be dropped.
 ///
 /// # Error recovery
 ///
@@ -1289,7 +1321,8 @@ impl Api {
 /// - conflicting kind prefixes (`/t /l foo` drops the `/t /l` chunk and
 ///   continues from `foo`);
 /// - a duplicate `!` (`! ! foo` drops that chunk);
-/// - an unterminated quoted string (`"foo` at EOF is dropped entirely).
+/// - an unterminated quoted string (`"foo` at EOF is dropped entirely);
+/// - an unterminated regex (`%foo` at EOF, same rule).
 ///
 /// Diagnostics are intentionally not surfaced: the caller sees only the chunks
 /// that parsed cleanly.
@@ -1315,6 +1348,15 @@ pub(crate) mod chunk {
         pub kind: ChunkKind,
         pub text: String,
         pub negated: bool,
+        /// True when the payload was written as `%...%`, meaning `text` is a
+        /// regular expression rather than a literal substring.
+        ///
+        /// Deliberately independent of [`ChunkKind`]: the prefix chooses *what
+        /// field* to match against, the delimiter chooses *how* to match. The
+        /// two compose freely, so `/l %^photos/%` and `! %\.tmp$%` are both
+        /// meaningful without the grammar having to enumerate the
+        /// combinations.
+        pub regex: bool,
     }
 
     /// Lex a query string into [`Chunk`]s. See the module docs for the grammar
@@ -1389,16 +1431,22 @@ pub(crate) mod chunk {
             }
         }
 
-        // Read the payload: quoted string or bare token.
-        let (text, rest) = if let Some(after_quote) = rest.strip_prefix('"') {
+        // Read the payload: regex, quoted string, or bare token.
+        let (text, regex, rest) = if let Some(after_quote) = rest.strip_prefix('"') {
             match read_quoted(after_quote) {
-                Some(parsed) => parsed,
+                Some((text, rest)) => (text, false, rest),
                 // Unterminated quote: discard the rest of the input entirely.
+                None => return (None, ""),
+            }
+        } else if let Some(after_delimiter) = rest.strip_prefix('%') {
+            match read_regex(after_delimiter) {
+                Some((text, rest)) => (text, true, rest),
+                // Unterminated, exactly like an unterminated quote.
                 None => return (None, ""),
             }
         } else {
             let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-            (rest[..end].to_owned(), &rest[end..])
+            (rest[..end].to_owned(), false, &rest[end..])
         };
 
         (
@@ -1406,9 +1454,28 @@ pub(crate) mod chunk {
                 kind: kind.unwrap_or(ChunkKind::Any),
                 text,
                 negated,
+                regex,
             }),
             rest,
         )
+    }
+
+    /// Read a `%...%`-delimited regex payload starting *after* the opening
+    /// delimiter. Returns `Some((pattern, remainder_after_closing_delimiter))`,
+    /// or `None` if the closing `%` is missing.
+    ///
+    /// Unlike [`read_quoted`] this performs **no escape processing at all**:
+    /// the payload is handed to the regex engine exactly as written, and
+    /// terminates at the first `%`. A regex is already a language with its own
+    /// escaping rules, and layering a second one on top would mean `\.` and
+    /// `\\.` differing for reasons that have nothing to do with the pattern.
+    ///
+    /// The cost is that a literal `%` cannot appear directly in a pattern.
+    /// That is not a real limitation — regex spells it `\x25` — and it buys a
+    /// payload the user can copy verbatim out of any other regex tool.
+    fn read_regex(input: &str) -> Option<(String, &str)> {
+        let end = input.find('%')?;
+        Some((input[..end].to_owned(), &input[end + '%'.len_utf8()..]))
     }
 
     /// Read a `"..."`-quoted payload starting *after* the opening quote.
@@ -1448,6 +1515,7 @@ pub(crate) mod chunk {
                 kind: ChunkKind::Any,
                 text: text.to_owned(),
                 negated: false,
+                regex: false,
             }
         }
 
@@ -1456,6 +1524,7 @@ pub(crate) mod chunk {
                 kind: ChunkKind::Tag,
                 text: text.to_owned(),
                 negated: false,
+                regex: false,
             }
         }
 
@@ -1464,11 +1533,19 @@ pub(crate) mod chunk {
                 kind: ChunkKind::Logical,
                 text: text.to_owned(),
                 negated: false,
+                regex: false,
             }
         }
 
         fn negate(mut chunk: Chunk) -> Chunk {
             chunk.negated = true;
+            chunk
+        }
+
+        /// Mark a chunk as a regex payload, so expectations read as
+        /// `regex(logical("^photos/"))`.
+        fn regex(mut chunk: Chunk) -> Chunk {
+            chunk.regex = true;
             chunk
         }
 
@@ -1502,6 +1579,79 @@ pub(crate) mod chunk {
             // silently interpreting it, to match the "quotes are only for
             // whitespace capture" contract.
             assert_eq!(lex_query(r#""a\nb""#), vec![any(r"a\nb")]);
+        }
+
+        #[test]
+        fn percent_delimiters_produce_a_regex_payload() {
+            assert_eq!(lex_query(r"%\.md$%"), vec![regex(any(r"\.md$"))]);
+        }
+
+        #[test]
+        fn regex_payload_captures_whitespace() {
+            assert_eq!(lex_query("%foo bar% baz"), vec![
+                regex(any("foo bar")),
+                any("baz")
+            ]);
+        }
+
+        /// The delimiter (how to match) and the prefix (what to match against)
+        /// are independent axes, so every combination lexes without the
+        /// grammar special-casing them.
+        #[test]
+        fn regex_composes_with_kind_prefixes_and_negation() {
+            assert_eq!(lex_query("/l %^photos/%"), vec![regex(logical("^photos/"))]);
+            assert_eq!(lex_query("/t %^wip-%"), vec![regex(tag("^wip-"))]);
+            assert_eq!(lex_query(r"! %\.tmp$%"), vec![negate(regex(any(
+                r"\.tmp$"
+            )))]);
+            assert_eq!(lex_query("! /l %^tmp/%"), vec![negate(regex(logical(
+                "^tmp/"
+            )))]);
+        }
+
+        /// Slashes need no escaping, which is the entire reason the delimiter
+        /// is `%` and not `/`.
+        #[test]
+        fn regex_payload_may_contain_slashes_verbatim() {
+            assert_eq!(lex_query("%^photos/.*/raw$%"), vec![regex(any(
+                "^photos/.*/raw$"
+            ))]);
+        }
+
+        /// No escape processing inside `%...%`: the payload reaches the regex
+        /// engine exactly as typed, so backslashes are not consumed the way
+        /// `read_quoted` consumes them.
+        #[test]
+        fn regex_payload_does_not_process_backslash_escapes() {
+            assert_eq!(lex_query(r"%a\\b%"), vec![regex(any(r"a\\b"))]);
+            assert_eq!(lex_query(r#"%a\"b%"#), vec![regex(any(r#"a\"b"#))]);
+        }
+
+        /// A regex terminates at the first `%`; there is no way to escape one,
+        /// by design (regex spells a literal percent `\x25`).
+        #[test]
+        fn regex_terminates_at_the_first_delimiter() {
+            assert_eq!(lex_query("%a%b%"), vec![regex(any("a")), any("b%")]);
+        }
+
+        /// Quoting is the escape hatch for a literal payload that starts with
+        /// `%`, which a bare token can no longer express.
+        #[test]
+        fn quoting_keeps_a_leading_percent_literal() {
+            assert_eq!(lex_query(r#""%20""#), vec![any("%20")]);
+        }
+
+        /// A `%` that is not in payload-leading position is an ordinary
+        /// character, so `50%` still searches literally.
+        #[test]
+        fn percent_inside_a_bare_token_is_literal() {
+            assert_eq!(lex_query("50% off"), vec![any("50%"), any("off")]);
+        }
+
+        #[test]
+        fn empty_regex_is_allowed() {
+            // Matches everything, exactly as the empty substring `""` does.
+            assert_eq!(lex_query("%%"), vec![regex(any(""))]);
         }
 
         #[test]
@@ -1568,6 +1718,14 @@ pub(crate) mod chunk {
             // that could rescue the remainder).
             assert_eq!(lex_query(r#"foo "bar baz"#), vec![any("foo")]);
             assert_eq!(lex_query(r#""foo"#), Vec::<Chunk>::new());
+        }
+
+        #[test]
+        fn unterminated_regex_drops_rest_of_input() {
+            // Same recovery as an unterminated quote: a missing closing `%`
+            // gives the lexer no boundary it could trust to resume at.
+            assert_eq!(lex_query("foo %bar baz"), vec![any("foo")]);
+            assert_eq!(lex_query("%foo"), Vec::<Chunk>::new());
         }
 
         #[test]

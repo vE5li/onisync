@@ -19,6 +19,22 @@ The upshot is that search is intentionally fuzzy: matching on any tag in a chain
 
 Sync is handled by `onisyncd`, running on every device. It's a true two-way sync (edits on any device propagate to the others, with conflicts resolved per-item) and it's push-based over persistent connections — changes show up on peers as they happen, with no polling.
 
+## Searching
+
+A query is a list of chunks, all of which must match. A chunk is an optional `!` (negate), an optional prefix picking what to match against (`/t` tag, `/l` logical path, nothing at all for "either"), and a payload.
+
+The payload's delimiter picks *how* to match:
+
+| Payload | Meaning |
+| --- | --- |
+| `cat` | literal substring |
+| `"my file"` | literal substring, including spaces |
+| `%\.md$%` | regular expression |
+
+So `/l %^photos/\d{4}/%` finds files under a four-digit year directory, and `beach ! %\.tmp$%` finds anything matching `beach` that isn't a temp file. Regexes are case-insensitive unless you start them with `(?-i)`.
+
+`%` rather than the usual `/.../` because paths are full of slashes — `%^photos/raw/%` needs no escaping — and because `/` already introduces the prefixes.
+
 ## Automatic tagging
 
 Tagging everything by hand gets old, so the daemon config can carry **tag rules**: a regular expression matched against a file's logical path, and the tags to apply when it matches.

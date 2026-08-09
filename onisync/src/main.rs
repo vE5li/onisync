@@ -539,9 +539,16 @@ enum Commands {
     /// - `!` — invert the following chunk (e.g. `! /t foo`)
     /// - no prefix — match `foo` as *either* a logical-path substring OR a tag
     ///
-    /// Quote payloads to include whitespace: `/t "my tag"`. Malformed chunks
-    /// are silently dropped. Example:
-    ///   `onisync search '/t photos ! /t archived beach'`.
+    /// Payloads can be written three ways: bare (`foo`), double-quoted to
+    /// include whitespace (`"my file"`), or `%`-delimited to make the payload a
+    /// regular expression (`%\.md$%`). Regexes are case-insensitive unless the
+    /// pattern starts with `(?-i)`, need no escaping of `/`, and compose with
+    /// every prefix — `/l %^photos/%`, `/t %^wip-%`, `! %\.tmp$%`.
+    ///
+    /// Malformed chunks are silently dropped; an invalid regex matches nothing.
+    /// Examples:
+    ///   `onisync search '/t photos ! /t archived beach'`
+    ///   `onisync search '/l %^photos/\d{4}/% ! %\.tmp$%'`
     #[command(visible_alias = "s")]
     Search {
         /// The query terms; joined with spaces if given as multiple arguments.
