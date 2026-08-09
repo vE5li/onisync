@@ -45,7 +45,10 @@ class TagColorSwatch extends StatelessWidget {
         color: parseTagColor(color),
         shape: BoxShape.circle,
         border: selected
-            ? Border.all(color: Theme.of(context).colorScheme.onSurface, width: 3)
+            ? Border.all(
+                color: Theme.of(context).colorScheme.onSurface,
+                width: 3,
+              )
             : Border.all(color: Colors.black26),
       ),
     );
@@ -59,12 +62,7 @@ class TagColorSwatch extends StatelessWidget {
 /// or both can be null; when both are non-null the pill body and the X are
 /// independent hit targets thanks to [InputChip]'s built-in split behavior.
 class TagChip extends StatelessWidget {
-  const TagChip({
-    super.key,
-    required this.tag,
-    this.onPressed,
-    this.onDeleted,
-  });
+  const TagChip({super.key, required this.tag, this.onPressed, this.onDeleted});
 
   final onisync.TagEntry tag;
   final VoidCallback? onPressed;

@@ -63,9 +63,7 @@ class AndroidEditorLauncher implements EditorLauncher {
     // there is no way to exec an arbitrary argv in this environment (and no
     // reason to want to). Ignore `rules` entirely.
     if (_pending != null) {
-      throw const EditorLaunchException(
-        'another edit is already in progress',
-      );
+      throw const EditorLaunchException('another edit is already in progress');
     }
     final completer = Completer<void>();
     _pending = completer;

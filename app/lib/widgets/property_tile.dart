@@ -39,28 +39,30 @@ class PropertyTile extends StatelessWidget {
     // adapts to light/dark themes without hard-coding a specific hex.
     final onSurface = theme.colorScheme.onSurface;
     final mutedColor = dense
-        ? Color.alphaBlend(onSurface.withValues(alpha: 0.55), theme.colorScheme.surface)
+        ? Color.alphaBlend(
+            onSurface.withValues(alpha: 0.55),
+            theme.colorScheme.surface,
+          )
         : null;
-    final baseValueStyle = (dense
-            ? theme.textTheme.bodySmall
-            : theme.textTheme.bodyLarge)
-        ?.copyWith(color: mutedColor);
+    final baseValueStyle =
+        (dense ? theme.textTheme.bodySmall : theme.textTheme.bodyLarge)
+            ?.copyWith(color: mutedColor);
     final valueStyle = monospace
-        ? (baseValueStyle ?? const TextStyle()).copyWith(fontFamily: 'monospace')
+        ? (baseValueStyle ?? const TextStyle()).copyWith(
+            fontFamily: 'monospace',
+          )
         : baseValueStyle;
-    final labelStyle = (dense ? theme.textTheme.labelSmall : theme.textTheme.labelMedium)
-        ?.copyWith(
-          color: dense ? mutedColor : theme.colorScheme.onSurfaceVariant,
-          fontWeight: FontWeight.bold,
-        );
+    final labelStyle =
+        (dense ? theme.textTheme.labelSmall : theme.textTheme.labelMedium)
+            ?.copyWith(
+              color: dense ? mutedColor : theme.colorScheme.onSurfaceVariant,
+              fontWeight: FontWeight.bold,
+            );
     return InkWell(
       onTap: onTap,
       onLongPress: _copy,
       child: Padding(
-        padding: EdgeInsets.symmetric(
-          horizontal: 16,
-          vertical: dense ? 6 : 12,
-        ),
+        padding: EdgeInsets.symmetric(horizontal: 16, vertical: dense ? 6 : 12),
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.center,
           children: [
@@ -74,10 +76,7 @@ class PropertyTile extends StatelessWidget {
                 ],
               ),
             ),
-            if (trailing != null) ...[
-              const SizedBox(width: 12),
-              trailing!,
-            ],
+            if (trailing != null) ...[const SizedBox(width: 12), trailing!],
           ],
         ),
       ),

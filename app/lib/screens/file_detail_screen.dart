@@ -116,15 +116,16 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
         subtagRule: onisync.SubtagRule.exclude,
       );
       final entries = await Future.wait(
-        applied.map((id) => _app.getTagEntry(
-              tagId: id,
-              deletedRule: onisync.DeletedRule.exclude,
-            )),
+        applied.map(
+          (id) => _app.getTagEntry(
+            tagId: id,
+            deletedRule: onisync.DeletedRule.exclude,
+          ),
+        ),
       );
       // Best-effort: absence (not-synced-here) is expected, not an error. Any
       // hard failure surfaces below as `_error` via the outer catch.
-      final localPath =
-          await _app.localPathForFile(fileId: widget.fileId);
+      final localPath = await _app.localPathForFile(fileId: widget.fileId);
       if (!mounted) return;
       setState(() {
         _file = file;
@@ -170,10 +171,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     final trimmed = result.trim();
     if (trimmed.isEmpty || trimmed == file.path) return;
     try {
-      await _app.moveFile(
-        fileId: widget.fileId,
-        logicalPath: trimmed,
-      );
+      await _app.moveFile(fileId: widget.fileId, logicalPath: trimmed);
       // Live update flows in via the change stream.
     } catch (error) {
       _snack('Failed to rename file: $error');
@@ -210,8 +208,9 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     }
     if (!mounted) return;
     final applied = _appliedTagIds.toSet();
-    final available =
-        all.tags.where((t) => !applied.contains(t.tagId)).toList();
+    final available = all.tags
+        .where((t) => !applied.contains(t.tagId))
+        .toList();
     if (available.isEmpty) {
       _snack('No more tags to add.');
       return;
@@ -222,7 +221,12 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
         child: ListView(
           shrinkWrap: true,
           children: [
-            const ListTile(title: Text('Add tag', style: TextStyle(fontWeight: FontWeight.bold))),
+            const ListTile(
+              title: Text(
+                'Add tag',
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+            ),
             for (final tag in available)
               ListTile(
                 leading: TagColorSwatch(color: tag.color),
@@ -293,7 +297,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
       // best-effort restore failed and the file remains deleted.
       final message = error is onisync.ApiError_ContentUnavailable
           ? 'Cannot restore: the file\'s contents are no longer available on '
-              'any device.'
+                'any device.'
           : 'Failed to restore file: $error';
       _snack(message);
     } finally {
@@ -337,7 +341,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     } catch (error) {
       final message = error is onisync.ApiError_ContentUnavailable
           ? 'Cannot share: the file\'s contents are not available on any '
-              'device.'
+                'device.'
           : 'Failed to share file: $error';
       _snack(message);
     } finally {
@@ -408,7 +412,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     } catch (error) {
       final message = error is onisync.ApiError_ContentUnavailable
           ? 'Cannot download: the file\'s contents are not available on any '
-              'device.'
+                'device.'
           : 'Failed to download file: $error';
       _snack(message);
     } finally {
@@ -522,7 +526,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     final dot = name.lastIndexOf('.');
     final stem = dot <= 0 ? name : name.substring(0, dot);
     final ext = dot <= 0 ? '' : name.substring(dot);
-    for (var n = 2;; n++) {
+    for (var n = 2; ; n++) {
       final candidate = '$dir/$stem ($n)$ext';
       if (!File(candidate).existsSync()) return candidate;
     }
@@ -530,7 +534,9 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
 
   void _snack(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   @override
@@ -611,9 +617,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
           // Mobile-only (gated on the session's public-key hint, which is
           // non-null only on Android), and only for live files. Disabled while
           // a fetch-then-share is in flight.
-          if (file != null &&
-              !file.deleted &&
-              widget.session.publicKey != null)
+          if (file != null && !file.deleted && widget.session.publicKey != null)
             IconButton(
               icon: _sharing
                   ? const SizedBox(
@@ -759,7 +763,9 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
           // Keyed by content hash so a content change refetches (the
           // RemotePreview widget also guards this via didUpdateWidget).
           ? RemotePreview(
-              key: ValueKey('remote-preview-${file.fileId}-${file.contentHash}'),
+              key: ValueKey(
+                'remote-preview-${file.fileId}-${file.contentHash}',
+              ),
               app: _app,
               fileId: file.fileId,
               contentHash: file.contentHash,
@@ -777,17 +783,17 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     if (tag == null) {
       // Applied tag not resolved (e.g. race between _load steps). Show the
       // raw id so the row is still meaningful.
-      return Chip(label: Text(tagId, style: const TextStyle(fontFamily: 'monospace')));
+      return Chip(
+        label: Text(tagId, style: const TextStyle(fontFamily: 'monospace')),
+      );
     }
     return TagChip(
       tag: tag,
       onPressed: () => Navigator.push(
         context,
         MaterialPageRoute(
-          builder: (_) => TagDetailScreen(
-            session: widget.session,
-            tagId: tagId,
-          ),
+          builder: (_) =>
+              TagDetailScreen(session: widget.session, tagId: tagId),
         ),
       ),
       onDeleted: () => _removeTag(tagId),
@@ -807,8 +813,9 @@ class _RenameFileDialog extends StatefulWidget {
 }
 
 class _RenameFileDialogState extends State<_RenameFileDialog> {
-  late final TextEditingController _controller =
-      TextEditingController(text: widget.initial);
+  late final TextEditingController _controller = TextEditingController(
+    text: widget.initial,
+  );
 
   @override
   void dispose() {

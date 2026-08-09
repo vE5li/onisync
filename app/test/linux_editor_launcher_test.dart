@@ -104,21 +104,24 @@ void main() {
       );
     });
 
-    test('a malformed matching rule fails loudly instead of falling through', () {
-      // Silently skipping to the next rule would launch a *different* editor
-      // than the operator configured — least acceptable exactly when the rule
-      // failed the absolute-path check.
-      expect(
-        () => LinuxEditorLauncher.resolveArgv(
-          appliedTagIds: const ['tag-a', 'tag-b'],
-          rules: [
-            _rule('tag-a', const ['relative-editor']),
-            _rule('tag-b', const ['/usr/bin/fallback']),
-          ],
-        ),
-        throwsA(isA<EditorLaunchException>()),
-      );
-    });
+    test(
+      'a malformed matching rule fails loudly instead of falling through',
+      () {
+        // Silently skipping to the next rule would launch a *different* editor
+        // than the operator configured — least acceptable exactly when the rule
+        // failed the absolute-path check.
+        expect(
+          () => LinuxEditorLauncher.resolveArgv(
+            appliedTagIds: const ['tag-a', 'tag-b'],
+            rules: [
+              _rule('tag-a', const ['relative-editor']),
+              _rule('tag-b', const ['/usr/bin/fallback']),
+            ],
+          ),
+          throwsA(isA<EditorLaunchException>()),
+        );
+      },
+    );
 
     test('non-matching malformed rules are ignored', () {
       // The guard applies to the rule that actually matched, not to every

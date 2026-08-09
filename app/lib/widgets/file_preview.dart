@@ -21,9 +21,36 @@ class FilePreview extends StatelessWidget {
   static const _imageExts = {'png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'};
   static const _markdownExts = {'md', 'markdown'};
   static const _textExts = {
-    'txt', 'log', 'json', 'yaml', 'yml', 'toml', 'ini', 'csv', 'tsv',
-    'dart', 'rs', 'py', 'js', 'ts', 'tsx', 'jsx', 'html', 'css', 'sh',
-    'c', 'cpp', 'h', 'hpp', 'java', 'kt', 'swift', 'go', 'rb', 'php', 'xml',
+    'txt',
+    'log',
+    'json',
+    'yaml',
+    'yml',
+    'toml',
+    'ini',
+    'csv',
+    'tsv',
+    'dart',
+    'rs',
+    'py',
+    'js',
+    'ts',
+    'tsx',
+    'jsx',
+    'html',
+    'css',
+    'sh',
+    'c',
+    'cpp',
+    'h',
+    'hpp',
+    'java',
+    'kt',
+    'swift',
+    'go',
+    'rb',
+    'php',
+    'xml',
   };
 
   String get _ext {
@@ -41,9 +68,7 @@ class FilePreview extends StatelessWidget {
       // top-left, which is InteractiveViewer's default child alignment.
       return InteractiveViewer(
         alignment: Alignment.center,
-        child: Center(
-          child: Image.file(file, fit: BoxFit.contain),
-        ),
+        child: Center(child: Image.file(file, fit: BoxFit.contain)),
       );
     }
 

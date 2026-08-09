@@ -183,7 +183,8 @@ class _HomeScreenState extends State<HomeScreen> {
       // Mid-typing tag tokens (`$fo`) legitimately fail to resolve; treat those
       // as "no matches" so the UI doesn't flash red at every keystroke. Other
       // errors (transport, etc.) still surface.
-      final looksLikeUnresolved = error is onisync.ApiError_UnknownId ||
+      final looksLikeUnresolved =
+          error is onisync.ApiError_UnknownId ||
           error is onisync.ApiError_AmbiguousId;
       setState(() {
         if (looksLikeUnresolved) {
@@ -241,7 +242,8 @@ class _HomeScreenState extends State<HomeScreen> {
     final results = _results;
     if (results == null) return;
     final candidate = _createCandidate;
-    final total = results.tags.length +
+    final total =
+        results.tags.length +
         (candidate != null ? 1 : 0) +
         results.files.length;
     if (total == 1) {
@@ -292,10 +294,7 @@ class _HomeScreenState extends State<HomeScreen> {
     // If focus somehow drifted off-list, fall back to the first row.
     final next = current < 0 ? 0 : (current + 1).clamp(0, _activeRowCount - 1);
     _rowFocus[next].requestFocus();
-    _ensureRowVisible(
-      next,
-      ScrollPositionAlignmentPolicy.keepVisibleAtEnd,
-    );
+    _ensureRowVisible(next, ScrollPositionAlignmentPolicy.keepVisibleAtEnd);
   }
 
   /// ArrowUp on the results area: move to the previous row. From row 0,
@@ -310,10 +309,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     final prev = current - 1;
     _rowFocus[prev].requestFocus();
-    _ensureRowVisible(
-      prev,
-      ScrollPositionAlignmentPolicy.keepVisibleAtStart,
-    );
+    _ensureRowVisible(prev, ScrollPositionAlignmentPolicy.keepVisibleAtStart);
   }
 
   /// Escape on the results area: return focus to the search field.
@@ -324,7 +320,10 @@ class _HomeScreenState extends State<HomeScreen> {
   /// Push the tag detail screen and, on return, put keyboard focus back on
   /// the row the user came from so keyboard navigation resumes where it
   /// left off.
-  Future<void> _openTag(onisync.TagEntry tag, {required int restoreIndex}) async {
+  Future<void> _openTag(
+    onisync.TagEntry tag, {
+    required int restoreIndex,
+  }) async {
     // Drop focus before pushing so Flutter's automatic focus restoration
     // doesn't re-focus the search field (which would also re-open the soft
     // keyboard on mobile). We put focus back explicitly on return.
@@ -332,10 +331,8 @@ class _HomeScreenState extends State<HomeScreen> {
     await Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => TagDetailScreen(
-          session: widget.session!,
-          tagId: tag.tagId,
-        ),
+        builder: (_) =>
+            TagDetailScreen(session: widget.session!, tagId: tag.tagId),
       ),
     );
     if (!mounted) return;
@@ -343,15 +340,15 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   /// See [_openTag].
-  Future<void> _openFile(onisync.FileEntry file, {required int restoreIndex}) async {
+  Future<void> _openFile(
+    onisync.FileEntry file, {
+    required int restoreIndex,
+  }) async {
     FocusManager.instance.primaryFocus?.unfocus();
     await Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => FileDetailScreen(
-          session: widget.session!,
-          file: file,
-        ),
+        builder: (_) => FileDetailScreen(session: widget.session!, file: file),
       ),
     );
     if (!mounted) return;
@@ -377,10 +374,7 @@ class _HomeScreenState extends State<HomeScreen> {
   /// this works both when the row is already laid out (arrow-key
   /// navigation) and when the tree is mid-rebuild (returning from a
   /// detail screen).
-  void _ensureRowVisible(
-    int index,
-    ScrollPositionAlignmentPolicy policy
-  ) {
+  void _ensureRowVisible(int index, ScrollPositionAlignmentPolicy policy) {
     final node = _rowFocus[index];
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
@@ -407,9 +401,9 @@ class _HomeScreenState extends State<HomeScreen> {
       // appear in the results (matching `name` as a substring).
     } catch (error) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to create tag: $error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Failed to create tag: $error')));
     }
   }
 
@@ -428,9 +422,7 @@ class _HomeScreenState extends State<HomeScreen> {
             tooltip: _showDeleted
                 ? 'Showing deleted — tap to search live'
                 : 'Search deleted files and tags',
-            icon: Icon(
-              _showDeleted ? Icons.delete : Icons.delete_outline,
-            ),
+            icon: Icon(_showDeleted ? Icons.delete : Icons.delete_outline),
             onPressed: () {
               setState(() => _showDeleted = !_showDeleted);
               // Re-run immediately if a query is already active so the mode
@@ -499,7 +491,8 @@ class _HomeScreenState extends State<HomeScreen> {
     // on every rebuild. Change-stream-driven rebuilds during arrow-key
     // navigation would otherwise pull the focused node out from under the
     // user, causing the "Up bounces back down" symptom.
-    final totalRows = results.tags.length +
+    final totalRows =
+        results.tags.length +
         (createCandidate != null ? 1 : 0) +
         results.files.length;
     _ensureRowFocusCapacity(totalRows);
@@ -513,31 +506,37 @@ class _HomeScreenState extends State<HomeScreen> {
       children.add(const _SectionHeader('Tags'));
       for (final tag in results.tags) {
         final index = rowIndex++;
-        children.add(_TagRow(
-          tag: tag,
-          focusNode: _rowFocus[index],
-          onActivate: () => _openTag(tag, restoreIndex: index),
-        ));
+        children.add(
+          _TagRow(
+            tag: tag,
+            focusNode: _rowFocus[index],
+            onActivate: () => _openTag(tag, restoreIndex: index),
+          ),
+        );
       }
       if (createCandidate != null) {
         // The create-tag row doesn't push a route, so nothing to restore
         // focus to; `_createTag` returns and the results list mutates.
-        children.add(_CreateTagRow(
-          name: createCandidate,
-          onCreate: () => _createTag(createCandidate),
-          focusNode: _rowFocus[rowIndex++],
-        ));
+        children.add(
+          _CreateTagRow(
+            name: createCandidate,
+            onCreate: () => _createTag(createCandidate),
+            focusNode: _rowFocus[rowIndex++],
+          ),
+        );
       }
     }
     if (hasFiles) {
       children.add(const _SectionHeader('Files'));
       for (final file in results.files) {
         final index = rowIndex++;
-        children.add(_FileRow(
-          file: file,
-          focusNode: _rowFocus[index],
-          onActivate: () => _openFile(file, restoreIndex: index),
-        ));
+        children.add(
+          _FileRow(
+            file: file,
+            focusNode: _rowFocus[index],
+            onActivate: () => _openFile(file, restoreIndex: index),
+          ),
+        );
       }
     }
     return CallbackShortcuts(
@@ -589,12 +588,12 @@ class _SearchBar extends StatelessWidget {
                 ),
               )
             : (controller.text.isEmpty
-                ? null
-                : IconButton(
-                    icon: const Icon(Icons.clear),
-                    tooltip: 'Clear',
-                    onPressed: () => controller.clear(),
-                  )),
+                  ? null
+                  : IconButton(
+                      icon: const Icon(Icons.clear),
+                      tooltip: 'Clear',
+                      onPressed: () => controller.clear(),
+                    )),
       ),
     );
   }
@@ -892,9 +891,9 @@ class _PurgePreviewsButtonState extends State<_PurgePreviewsButton> {
     try {
       final purged = await session.app.purgePreviews();
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Purged $purged cached previews')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Purged $purged cached previews')));
     } catch (error) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(

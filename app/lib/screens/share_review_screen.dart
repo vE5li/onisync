@@ -63,8 +63,9 @@ class _ShareReviewScreenState extends State<ShareReviewScreen> {
       return;
     }
     if (!mounted) return;
-    final available =
-        all.tags.where((t) => !_selected.containsKey(t.tagId)).toList();
+    final available = all.tags
+        .where((t) => !_selected.containsKey(t.tagId))
+        .toList();
 
     final chosen = await showModalBottomSheet<onisync.TagEntry>(
       context: context,
@@ -165,7 +166,9 @@ class _ShareReviewScreenState extends State<ShareReviewScreen> {
 
   void _snack(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   @override
@@ -174,7 +177,9 @@ class _ShareReviewScreenState extends State<ShareReviewScreen> {
     final multiple = widget.paths.length > 1;
     return Scaffold(
       appBar: AppBar(
-        title: Text(multiple ? 'Share ${widget.paths.length} files' : 'Share file'),
+        title: Text(
+          multiple ? 'Share ${widget.paths.length} files' : 'Share file',
+        ),
       ),
       body: ListView(
         padding: const EdgeInsets.symmetric(vertical: 8),
@@ -213,8 +218,9 @@ class _ShareReviewScreenState extends State<ShareReviewScreen> {
                       for (final tag in _selected.values)
                         TagChip(
                           tag: tag,
-                          onDeleted:
-                              _uploading ? null : () => _removeTag(tag.tagId),
+                          onDeleted: _uploading
+                              ? null
+                              : () => _removeTag(tag.tagId),
                         ),
                     ],
                   ),

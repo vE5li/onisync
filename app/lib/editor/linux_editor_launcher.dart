@@ -105,7 +105,9 @@ class LinuxEditorLauncher implements EditorLauncher {
       // slice of stderr so the user can see why (e.g. GIMP printing a
       // display error). Trim to keep the snackbar short.
       final stderr = result.stderr.toString().trim();
-      final tail = stderr.length > 200 ? '${stderr.substring(0, 200)}…' : stderr;
+      final tail = stderr.length > 200
+          ? '${stderr.substring(0, 200)}…'
+          : stderr;
       throw EditorLaunchException(
         'editor "${argv[0]}" exited with code ${result.exitCode}'
         '${tail.isEmpty ? '' : ': $tail'}',

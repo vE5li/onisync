@@ -108,10 +108,12 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
       // would do.
       final relatedIds = {...parents, ...subtags};
       final relatedEntries = await Future.wait(
-        relatedIds.map((id) => _app.getTagEntry(
-              tagId: id,
-              deletedRule: onisync.DeletedRule.exclude,
-            )),
+        relatedIds.map(
+          (id) => _app.getTagEntry(
+            tagId: id,
+            deletedRule: onisync.DeletedRule.exclude,
+          ),
+        ),
       );
       if (!mounted) return;
       setState(() {
@@ -161,9 +163,9 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
       // Live update flows in via the change stream.
     } catch (error) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to rename tag: $error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Failed to rename tag: $error')));
     }
   }
 
@@ -179,14 +181,14 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
       await _app.setTagColor(tagId: tag.tagId, color: result);
     } catch (error) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to change color: $error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Failed to change color: $error')));
     }
   }
 
   /// Open a picker of candidate tags (excluding self and any already-related
-   /// ids in [excludeIds]) and return the chosen one, or null on cancel.
+  /// ids in [excludeIds]) and return the chosen one, or null on cancel.
   ///
   /// TODO(perf/UX): this runs an empty `runQuery` to list every tag, purely
   /// to power the picker. Fetched on user tap (not on screen open) so the
@@ -226,7 +228,10 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
           shrinkWrap: true,
           children: [
             ListTile(
-              title: Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
+              title: Text(
+                title,
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
             ),
             for (final tag in candidates)
               ListTile(
@@ -248,10 +253,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
     if (chosen == null) return;
     try {
       // The chosen tag becomes a parent of this tag: parent = chosen, subtag = this.
-      await _app.tagTag(
-        parentId: chosen.tagId,
-        subtagId: widget.tagId,
-      );
+      await _app.tagTag(parentId: chosen.tagId, subtagId: widget.tagId);
       // The change stream drives _load().
     } catch (error) {
       _snack('Failed to add parent: $error');
@@ -266,10 +268,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
     if (chosen == null) return;
     try {
       // The chosen tag becomes a subtag of this tag: parent = this, subtag = chosen.
-      await _app.tagTag(
-        parentId: widget.tagId,
-        subtagId: chosen.tagId,
-      );
+      await _app.tagTag(parentId: widget.tagId, subtagId: chosen.tagId);
     } catch (error) {
       _snack('Failed to add subtag: $error');
     }
@@ -277,10 +276,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
 
   Future<void> _removeParent(String parentId) async {
     try {
-      await _app.untagTag(
-        parentId: parentId,
-        subtagId: widget.tagId,
-      );
+      await _app.untagTag(parentId: parentId, subtagId: widget.tagId);
     } catch (error) {
       _snack('Failed to remove parent: $error');
     }
@@ -293,20 +289,14 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => TagDetailScreen(
-          session: widget.session,
-          tagId: tagId,
-        ),
+        builder: (_) => TagDetailScreen(session: widget.session, tagId: tagId),
       ),
     );
   }
 
   Future<void> _removeSubtag(String subtagId) async {
     try {
-      await _app.untagTag(
-        parentId: widget.tagId,
-        subtagId: subtagId,
-      );
+      await _app.untagTag(parentId: widget.tagId, subtagId: subtagId);
     } catch (error) {
       _snack('Failed to remove subtag: $error');
     }
@@ -314,7 +304,9 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
 
   void _snack(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   Future<void> _deleteTag() async {
@@ -346,9 +338,9 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
     } catch (error) {
       _deleted = false;
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Failed to delete tag: $error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Failed to delete tag: $error')));
     }
   }
 
@@ -519,9 +511,7 @@ class _TagsSection extends StatelessWidget {
             Wrap(
               spacing: 8,
               runSpacing: 8,
-              children: [
-                for (final tagId in tagIds) _chipFor(tagId),
-              ],
+              children: [for (final tagId in tagIds) _chipFor(tagId)],
             ),
         ],
       ),
@@ -557,8 +547,9 @@ class _RenameTagDialog extends StatefulWidget {
 }
 
 class _RenameTagDialogState extends State<_RenameTagDialog> {
-  late final TextEditingController _controller =
-      TextEditingController(text: widget.initial);
+  late final TextEditingController _controller = TextEditingController(
+    text: widget.initial,
+  );
 
   @override
   void dispose() {
@@ -601,8 +592,9 @@ class _RecolorTagDialog extends StatefulWidget {
 }
 
 class _RecolorTagDialogState extends State<_RecolorTagDialog> {
-  late final TextEditingController _controller =
-      TextEditingController(text: widget.initial);
+  late final TextEditingController _controller = TextEditingController(
+    text: widget.initial,
+  );
 
   @override
   void initState() {
@@ -679,8 +671,8 @@ class _RecolorTagDialogState extends State<_RecolorTagDialog> {
                   },
                   child: TagColorSwatch(
                     color: color,
-                    selected: normalized != null &&
-                        color.toUpperCase() == normalized,
+                    selected:
+                        normalized != null && color.toUpperCase() == normalized,
                   ),
                 ),
             ],

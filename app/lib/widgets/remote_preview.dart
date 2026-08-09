@@ -109,10 +109,7 @@ class _RemotePreviewState extends State<RemotePreview> {
           padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
           child: SizedBox(
             width: double.infinity,
-            child: Image.memory(
-              bytes,
-              fit: BoxFit.contain,
-            ),
+            child: Image.memory(bytes, fit: BoxFit.contain),
           ),
         );
       case onisync.PreviewKind.text:

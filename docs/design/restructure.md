@@ -894,11 +894,22 @@ cargo test --workspace                # baseline: 204 pass, 0.92s
 cargo check -p onisyncd --no-default-features   # the preview-generation gate
 ```
 
-For anything touching `onisync-bridge` or the FFI surface:
+For anything touching Dart:
+
+```
+jj file list | rg '\.dart$' | xargs dart format
+cd app && flutter analyze && flutter test
+```
+
+The tracked Dart sources are `dart format`-clean against the Flutter SDK pinned
+in `flake.nix`; keep them that way so a formatting pass never lands inside a
+behavior change. Format only tracked files — `app/lib/rust/` is codegen output
+and is gitignored.
+
+For anything touching `onisync-bridge` or the FFI surface, also:
 
 ```
 nix run .#codegen
-cd app && flutter analyze && flutter test
 ```
 
 Rules of engagement:
@@ -949,8 +960,3 @@ Identified during analysis, not scheduled:
   it, so every screen's change-stream loop reloads its entire state on *any*
   change anywhere. Mirroring it would let a screen filter by the affected
   file/tag id. Same treatment as `ApiError` in 0.6.
-- **The Dart tree is not `dart format`-clean** against the SDK pinned in
-  `flake.nix` (Flutter 3.41.9). Running `dart format` on a screen reflows
-  20–100 unrelated lines, which buries real changes in review noise. Either
-  reformat the whole tree once, in its own commit, or add a CI check — but do
-  not let it happen incidentally inside a behaviour change.
