@@ -1,0 +1,20 @@
+{
+  "sync_directories": [
+    {
+      "path": "$DOCUMENTS/phone",
+      "sync_type": { "TagBased": { "tags": ["467f35d7ae6f4dffb72905ff2bc743c5", "6450a8fe6eb945cc8b40adf4b97408bd"] } }
+    },
+    {
+      "path": "$DOCUMENTS/audiobooks",
+      "sync_type": { "TagBased": { "tags": ["b053c022c8a6432eb88acb0452abceb2"] } }
+    }
+  ],
+  "listen_port": null,
+  "peers": [
+    {
+      "address": ["192.168.188.10", 3468],
+      "name": "central",
+      "public_key": "AYWQNMCy5y20bjB1oxU79x5fUYQI4CGPbsqk7N+Qrgs="
+    }
+  ]
+}

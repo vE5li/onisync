@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Adaptive launcher-icon background for tagsy. -->
-    <color name="ic_launcher_background">#FFFFFF</color>
+    <!-- Adaptive launcher-icon background for tagsy: the yellow from
+         icon/icon.png, so the transparent-background foreground (the taxi)
+         composites over it. Keep in sync with the source art. -->
+    <color name="ic_launcher_background">#FFCA2F</color>
 </resources>

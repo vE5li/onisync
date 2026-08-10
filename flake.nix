@@ -212,35 +212,82 @@
           ${buildNativeForAbisBody}
         '';
 
-        # Regenerate the legacy square launcher icons (mipmap-*/ic_launcher.png)
-        # from icon/icon.png. These are the pre-Android-8 raster icons; each
-        # density just needs icon.png downscaled to its px size. The adaptive
-        # icon (mipmap-anydpi-v26 + drawable*/ic_launcher_foreground) is a
-        # separate hand-authored vector glyph and is intentionally NOT touched
-        # here. `magick` is referenced by absolute store path (like git/adb
-        # elsewhere) so it doesn't have to be added to every app's PATH.
+        # Regenerate ALL of the app's Android launcher icons from the source art
+        # in icon/. Two independent icon systems must be kept in sync, and this
+        # is what a modern phone (Android 8+) actually renders:
+        #
+        #   1. Legacy square icons  mipmap-*/ic_launcher.png
+        #      Pre-Android-8 raster icons; just icon/icon.png downscaled per
+        #      density. Ignored by adaptive-icon launchers but still needed for
+        #      old devices and some surfaces.
+        #
+        #   2. Adaptive icon        mipmap-anydpi-v26/ic_launcher{,_round}.xml
+        #      What Android 8+ launchers show. It composites a *background*
+        #      (a flat colour, @color/ic_launcher_background) with a *foreground*
+        #      (drawable-*/ic_launcher_foreground.png), then applies the
+        #      launcher's mask (circle/squircle/...). The foreground is derived
+        #      from icon/foreground.png (the taxi ONLY, transparent background)
+        #      so the yellow shows through as the adaptive background instead of
+        #      being baked in — this is why replacing icon.png alone left the old
+        #      icon on the phone: the foreground came from a stale hand-authored
+        #      vector (drawable/ic_launcher_foreground.xml), which the icon setup
+        #      script now removes so these PNGs win.
+        #
+        # `magick` is referenced by absolute store path (like git/adb elsewhere)
+        # so it doesn't have to be added to every app's PATH.
+        #
+        # If you re-export foreground.png with real transparent margin baked in
+        # (art within the ~66% safe zone), drop the 16% inset in
+        # ic_launcher.xml so it isn't shrunk twice.
         rebuildAndroidIconsBody = ''
-          src="icon/icon.png"
-          if [ ! -f "$src" ]; then
-            echo "Source icon $src not found." >&2
-            exit 1
-          fi
+          icon="icon/icon.png"
+          fg="icon/foreground.png"
+          for f in "$icon" "$fg"; do
+            if [ ! -f "$f" ]; then
+              echo "Source icon $f not found." >&2
+              exit 1
+            fi
+          done
           res="app/android/app/src/main/res"
-          # density -> launcher icon edge length in px.
-          declare -A sizes=(
+          magick="${pkgs.imagemagick}/bin/magick"
+
+          # (1) Legacy square launcher icons: density -> edge length in px.
+          declare -A mipmapSizes=(
             [mdpi]=48
             [hdpi]=72
             [xhdpi]=96
             [xxhdpi]=144
             [xxxhdpi]=192
           )
-          for density in "''${!sizes[@]}"; do
-            size="''${sizes[$density]}"
+          for density in "''${!mipmapSizes[@]}"; do
+            size="''${mipmapSizes[$density]}"
             out="$res/mipmap-$density/ic_launcher.png"
             echo "Generating $out (''${size}x''${size})"
-            "${pkgs.imagemagick}/bin/magick" "$src" \
-              -resize "''${size}x''${size}" "$out"
+            "$magick" "$icon" -resize "''${size}x''${size}" "$out"
           done
+
+          # (2) Adaptive-icon foreground: density -> edge length in px. These are
+          # 108dp expressed at each density's dpi (108, 162, 216, 324, 432).
+          declare -A fgSizes=(
+            [mdpi]=108
+            [hdpi]=162
+            [xhdpi]=216
+            [xxhdpi]=324
+            [xxxhdpi]=432
+          )
+          for density in "''${!fgSizes[@]}"; do
+            size="''${fgSizes[$density]}"
+            out="$res/drawable-$density/ic_launcher_foreground.png"
+            echo "Generating $out (''${size}x''${size})"
+            "$magick" "$fg" -resize "''${size}x''${size}" "$out"
+          done
+
+          # The stale hand-authored foreground vector would otherwise shadow the
+          # raster PNGs above (Android prefers drawable/ over drawable-<dpi>/).
+          rm -f "$res/drawable/ic_launcher_foreground.xml"
+
+          echo "Icons rebuilt. Background colour is @color/ic_launcher_background"
+          echo "in $res/values/colors.xml — keep it matching icon/icon.png."
         '';
 
         # Resolve the target android device AND its ABI. Flutter's `-d` matches a
@@ -389,9 +436,11 @@
           # Individual build step, exposed for manual use / overriding ABIs
           # (defaults to arm64-v8a; set ONISYNC_ANDROID_ABIS for a release build).
           build-native-android = buildNativeAndroidBody;
-          # Regenerate the legacy square launcher icons under
-          # app/android/app/src/main/res/mipmap-*/ic_launcher.png from
-          # icon/icon.png. Run after changing the source icon; commit the result.
+          # Regenerate all Android launcher icons from icon/icon.png (legacy
+          # square mipmaps) and icon/foreground.png (adaptive-icon foreground).
+          # Run after changing the source art; commit the result. If you change
+          # the icon's background colour, also update ic_launcher_background in
+          # app/android/app/src/main/res/values/colors.xml.
           rebuild-android-icons = rebuildAndroidIconsBody;
 
           # Full build-and-run: regenerate bindings, then launch (the native
