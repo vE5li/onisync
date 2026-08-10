@@ -1,5 +1,5 @@
 // Android launcher: fire `ACTION_EDIT` for a FileProvider URI and wait for
-// the user to return to onisync.
+// the user to return to tagsy.
 //
 // Two Android-specific problems this solves:
 //
@@ -15,7 +15,7 @@
 //      count on is "MainActivity resumed after we launched", which the
 //      Kotlin side surfaces via the `editorReturned` MethodChannel event.
 //      First `onResume` after launch wins; if the user got distracted (task
-//      switcher, notification) and hit onisync's icon without ever opening
+//      switcher, notification) and hit tagsy's icon without ever opening
 //      the editor, we still hand the path to `finishEdit`, which
 //      re-hashes and no-ops when nothing changed.
 //
@@ -26,15 +26,15 @@ import 'dart:async';
 
 import 'package:flutter/services.dart';
 
-import '../rust/api.dart' as onisync;
+import '../rust/api.dart' as tagsy;
 import 'editor_launcher.dart';
 
 /// The MethodChannel name matches the Kotlin side (`EditorChannel.kt`).
 ///
-/// Kept separate from the existing `onisync_app/config` channel so the two
+/// Kept separate from the existing `tagsy_app/config` channel so the two
 /// concerns stay independent — `config` is startup-only, `editor` is
 /// per-edit and has state (the pending edit's completer).
-const _channel = MethodChannel('onisync_app/editor');
+const _channel = MethodChannel('tagsy_app/editor');
 
 class AndroidEditorLauncher implements EditorLauncher {
   AndroidEditorLauncher() {
@@ -56,7 +56,7 @@ class AndroidEditorLauncher implements EditorLauncher {
     required String path,
     required String logicalName,
     required List<String> appliedTagIds,
-    required List<onisync.EditorRuleEntry> rules,
+    required List<tagsy.EditorRuleEntry> rules,
   }) async {
     // Rules exist for the Linux CLI-style "run this argv" model. Android's
     // dispatch is by MIME, resolved by the OS from the picker the user sees;

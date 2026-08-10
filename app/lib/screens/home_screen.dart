@@ -19,7 +19,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../bootstrap/bootstrap.dart';
-import '../rust/api.dart' as onisync;
+import '../rust/api.dart' as tagsy;
 import '../widgets/tag_chip.dart';
 import 'file_detail_screen.dart';
 import 'operations_screen.dart';
@@ -28,7 +28,7 @@ import 'tag_detail_screen.dart';
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key, required this.session});
 
-  final OniSyncSession? session;
+  final TagsySession? session;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -53,12 +53,12 @@ class _HomeScreenState extends State<HomeScreen> {
   int _queryEpoch = 0;
 
   /// Latest result to render. Null until the user runs a query.
-  onisync.QueryEntries? _results;
+  tagsy.QueryEntries? _results;
   String? _error;
   bool _loading = false;
 
   /// When true, the search runs against soft-deleted (tombstoned) files and
-  /// tags instead of live ones — see [onisync.DeletedRule]. Toggled by the
+  /// tags instead of live ones — see [tagsy.DeletedRule]. Toggled by the
   /// small button next to the search field. Off by default: the standard
   /// search only ever shows live rows.
   bool _showDeleted = false;
@@ -167,10 +167,10 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       final result = await session.app.runQuery(
         query: _query.text,
-        subtagRule: onisync.SubtagRule.include,
+        subtagRule: tagsy.SubtagRule.include,
         deletedRule: _showDeleted
-            ? onisync.DeletedRule.include
-            : onisync.DeletedRule.exclude,
+            ? tagsy.DeletedRule.include
+            : tagsy.DeletedRule.exclude,
       );
       if (!mounted || epoch != _queryEpoch) return;
       setState(() {
@@ -184,11 +184,11 @@ class _HomeScreenState extends State<HomeScreen> {
       // as "no matches" so the UI doesn't flash red at every keystroke. Other
       // errors (transport, etc.) still surface.
       final looksLikeUnresolved =
-          error is onisync.ApiError_UnknownId ||
-          error is onisync.ApiError_AmbiguousId;
+          error is tagsy.ApiError_UnknownId ||
+          error is tagsy.ApiError_AmbiguousId;
       setState(() {
         if (looksLikeUnresolved) {
-          _results = const onisync.QueryEntries(files: [], tags: []);
+          _results = const tagsy.QueryEntries(files: [], tags: []);
           _error = null;
         } else {
           _error = '$error';
@@ -321,7 +321,7 @@ class _HomeScreenState extends State<HomeScreen> {
   /// the row the user came from so keyboard navigation resumes where it
   /// left off.
   Future<void> _openTag(
-    onisync.TagEntry tag, {
+    tagsy.TagEntry tag, {
     required int restoreIndex,
   }) async {
     // Drop focus before pushing so Flutter's automatic focus restoration
@@ -341,7 +341,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   /// See [_openTag].
   Future<void> _openFile(
-    onisync.FileEntry file, {
+    tagsy.FileEntry file, {
     required int restoreIndex,
   }) async {
     FocusManager.instance.primaryFocus?.unfocus();
@@ -394,7 +394,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (session == null) return;
     try {
       // Pass an empty color; the engine substitutes its default palette entry
-      // (see onisyncd::api::create_tag). The user can recolor via the tag
+      // (see tagsyd::api::create_tag). The user can recolor via the tag
       // detail screen.
       await session.app.createTag(name: name, color: '');
       // The change stream will re-run the current query and the new tag will
@@ -412,7 +412,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final publicKey = widget.session?.publicKey;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('OniSync'),
+        title: const Text('Tagsy'),
         actions: [
           // Toggle: search live vs. tombstoned rows. When on, the daemon
           // returns only soft-deleted files/tags for the same query text;
@@ -626,7 +626,7 @@ class _TagRow extends StatelessWidget {
     required this.onActivate,
   });
 
-  final onisync.TagEntry tag;
+  final tagsy.TagEntry tag;
 
   /// Stable state-owned focus node for this row's slot in the list. See
   /// [_HomeScreenState._rowFocus] for why every row needs one.
@@ -691,7 +691,7 @@ class _FileRow extends StatelessWidget {
     required this.onActivate,
   });
 
-  final onisync.FileEntry file;
+  final tagsy.FileEntry file;
 
   /// See [_TagRow.focusNode].
   final FocusNode focusNode;
@@ -725,7 +725,7 @@ class _FileRow extends StatelessWidget {
 class _OperationsButton extends StatefulWidget {
   const _OperationsButton({required this.session});
 
-  final OniSyncSession? session;
+  final TagsySession? session;
 
   @override
   State<_OperationsButton> createState() => _OperationsButtonState();
@@ -734,7 +734,7 @@ class _OperationsButton extends StatefulWidget {
 class _OperationsButtonState extends State<_OperationsButton> {
   /// Currently-active operations, keyed by id. Includes steady-state
   /// peer-connection rows (see [_countsAsWork]).
-  final Map<BigInt, onisync.OperationEntry> _working = {};
+  final Map<BigInt, tagsy.OperationEntry> _working = {};
 
   bool _watching = false;
 
@@ -760,11 +760,11 @@ class _OperationsButtonState extends State<_OperationsButton> {
 
   /// Whether an operation should count toward the badge: any active operation
   /// (including steady-state peer connections).
-  static bool _countsAsWork(onisync.OperationEntry op) {
-    return op.status is onisync.OperationStatusDto_Active;
+  static bool _countsAsWork(tagsy.OperationEntry op) {
+    return op.status is tagsy.OperationStatusDto_Active;
   }
 
-  void _apply(onisync.OperationEntry op) {
+  void _apply(tagsy.OperationEntry op) {
     if (_countsAsWork(op)) {
       _working[op.id] = op;
     } else {
@@ -794,7 +794,7 @@ class _OperationsButtonState extends State<_OperationsButton> {
         if (update == null) break;
         if (!mounted) break;
         switch (update) {
-          case onisync.OperationUpdateDto_Resynced():
+          case tagsy.OperationUpdateDto_Resynced():
             final refreshed = await session.app.listOperations();
             if (!mounted) break;
             setState(() {
@@ -803,9 +803,9 @@ class _OperationsButtonState extends State<_OperationsButton> {
                 _apply(op);
               }
             });
-          case onisync.OperationUpdateDto_Started(:final operation):
+          case tagsy.OperationUpdateDto_Started(:final operation):
             setState(() => _apply(operation));
-          case onisync.OperationUpdateDto_Updated(:final operation):
+          case tagsy.OperationUpdateDto_Updated(:final operation):
             setState(() => _apply(operation));
         }
       }
@@ -874,7 +874,7 @@ class _OperationsButtonState extends State<_OperationsButton> {
 class _PurgePreviewsButton extends StatefulWidget {
   const _PurgePreviewsButton({required this.session});
 
-  final OniSyncSession? session;
+  final TagsySession? session;
 
   @override
   State<_PurgePreviewsButton> createState() => _PurgePreviewsButtonState();

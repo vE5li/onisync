@@ -14,7 +14,7 @@ import 'package:share_plus/share_plus.dart';
 
 import '../bootstrap/bootstrap.dart';
 import '../editor/editor_launcher.dart';
-import '../rust/api.dart' as onisync;
+import '../rust/api.dart' as tagsy;
 import '../widgets/file_preview.dart';
 import '../widgets/property_tile.dart';
 import '../widgets/remote_preview.dart';
@@ -25,13 +25,13 @@ class FileDetailScreen extends StatefulWidget {
   FileDetailScreen({
     super.key,
     required this.session,
-    required onisync.FileEntry file,
+    required tagsy.FileEntry file,
   }) : fileId = file.fileId;
 
-  final OniSyncSession session;
+  final TagsySession session;
 
   /// The string id of the file to display. The constructor takes a full
-  /// [onisync.FileEntry] for convenience at call sites (list rows already
+  /// [tagsy.FileEntry] for convenience at call sites (list rows already
   /// have one), but the screen retains only its id and refetches the entry
   /// itself so it always reflects the current state of the store.
   final String fileId;
@@ -41,12 +41,12 @@ class FileDetailScreen extends StatefulWidget {
 }
 
 class _FileDetailScreenState extends State<FileDetailScreen> {
-  onisync.FileEntry? _file;
+  tagsy.FileEntry? _file;
 
   /// Tags currently applied to this file, keyed by string id (for name/color
   /// lookup when rendering the chips). Bounded by the number of applied tags,
   /// so we fetch these one-by-one rather than pulling every tag in the store.
-  Map<String, onisync.TagEntry> _appliedTags = {};
+  Map<String, tagsy.TagEntry> _appliedTags = {};
 
   /// The string ids of tags currently applied to this file (direct only).
   List<String> _appliedTagIds = [];
@@ -65,7 +65,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
   bool _downloading = false;
   bool _editing = false;
 
-  onisync.OniSyncApp get _app => widget.session.app;
+  tagsy.TagsyApp get _app => widget.session.app;
 
   @override
   void initState() {
@@ -107,19 +107,19 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
       // tombstoned tag can't be applied to anything.
       final file = await _app.getFileEntry(
         fileId: widget.fileId,
-        deletedRule: onisync.DeletedRule.include,
+        deletedRule: tagsy.DeletedRule.include,
       );
       // Direct tags only (Exclude = no subtag recursion) — these are the ones
       // the user can meaningfully add/remove on this file.
       final applied = await _app.tagIdsForFile(
         fileId: widget.fileId,
-        subtagRule: onisync.SubtagRule.exclude,
+        subtagRule: tagsy.SubtagRule.exclude,
       );
       final entries = await Future.wait(
         applied.map(
           (id) => _app.getTagEntry(
             tagId: id,
-            deletedRule: onisync.DeletedRule.exclude,
+            deletedRule: tagsy.DeletedRule.exclude,
           ),
         ),
       );
@@ -141,7 +141,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
       // rejects with `UnknownId` when the entity is gone; treat that on the
       // file itself as "deleted underneath us" and pop back to the previous
       // route.
-      final isMissing = error is onisync.ApiError_UnknownId;
+      final isMissing = error is tagsy.ApiError_UnknownId;
       setState(() {
         if (isMissing) {
           _file = null;
@@ -193,14 +193,14 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     // whole tag store. Revisit — the right shape is likely a small
     // search-in-picker that calls `runQuery` per keystroke, matching the home
     // screen's model. Same TODO applies to TagDetailScreen._pickTag.
-    final onisync.QueryEntries all;
+    final tagsy.QueryEntries all;
     try {
       // Tag-picker sheets only surface live tags — you can't apply a
       // tombstoned tag to a file.
       all = await _app.runQuery(
         query: '',
-        subtagRule: onisync.SubtagRule.include,
-        deletedRule: onisync.DeletedRule.exclude,
+        subtagRule: tagsy.SubtagRule.include,
+        deletedRule: tagsy.DeletedRule.exclude,
       );
     } catch (error) {
       _snack('Failed to load tags: $error');
@@ -215,7 +215,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
       _snack('No more tags to add.');
       return;
     }
-    final chosen = await showModalBottomSheet<onisync.TagEntry>(
+    final chosen = await showModalBottomSheet<tagsy.TagEntry>(
       context: context,
       builder: (_) => SafeArea(
         child: ListView(
@@ -295,7 +295,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
       if (!mounted) return;
       // `ContentUnavailable` means no source still holds the bytes — the
       // best-effort restore failed and the file remains deleted.
-      final message = error is onisync.ApiError_ContentUnavailable
+      final message = error is tagsy.ApiError_ContentUnavailable
           ? 'Cannot restore: the file\'s contents are no longer available on '
                 'any device.'
           : 'Failed to restore file: $error';
@@ -339,7 +339,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
       }
       await Share.shareXFiles([XFile(path, name: name)]);
     } catch (error) {
-      final message = error is onisync.ApiError_ContentUnavailable
+      final message = error is tagsy.ApiError_ContentUnavailable
           ? 'Cannot share: the file\'s contents are not available on any '
                 'device.'
           : 'Failed to share file: $error';
@@ -360,7 +360,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
   }
 
   /// Copy this file into the device's public Downloads directory (Android only
-  /// — the button is gated on the mobile-only [OniSyncSession.downloadsDir]).
+  /// — the button is gated on the mobile-only [TagsySession.downloadsDir]).
   ///
   /// A locally-held copy is copied out (the original stays in its sync
   /// directory). A file not present locally is fetched to a daemon-owned temp
@@ -410,7 +410,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
       }
       _snack('Saved "${dest.split('/').last}" to Downloads.');
     } catch (error) {
-      final message = error is onisync.ApiError_ContentUnavailable
+      final message = error is tagsy.ApiError_ContentUnavailable
           ? 'Cannot download: the file\'s contents are not available on any '
                 'device.'
           : 'Failed to download file: $error';
@@ -744,7 +744,7 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
   ///   peer — so there's still something to show without pulling the whole file.
   ///
   /// Preview height is bounded so it never crowds out the tags/properties.
-  Widget _buildPreview(BuildContext context, onisync.FileEntry file) {
+  Widget _buildPreview(BuildContext context, tagsy.FileEntry file) {
     final theme = Theme.of(context);
     final path = _localPath;
     final header = Padding(

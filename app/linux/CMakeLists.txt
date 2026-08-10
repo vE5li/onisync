@@ -4,10 +4,10 @@ project(runner LANGUAGES CXX)
 
 # The name of the executable created for the application. Change this to change
 # the on-disk name of your application.
-set(BINARY_NAME "onisync_app")
+set(BINARY_NAME "tagsy_app")
 # The unique GTK application identifier for this application. See:
 # https://wiki.gnome.org/HowDoI/ChooseApplicationID
-set(APPLICATION_ID "com.example.onisync_app")
+set(APPLICATION_ID "com.example.tagsy_app")
 
 # Explicitly opt in to modern CMake behaviors to avoid warnings with recent
 # versions of CMake.
@@ -54,11 +54,11 @@ add_subdirectory(${FLUTTER_MANAGED_DIR})
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GTK REQUIRED IMPORTED_TARGET gtk+-3.0)
 
-# === onisync native bridge (flutter_rust_bridge, plan section 6) ===
+# === tagsy native bridge (flutter_rust_bridge, plan section 6) ===
 #
-# On Android `cargo-ndk` cross-compiles libonisync_bridge.so into jniLibs/. There
+# On Android `cargo-ndk` cross-compiles libtagsy_bridge.so into jniLibs/. There
 # is no such step for the Linux desktop bundle, so build it here: compile the
-# `onisync-bridge` cdylib with Cargo and bundle the resulting .so next to the
+# `tagsy-bridge` cdylib with Cargo and bundle the resulting .so next to the
 # runner (installed into lib/, found at runtime via the $ORIGIN/lib RPATH set
 # above). RustLib.init() then dlopen()s it by name.
 #
@@ -67,12 +67,12 @@ get_filename_component(ONISYNC_WORKSPACE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..
 
 # Cargo's release output for the bridge cdylib.
 set(ONISYNC_BRIDGE_SO
-  "${ONISYNC_WORKSPACE_ROOT}/target/release/libonisync_bridge.so")
+  "${ONISYNC_WORKSPACE_ROOT}/target/release/libtagsy_bridge.so")
 
 # Build the bridge with the `generated` feature (the frb glue module) turned on,
 # matching flutter_rust_bridge.yaml's rust_features.
 #
-# Cargo must run on EVERY build so Rust source changes (e.g. to the `onisync`
+# Cargo must run on EVERY build so Rust source changes (e.g. to the `tagsy`
 # core linked into this cdylib) are picked up. A naive
 # `add_custom_command(OUTPUT ${ONISYNC_BRIDGE_SO} ...)` does NOT achieve this:
 # once the .so exists and no *declared* dependency changed, CMake considers the
@@ -81,12 +81,12 @@ set(ONISYNC_BRIDGE_SO
 # Cargo's own incremental compilation make the no-change case cheap. The command
 # also `touch`es a stamp so the install step below has a concrete file to depend
 # on if needed.
-add_custom_target(onisync_bridge ALL
+add_custom_target(tagsy_bridge ALL
   BYPRODUCTS "${ONISYNC_BRIDGE_SO}"
   COMMAND ${CMAKE_COMMAND} -E env cargo build --release
-          -p onisync-bridge --features generated
+          -p tagsy-bridge --features generated
   WORKING_DIRECTORY "${ONISYNC_WORKSPACE_ROOT}"
-  COMMENT "Building libonisync_bridge.so (onisync-bridge cdylib)"
+  COMMENT "Building libtagsy_bridge.so (tagsy-bridge cdylib)"
   VERBATIM
   USES_TERMINAL
 )
@@ -95,7 +95,7 @@ add_custom_target(onisync_bridge ALL
 add_subdirectory("runner")
 
 # The runner must not link/launch before the bridge .so exists.
-add_dependencies(${BINARY_NAME} onisync_bridge)
+add_dependencies(${BINARY_NAME} tagsy_bridge)
 
 # Run the Flutter tool portions of the build. This must not be removed.
 add_dependencies(${BINARY_NAME} flutter_assemble)
@@ -146,8 +146,8 @@ foreach(bundled_library ${PLUGIN_BUNDLED_LIBRARIES})
     COMPONENT Runtime)
 endforeach(bundled_library)
 
-# Bundle the onisync native bridge .so so RustLib.init() can dlopen it via the
-# $ORIGIN/lib RPATH (see the "onisync native bridge" section above).
+# Bundle the tagsy native bridge .so so RustLib.init() can dlopen it via the
+# $ORIGIN/lib RPATH (see the "tagsy native bridge" section above).
 install(FILES "${ONISYNC_BRIDGE_SO}"
   DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
   COMPONENT Runtime)

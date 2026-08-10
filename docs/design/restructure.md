@@ -18,10 +18,10 @@ The tree grew by expansion rather than design. Four files carry most of it:
 
 | File | Lines | Tests | Largest item |
 |---|---|---|---|
-| `onisyncd/src/lib.rs` | 6511 | 1013 | `handle_changes` — 2242 lines, one `async fn` |
-| `onisyncd/src/database.rs` | 4482 | 1633 | `impl FileDatabase` — 2205 lines, 65 methods |
-| `onisyncd/src/directory_manager.rs` | 2655 | 815 | `handle_command` 411 + `handle_event` 266 |
-| `onisyncd/src/api.rs` | 1768 | 259 | `impl Api` 1019 + `mod chunk` 508 |
+| `tagsyd/src/lib.rs` | 6511 | 1013 | `handle_changes` — 2242 lines, one `async fn` |
+| `tagsyd/src/database.rs` | 4482 | 1633 | `impl FileDatabase` — 2205 lines, 65 methods |
+| `tagsyd/src/directory_manager.rs` | 2655 | 815 | `handle_command` 411 + `handle_event` 266 |
+| `tagsyd/src/api.rs` | 1768 | 259 | `impl Api` 1019 + `mod chunk` 508 |
 
 The design underneath is sound — it is a message-passing actor system with a
 ports-and-adapters frontend — but the flat `mod` list in `lib.rs` hides it, and
@@ -88,10 +88,10 @@ kernels as their own modules makes that split visible.
                         (filesystem + indexes)    (sockets) ──> relays
 ```
 
-## Target module layout — `onisyncd`
+## Target module layout — `tagsyd`
 
 ```
-onisyncd/src/
+tagsyd/src/
   lib.rs              ~250 lines: mod decls, run(), ShutdownSignal, RunError
 
   store/                          # was database.rs (4482)
@@ -176,21 +176,21 @@ onisyncd/src/
 ## Target crate graph
 
 ```
-onisync-core     ids, LogicalPath/PhysicalPath, wire protocol, Preview, FileInfo
+tagsy-core     ids, LogicalPath/PhysicalPath, wire protocol, Preview, FileInfo
     ▲
-onisync-api      THE PORT: Backend trait, ApiError, and every DTO crossing it
+tagsy-api      THE PORT: Backend trait, ApiError, and every DTO crossing it
                  (Tag, DeletedRule, SubtagRule, SearchResults, EditOutcome,
                   ApiEvent, EditorRule, RetagSummary, TagRuleReport, Operation*)
     ▲
-onisync-ipc      ControlRequest/Response/Frame + codec + IpcBackend (client)
+tagsy-ipc      ControlRequest/Response/Frame + codec + IpcBackend (client)
     ▲                          ▲
-onisync (CLI) ────┘            │
-                          onisyncd  (server half + everything above)
+tagsy (CLI) ────┘            │
+                          tagsyd  (server half + everything above)
                                ▲
-                          onisync-bridge
+                          tagsy-bridge
 ```
 
-Today `onisync` (the CLI) depends on `onisyncd`, which — because
+Today `tagsy` (the CLI) depends on `tagsyd`, which — because
 `preview-generation` is a default feature — makes building the CLI compile
 `rusqlite`, `tokio-tungstenite`, `image`, `infer`, and `pdfium-render`. Nothing
 structurally prevents the CLI from opening the database behind the daemon's
@@ -201,10 +201,10 @@ back.
 ```
 app/lib/
   main.dart
-  shell/            OniSyncAppRoot, global keys, Ctrl+C handler, message host
-  session/          OniSyncSession   (out of bootstrap/ — every screen imports it)
+  shell/            TagsyAppRoot, global keys, Ctrl+C handler, message host
+  session/          TagsySession   (out of bootstrap/ — every screen imports it)
   data/
-    repository.dart replaces onisync_service.dart
+    repository.dart replaces tagsy_service.dart
   bootstrap/        unchanged
   features/
     search/         home_screen + _SearchBar/_TagRow/_FileRow/_SectionHeader
@@ -244,7 +244,7 @@ cite it.
 | `InProcessBackend` / `IpcClientBackend` | `LocalBackend` / `IpcBackend` | |
 | `EntryType` | **delete**, use `core::state::RelationshipKind` | Identical two-variant enum; `database.rs:273–289` carries `From` impls in both directions purely to translate between two names for the same thing. Move `ToSql`/`FromSql` onto `RelationshipKind`, drop four impl blocks. |
 | `QueryEntries` (bridge) / `QueryResult` (api) | `SearchResults` on both | Same payload, two names. Also aligns with the CLI's `search` subcommand and the UI's search box; `run_query` becomes `search`. |
-| Rust `OniSyncApp` (bridge opaque) | `OniSync` | Collides with the Flutter widget `OniSyncApp` in `app/lib/app.dart`; both are in scope in `file_detail_screen.dart`, disambiguated only by import prefix. The bridge type is an API handle, not an app. |
+| Rust `TagsyApp` (bridge opaque) | `Tagsy` | Collides with the Flutter widget `TagsyApp` in `app/lib/app.dart`; both are in scope in `file_detail_screen.dart`, disambiguated only by import prefix. The bridge type is an API handle, not an app. |
 
 ## Vague words — pattern names instead of responsibilities
 
@@ -265,7 +265,7 @@ cite it.
 | `Paths` | `StorageLayout` | Not a generic path utility — specifically *this device's* storage locations. |
 | `initial_sync_tagged` | `initial_sync_tag_based` | The enum variant is `SyncType::TagBased`; two words for one policy makes the dispatch read as if they differ. |
 | `SpecialType { Upload, Copy }` | **delete** | Declared in `configuration.rs:66`, referenced nowhere. |
-| Dart `onisync_service.dart` | **delete** (see 0.7) | "Service" means nothing, and it is an extension, not a service. |
+| Dart `tagsy_service.dart` | **delete** (see 0.7) | "Service" means nothing, and it is an extension, not a service. |
 | Dart `_watch()` (×4 screens) | `_subscribeToChanges()` | Reads like a getter; opens a lifetime-scoped stream subscription. |
 
 ## Spelling
@@ -324,7 +324,7 @@ found nothing else.
 
 - **Why** Mismatch with `SyncType::TagBased`.
 - **Change** Rename in `directory_manager.rs` (2 sites).
-- **Verify** `cargo check -p onisyncd`
+- **Verify** `cargo check -p tagsyd`
 - **Depends on** —
 
 ### 0.4 — Delete `SpecialType` — **S** — **DONE**
@@ -339,10 +339,10 @@ found nothing else.
 - **Why** Two names for one two-variant enum, with `From` impls both ways
   (`database.rs:248–289`) purely to translate between them.
 - **Change** Move the `ToSql`/`FromSql` impls onto
-  `onisync_core::state::RelationshipKind`. Delete `EntryType` and its four impl
+  `tagsy_core::state::RelationshipKind`. Delete `EntryType` and its four impl
   blocks. Update `entries.rs` call sites (the table name `entries_v1` is
   unchanged).
-- **Note** `onisync-core` already depends on `rusqlite`, so this adds no
+- **Note** `tagsy-core` already depends on `rusqlite`, so this adds no
   dependency.
 - **Verify** `cargo test --workspace`
 - **Depends on** —
@@ -384,7 +384,7 @@ found nothing else.
   a file whose peer is offline (expect "Preview unavailable").
 - **Depends on** —
 
-### 0.7 — Drop `_by_string` / `_string`, delete `onisync_service.dart` — **M** — **DONE**
+### 0.7 — Drop `_by_string` / `_string`, delete `tagsy_service.dart` — **M** — **DONE**
 
 - **Why** Two suffixes for one concept (`_string` on 3 methods, `_by_string` on
   12) — but the deeper problem is that the suffix marks the *wrong* method as
@@ -392,17 +392,17 @@ found nothing else.
   `FileEntry.fileId` is already a `String`. The opaque `FileId`/`TagId` handles
   taken by six bridge methods (`bridge/api.rs:438, 449, 454, 765, 820, 855, 860`)
   are unusable from Dart except as tokens handed straight back, and
-  `app/lib/onisync_service.dart` (71 lines) exists solely to paper over them.
+  `app/lib/tagsy_service.dart` (71 lines) exists solely to paper over them.
 - **Change** Change those six methods to take `String`. Drop every `_string` /
   `_by_string` suffix (≈15 Rust methods, ≈25 Dart call sites). Delete
-  `app/lib/onisync_service.dart`.
+  `app/lib/tagsy_service.dart`.
 - **Rule to record** *The bridge speaks Dart's types.* `String` in, DTOs out, no
-  Rust handles except genuinely long-lived resources (`OniSync`,
+  Rust handles except genuinely long-lived resources (`Tagsy`,
   subscriptions). If a handle-taking variant must survive, invert the naming:
   `move_file(String)` and `move_file_by_id(FileId)` — never suffix the path
   everyone takes.
 - **Verify** `cargo test --workspace`; `nix run .#codegen`; `flutter analyze`;
-  `rg -n 'ByString|_by_string|_string\b' app/lib onisync-bridge` returns nothing.
+  `rg -n 'ByString|_by_string|_string\b' app/lib tagsy-bridge` returns nothing.
 - **Depends on** — (independent of 0.6, but both need codegen; consider landing
   0.6 first so there is only one codegen churn on `ApiError`)
 
@@ -440,9 +440,9 @@ found nothing else.
 
 ---
 
-## Phase 1 — `store/`
+## Phase 1 — `store/` — **COMPLETE**
 
-### 1.1 — Split `database.rs` into `store/` — **L**
+### 1.1 — Split `database.rs` into `store/` — **L** — **DONE**
 
 - **Why** 4482 lines, 49% one impl block. The seams are unusually clean: seven
   of them are single-table, and the 71 tests already cluster 1:1 onto them.
@@ -469,8 +469,21 @@ found nothing else.
   not persistence.
 - **Verify** `cargo test --workspace` — 204 pass, count unchanged.
 - **Depends on** 0.2, 0.5
+- **As landed** — two deliberate departures from the above:
+  - **No `connection()` accessor.** Rust already lets a descendant module
+    reach a private field of an ancestor's struct, so the per-table modules
+    use `self.connection` directly. A `pub(crate)` accessor would have been
+    *wider* than the private field — crate-visible rather than
+    `store`-subtree-visible — which cuts against the encapsulation this item
+    exists to buy.
+  - **`create_files_v1` (per-directory) → `create_directory_files_v1`.**
+    Both databases' DDL now share one `schema.rs`, where an unprefixed
+    `create_files_v1` would sit beside `migrate_files_to_v2` — which reads
+    the *main* catalog's unrelated `files_v1`. The prefix keeps the two
+    apart; `AGENTS.md` records it as the convention to follow if that table
+    is ever versioned.
 
-### 1.2 — Reconcile `AGENTS.md` with reality — **S**
+### 1.2 — Reconcile `AGENTS.md` with reality — **S** — **DONE**
 
 - **Why** The schema section is now partly wrong, and Phase 1 moves the
   functions it tells you to grep for.
@@ -489,7 +502,7 @@ found nothing else.
 
 ## Phase 2 — Drain the pure logic out of `lib.rs`
 
-### 2.1 — Extract `peer/plan.rs` and `peer/plan_tags.rs` — **M**
+### 2.1 — Extract `peer/plan.rs` and `peer/plan_tags.rs` — **M** — **DONE**
 
 - **Why** The cleanest seam in the file. `reconcile_peer_manifest`
   (`lib.rs:1887–2128`) plus its helpers has **zero `.await`, zero channels, zero
@@ -502,8 +515,17 @@ found nothing else.
   side (2713–2905) into `plan_tags.rs`.
 - **Verify** `cargo test --workspace`; `lib.rs` drops ~600 lines.
 - **Depends on** 0.2
+- **As landed** — `lib.rs` drops 971 lines (more than estimated: the tag-side
+  move carries its own weight, and the two `effective_placement_tags` tests
+  that lived inside `reconcile_tests` moved with the rest of the module,
+  referenced as `crate::effective_placement_tags` since that function stays in
+  `lib.rs` until 2.2). A `peer` module didn't exist yet (Phase 3 hasn't
+  landed), so this item creates `tagsyd/src/peer/mod.rs` declaring just
+  `plan` and `plan_tags`; the session machinery joins them in 3.1. Also
+  dropped a pre-existing broken intra-doc link on `build_tag_request_response`
+  (`[`build_request_response`]` — no such function exists in the tree).
 
-### 2.2 — Extract `catalog/placement.rs` — **M**
+### 2.2 — Extract `catalog/placement.rs` — **M** — **DONE**
 
 - **Why** Highest-value extraction by call count: reached from five arms of
   `handle_changes` (4149, 4346, 5335, 5395) plus `run_peer_session`.
@@ -517,6 +539,21 @@ found nothing else.
   the table. Delete the duplicate in `directory_manager.rs` and import.
 - **Verify** `cargo test --workspace`
 - **Depends on** 2.1
+- **As landed** — `catalog` didn't exist yet (like `peer` in 2.1, it's created
+  ahead of Phase 4 with just `mod.rs` declaring `placement`). Only the lib.rs
+  side of the `reconcile_tag_placement` pair is renamed here, to
+  `plan_placement`; the `directory_manager.rs` one keeps its name until it
+  becomes `apply_placement` in 5.1 (moving both together would conflate this
+  item with that phase's rename). `change_targets` (→ `placements_for`) and
+  `dispatch_content_to_sync_directories` (→ `place_content`) were nested `fn`
+  items inside `handle_changes`; both close over nothing (confirmed by 4.1's
+  own notes), so they lift to module scope with no signature changes — this
+  item does that lift now rather than waiting for 4.1. The two
+  `effective_placement_tags` tests that had temporarily landed in
+  `peer::plan::tests` in 2.1 (referenced via `crate::effective_placement_tags`)
+  moved on to `catalog::placement::tests` with the function; three new tests
+  for `contains_all_tags` were added there too (it had none before, in any of
+  its three call sites). Test count: 204 → 207.
 
 ### 2.3 — Extract `catalog/previews.rs` — **S**
 
@@ -524,7 +561,7 @@ found nothing else.
   rest of `lib.rs` (six items, including a duplicated
   `try_serve_generated_preview` pair at 2453 / 2494).
 - **Change** Move 2240–2507 plus `maybe_eager_preview`.
-- **Verify** `cargo test --workspace`; `cargo check -p onisyncd --no-default-features`
+- **Verify** `cargo test --workspace`; `cargo check -p tagsyd --no-default-features`
 - **Depends on** —
 
 ### 2.4 — Split `preview.rs` into `preview/` — **S**
@@ -619,7 +656,7 @@ found nothing else.
      `CatalogCommand`.
 - **Note** `mod tag_rule_tests` (5851–6511, 15 `#[tokio::test]`) boots the whole
   stack. It uses only `pub`-reachable machinery plus `handle_changes` itself, so
-  it should become an integration test under `onisyncd/tests/`.
+  it should become an integration test under `tagsyd/tests/`.
 - **Verify** `cargo test --workspace` — 204 pass, count unchanged.
 - **Depends on** 1.1, 2.1, 2.2, 2.3, 3.1
 
@@ -628,7 +665,7 @@ found nothing else.
 - **Change** What remains: `ShutdownSignal` (154), `RunError` (188),
   `enqueue_declared_tags` (210), `run` (266), `handle_sync_directories` (2907),
   and the `mod` declarations. Target ~250 lines.
-- **Verify** `cargo test --workspace`; `wc -l onisyncd/src/lib.rs`
+- **Verify** `cargo test --workspace`; `wc -l tagsyd/src/lib.rs`
 - **Depends on** 4.1
 
 ---
@@ -714,7 +751,7 @@ found nothing else.
 - **Why** Three unrelated concerns in one file. `RuntimePeer` /
   `RuntimeConfiguration` (541–592) are mutable session state, not configuration,
   and are the **only** reason `configuration.rs` depends on `crate::bus` and
-  `onisync_core::state::Frame` — extracting them makes the config module a pure
+  `tagsy_core::state::Frame` — extracting them makes the config module a pure
   leaf. The tag-rule engine (192–348) holds a `regex::Regex`, owns 8 of the 13
   tests, and is the cleanest extraction.
 - **Change** `mod.rs` / `tag_rules.rs` / `runtime.rs`.
@@ -779,7 +816,7 @@ found nothing else.
 
 ## Phase 7 — Crate split
 
-### 7.1 — Extract `onisync-api` — **M**
+### 7.1 — Extract `tagsy-api` — **M**
 
 - **Why** `TransportBackend` exists precisely to be the frontend-facing
   contract; putting it inside the daemon crate inverts the dependency. Moving it
@@ -794,20 +831,20 @@ found nothing else.
 - **Verify** `cargo test --workspace`; `nix run .#codegen`
 - **Depends on** 6.4, 0.6
 
-### 7.2 — Extract `onisync-ipc` — **M**
+### 7.2 — Extract `tagsy-ipc` — **M**
 
 - **Change** Protocol types + codec + `IpcBackend` (client) move out;
-  `serve_control` (server) stays in `onisyncd` and depends on the new crate.
+  `serve_control` (server) stays in `tagsyd` and depends on the new crate.
 - **Verify** `cargo test --workspace`
 - **Depends on** 7.1, 6.3
 
-### 7.3 — Cut the CLI's dependency on `onisyncd` — **S**
+### 7.3 — Cut the CLI's dependency on `tagsyd` — **S**
 
-- **Why** The payoff. `onisync/Cargo.toml` drops `onisyncd`, which stops the CLI
+- **Why** The payoff. `tagsy/Cargo.toml` drops `tagsyd`, which stops the CLI
   build from compiling `rusqlite`, `tokio-tungstenite`, `image`, `infer` and
   `pdfium-render`.
-- **Change** Repoint `onisync` at `onisync-api` + `onisync-ipc` + `onisync-core`.
-- **Verify** `cargo build -p onisync`; `cargo tree -p onisync` shows none of the
+- **Change** Repoint `tagsy` at `tagsy-api` + `tagsy-ipc` + `tagsy-core`.
+- **Verify** `cargo build -p tagsy`; `cargo tree -p tagsy` shows none of the
   five heavy deps.
 - **Depends on** 7.2, 6.5
 
@@ -819,10 +856,10 @@ Independent of Phases 1–7 except 8.1, which needs 0.7. Can run in parallel.
 
 ### 8.1 — `data/repository.dart` — **S**
 
-- **Change** Replace the deleted `onisync_service.dart` with a thin repository
+- **Change** Replace the deleted `tagsy_service.dart` with a thin repository
   that every screen talks to instead of importing `rust/api.dart` directly.
   Today there is no layer between the widgets and the bridge.
-- **Also** Move `OniSyncSession` out of `bootstrap/` into `session/` — all five
+- **Also** Move `TagsySession` out of `bootstrap/` into `session/` — all five
   screens import the bootstrap layer solely for that type.
 - **Depends on** 0.7
 
@@ -854,7 +891,7 @@ Ranked by duplication removed:
 
 - **Why** `_OperationRow` (`operations_screen:136–246`) is 111 lines of which 76
   are pure string/icon mapping in four parallel switches — and those switches
-  mirror `flatten_kind` in `onisync-bridge/src/api.rs:302–340` across the FFI
+  mirror `flatten_kind` in `tagsy-bridge/src/api.rs:302–340` across the FFI
   boundary with no sync mechanism. Silent fallthrough to `Icons.pending` if they
   drift.
 - **Change** One `const Map<String, (IconData, String)>` with a test asserting
@@ -874,10 +911,10 @@ Ranked by duplication removed:
   at minimum add a test asserting they agree.
 - **Depends on** 2.4
 
-### 8.6 — `OniSyncApp` collision — **S**
+### 8.6 — `TagsyApp` collision — **S**
 
-- **Change** Rename the bridge type to `OniSync`; rename the Flutter widget to
-  `OniSyncAppRoot`. Rename the `_app` fields on the screens to `_client`.
+- **Change** Rename the bridge type to `Tagsy`; rename the Flutter widget to
+  `TagsyAppRoot`. Rename the `_app` fields on the screens to `_client`.
 - **Depends on** 8.1
 
 ---
@@ -891,7 +928,7 @@ cargo fmt --all                       # rustfmt.toml is opinionated; run it
 cargo check --workspace
 cargo clippy --workspace --all-targets
 cargo test --workspace                # baseline: 204 pass, 0.92s
-cargo check -p onisyncd --no-default-features   # the preview-generation gate
+cargo check -p tagsyd --no-default-features   # the preview-generation gate
 ```
 
 For anything touching Dart:
@@ -906,7 +943,7 @@ in `flake.nix`; keep them that way so a formatting pass never lands inside a
 behavior change. Format only tracked files — `app/lib/rust/` is codegen output
 and is gitignored.
 
-For anything touching `onisync-bridge` or the FFI surface, also:
+For anything touching `tagsy-bridge` or the FFI surface, also:
 
 ```
 nix run .#codegen
@@ -943,7 +980,7 @@ Identified during analysis, not scheduled:
   nine times in `file_bytes.rs`; a private helper removes ~40 lines.
 - **`file_bytes.rs` test helper never cleans up its temp dirs** (`temp_dir`, 364).
 - **`service.rs` lock incantation** — `slot().lock().unwrap_or_else(|p| p.into_inner())`
-  appears seven times in `onisync-bridge/src/service.rs`; one
+  appears seven times in `tagsy-bridge/src/service.rs`; one
   `with_runtime<R>(f)` helper collapses it.
 - **`RuntimeHandle::stop` and `impl Drop`** are verbatim duplicates
   (`runtime.rs:144–149`, `152–161`).
@@ -955,7 +992,7 @@ Identified during analysis, not scheduled:
 - **`app.dart:70–91`** — bootstrap failure only `debugPrint`s (has a TODO).
 - **`api.rs::parse_query`** silently drops the `/p` (physical path) prefix.
 - **`ApiEvent` is still an opaque handle** and is the last data type on the Dart
-  surface that is (the other three — `OniSyncApp`, `EventSubscription`,
+  surface that is (the other three — `TagsyApp`, `EventSubscription`,
   `OperationSubscription` — are deliberately opaque resources). Dart cannot read
   it, so every screen's change-stream loop reloads its entire state on *any*
   change anywhere. Mirroring it would let a screen filter by the affected

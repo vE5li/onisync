@@ -1348,76 +1348,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 
 [[package]]
-name = "onisync"
-version = "0.1.0"
-dependencies = [
- "clap",
- "comfy-table",
- "onisync-core",
- "onisyncd",
- "owo-colors",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "onisync-bridge"
-version = "0.1.0"
-dependencies = [
- "android_logger",
- "env_logger",
- "flutter_rust_bridge",
- "jni",
- "log",
- "onisync-core",
- "onisyncd",
- "thiserror",
- "tokio",
-]
-
-[[package]]
-name = "onisync-core"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "onisyncd"
-version = "0.1.0"
-dependencies = [
- "base64",
- "blake3",
- "clap",
- "ed25519-dalek",
- "env_logger",
- "futures-util",
- "image",
- "infer",
- "log",
- "notify",
- "onisync-core",
- "pdfium-render",
- "rand",
- "regex",
- "rmp-serde",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "uuid",
- "walkdir",
-]
-
-[[package]]
 name = "oslog"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1871,6 +1801,76 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tagsy"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "comfy-table",
+ "owo-colors",
+ "serde",
+ "serde_json",
+ "tagsy-core",
+ "tagsyd",
+ "tokio",
+]
+
+[[package]]
+name = "tagsy-bridge"
+version = "0.1.0"
+dependencies = [
+ "android_logger",
+ "env_logger",
+ "flutter_rust_bridge",
+ "jni",
+ "log",
+ "tagsy-core",
+ "tagsyd",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "tagsy-core"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "tagsyd"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "blake3",
+ "clap",
+ "ed25519-dalek",
+ "env_logger",
+ "futures-util",
+ "image",
+ "infer",
+ "log",
+ "notify",
+ "pdfium-render",
+ "rand",
+ "regex",
+ "rmp-serde",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tagsy-core",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "uuid",
+ "walkdir",
 ]
 
 [[package]]

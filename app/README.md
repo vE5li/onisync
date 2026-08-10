@@ -1,4 +1,4 @@
-# onisync_app
+# tagsy_app
 
 A new Flutter project.
 

@@ -2,7 +2,7 @@
 // waiting until the user is done editing it.
 //
 // The Flutter "edit" action in the file detail screen is a thin driver over
-// the daemon's stateless edit protocol (see OniSyncApp.beginEdit /
+// the daemon's stateless edit protocol (see TagsyApp.beginEdit /
 // finishEdit / cancelEdit): it asks the daemon for a path, hands the
 // path to a launcher implementing this interface, and — once the launcher
 // resolves — hands the path back for hash-and-maybe-upload.
@@ -15,13 +15,13 @@
 //   * Android: fire an `ACTION_EDIT` intent for a FileProvider URI and await
 //     the next `onResume` of MainActivity. External editors do not reliably
 //     return a result to us via `startActivityForResult`, so "the user came
-//     back to onisync" is the strongest signal available.
+//     back to tagsy" is the strongest signal available.
 //
 // Each platform's bootstrap plugs a concrete [EditorLauncher] into the
-// [OniSyncSession] (null on platforms without one). The file detail screen
+// [TagsySession] (null on platforms without one). The file detail screen
 // only shows its Edit button when the session carries a launcher.
 
-import '../rust/api.dart' as onisync;
+import '../rust/api.dart' as tagsy;
 
 /// Handle to launch external editors on files.
 ///
@@ -35,7 +35,7 @@ abstract class EditorLauncher {
   /// Open [path] in an external editor and return once the user is done.
   ///
   /// [rules] is the daemon-configured tag → `argv` mapping (see
-  /// [onisync.EditorRuleEntry]); implementations that consult tags (Linux)
+  /// [tagsy.EditorRuleEntry]); implementations that consult tags (Linux)
   /// walk it in declaration order, first match wins. Implementations that
   /// ignore tags (Android — the OS picks the editor by MIME) may leave it
   /// unused.
@@ -57,7 +57,7 @@ abstract class EditorLauncher {
     required String path,
     required String logicalName,
     required List<String> appliedTagIds,
-    required List<onisync.EditorRuleEntry> rules,
+    required List<tagsy.EditorRuleEntry> rules,
   });
 }
 

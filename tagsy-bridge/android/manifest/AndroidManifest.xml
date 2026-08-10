@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Minimal manifest fragment for the tagsy Android app (portability plan
+    section 8). This is scaffolding: merge these permissions and the
+    <service> declaration into the Flutter app's real
+    android/app/src/main/AndroidManifest.xml once `flutter create` has
+    generated the app tree. Package/label/theme are intentionally omitted here.
+
+    Permissions (plan 8):
+      - INTERNET: peer sync (outbound connect_to_peer / optional listener).
+      - FOREGROUND_SERVICE (+ ..._DATA_SYNC on API 34+): keep the tokio runtime
+        and inotify alive under Doze via an ongoing-notification service.
+    Media read permissions are NOT requested: v1 syncs app-private storage
+    (getFilesDir()) only, where inotify works with no storage permission.
+    Add READ_MEDIA_* only if section 9 (MediaStore) is implemented.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Required on API 34+ (Android 14) for a data-sync foreground service. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Needed to re-post the ongoing notification on API 33+. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application>
+        <!--
+            The foreground service that hosts the native runtime. `exported`
+            is false: nothing outside the app should start it. `foregroundServiceType`
+            must match the ..._DATA_SYNC permission above.
+        -->
+        <service
+            android:name=".TagsyService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+    </application>
+
+</manifest>

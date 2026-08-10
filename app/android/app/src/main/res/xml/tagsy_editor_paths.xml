@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    FileProvider path config for the external-editor launcher
+    (EditorChannel.kt).
+
+    We hand out `content://` URIs for two categories of path:
+
+    - `files-path` — the daemon's fetch temp dir lives under the app's
+      private files directory (returned by `Context.getFilesDir()`,
+      resolves to `/data/data/com.example.tagsy_app/files/…`). Fetched
+      temps used for Branch B edits are here.
+
+    - `external-path` — the sync directory lives under public external
+      storage (`Documents/tagsy`, since the app holds
+      MANAGE_EXTERNAL_STORAGE). Branch A "edit in place" hands out those
+      paths.
+
+    The `path="."` roots expose the whole subtree of each; the launcher
+    passes an absolute path and `FileProvider.getUriForFile` walks it to
+    find the matching root.
+-->
+<paths>
+    <files-path name="files" path="." />
+    <external-path name="external" path="." />
+</paths>

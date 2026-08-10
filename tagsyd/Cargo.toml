@@ -1,0 +1,57 @@
+[package]
+name = "tagsyd"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "tagsyd"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "tagsyd"
+path = "src/main.rs"
+
+[features]
+# The local preview *generation* stack: image decode/resize (`image`), content
+# sniffing (`infer`), and PDF first-page rasterization (`pdfium-render`, which
+# statically links libpdfium). A build without this feature cannot generate
+# previews and must run with `preview_generation_policy = "Never"` (enforced at
+# startup); it can still cache, serve, and relay previews obtained from peers.
+#
+# Enabled by default so the desktop/server build gets previews out of the box.
+# A minimal client (e.g. the Android bridge) can build with
+# `--no-default-features` to drop the `image`/`pdfium` dependencies entirely.
+default = ["preview-generation"]
+preview-generation = ["dep:image", "dep:infer", "dep:pdfium-render"]
+
+[dependencies]
+base64 = { workspace = true }
+blake3 = { workspace = true }
+clap = { workspace = true }
+ed25519-dalek = { workspace = true }
+futures-util = { workspace = true }
+rand = { workspace = true }
+regex = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rmp-serde = { workspace = true }
+thiserror = { workspace = true }
+tagsy-core = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-tungstenite = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+notify = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+walkdir = { workspace = true }
+image = { workspace = true, optional = true }
+infer = { workspace = true, optional = true }
+pdfium-render = { workspace = true, optional = true }
+
+[dev-dependencies]
+# `test-util` (not part of tokio's `full`) enables paused-time tests
+# (`#[tokio::test(start_paused = true)]`) used to exercise the receiver's
+# per-chunk liveness timeout without waiting the real `HOP_TIMEOUT`.
+tokio = { workspace = true, features = ["full", "test-util"] }

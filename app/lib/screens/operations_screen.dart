@@ -14,12 +14,12 @@
 import 'package:flutter/material.dart';
 
 import '../bootstrap/bootstrap.dart';
-import '../rust/api.dart' as onisync;
+import '../rust/api.dart' as tagsy;
 
 class OperationsScreen extends StatefulWidget {
   const OperationsScreen({super.key, required this.session});
 
-  final OniSyncSession session;
+  final TagsySession session;
 
   @override
   State<OperationsScreen> createState() => _OperationsScreenState();
@@ -28,13 +28,13 @@ class OperationsScreen extends StatefulWidget {
 class _OperationsScreenState extends State<OperationsScreen> {
   /// Current operations, keyed by their stable id so live updates replace the
   /// matching row in place. Rendered sorted by `startedAt` (newest first).
-  final Map<BigInt, onisync.OperationEntry> _operations = {};
+  final Map<BigInt, tagsy.OperationEntry> _operations = {};
 
   bool _loading = true;
   String? _error;
   bool _watching = false;
 
-  onisync.OniSyncApp get _app => widget.session.app;
+  tagsy.TagsyApp get _app => widget.session.app;
 
   @override
   void initState() {
@@ -82,11 +82,11 @@ class _OperationsScreenState extends State<OperationsScreen> {
         if (update == null) break;
         if (!mounted) break;
         switch (update) {
-          case onisync.OperationUpdateDto_Resynced():
+          case tagsy.OperationUpdateDto_Resynced():
             await _load();
-          case onisync.OperationUpdateDto_Started(:final operation):
+          case tagsy.OperationUpdateDto_Started(:final operation):
             setState(() => _operations[operation.id] = operation);
-          case onisync.OperationUpdateDto_Updated(:final operation):
+          case tagsy.OperationUpdateDto_Updated(:final operation):
             setState(() => _operations[operation.id] = operation);
         }
       }
@@ -136,7 +136,7 @@ class _OperationsScreenState extends State<OperationsScreen> {
 class _OperationRow extends StatelessWidget {
   const _OperationRow({required this.operation});
 
-  final onisync.OperationEntry operation;
+  final tagsy.OperationEntry operation;
 
   @override
   Widget build(BuildContext context) {
@@ -196,7 +196,7 @@ class _OperationRow extends StatelessWidget {
   }
 
   /// Subtitle: the peer and/or file the operation concerns, plus its status.
-  String _subtitle(onisync.OperationEntry operation) {
+  String _subtitle(tagsy.OperationEntry operation) {
     final parts = <String>[];
     if (operation.peerName != null) {
       parts.add('peer: ${operation.peerName}');
@@ -211,26 +211,26 @@ class _OperationRow extends StatelessWidget {
   }
 
   /// Status label, including a `done/total` fragment when progress is reported.
-  String _statusLabel(onisync.OperationStatusDto status) {
+  String _statusLabel(tagsy.OperationStatusDto status) {
     switch (status) {
-      case onisync.OperationStatusDto_Active():
+      case tagsy.OperationStatusDto_Active():
         final done = operation.progressDone;
         if (done == null) return 'active';
         final total = operation.progressTotal;
         return total == null ? 'active ($done)' : 'active ($done/$total)';
-      case onisync.OperationStatusDto_Completed():
+      case tagsy.OperationStatusDto_Completed():
         return 'completed';
-      case onisync.OperationStatusDto_Failed(:final reason):
+      case tagsy.OperationStatusDto_Failed(:final reason):
         return 'failed: $reason';
-      case onisync.OperationStatusDto_Aborted():
+      case tagsy.OperationStatusDto_Aborted():
         return 'aborted';
     }
   }
 
   /// A progress indicator for active operations that report byte/entry
   /// progress; nothing otherwise.
-  Widget? _trailing(onisync.OperationEntry operation) {
-    if (operation.status is! onisync.OperationStatusDto_Active) return null;
+  Widget? _trailing(tagsy.OperationEntry operation) {
+    if (operation.status is! tagsy.OperationStatusDto_Active) return null;
     final done = operation.progressDone;
     final total = operation.progressTotal;
     if (done == null) return null;

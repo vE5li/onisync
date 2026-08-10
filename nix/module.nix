@@ -4,17 +4,17 @@ self: {
   config,
   ...
 }: {
-  options.services.onisync = with lib; {
-    # enable = lib.mkEnableOption "onisync service";
+  options.services.tagsy = with lib; {
+    # enable = lib.mkEnableOption "tagsy service";
 
     user = mkOption {
       type = types.str;
-      description = "User account under which onisync runs.";
+      description = "User account under which tagsy runs.";
     };
 
     group = mkOption {
       type = types.str;
-      description = "Group under which onisync runs.";
+      description = "Group under which tagsy runs.";
     };
 
     enable-preview-generation = mkOption {
@@ -41,13 +41,13 @@ self: {
       # `enable-preview-generation`. Uses `callPackage` on the package
       # definition directly so it works whether or not the host applies the
       # flake overlay.
-      default = pkgs.callPackage ../nix/onisyncd.nix {
-        withPreviewGeneration = config.services.onisync.enable-preview-generation;
+      default = pkgs.callPackage ../nix/tagsyd.nix {
+        withPreviewGeneration = config.services.tagsy.enable-preview-generation;
       };
       defaultText = literalExpression ''
-        pkgs.callPackage ./nix/onisyncd.nix { withPreviewGeneration = <enable-preview-generation>; }
+        pkgs.callPackage ./nix/tagsyd.nix { withPreviewGeneration = <enable-preview-generation>; }
       '';
-      description = "The onisync daemon package to use.";
+      description = "The tagsy daemon package to use.";
     };
 
     configuration-file = mkOption {
@@ -57,7 +57,7 @@ self: {
 
     state-directory = mkOption {
       type = types.str;
-      default = "onisync";
+      default = "tagsy";
       description = ''
         Name of the systemd StateDirectory, created under /var/lib and
         owned by the service user. Used as the default data directory.
@@ -66,7 +66,7 @@ self: {
 
     data-directory = mkOption {
       type = types.path;
-      default = "/var/lib/${config.services.onisync.state-directory}";
+      default = "/var/lib/${config.services.tagsy.state-directory}";
       defaultText = literalExpression ''"/var/lib/''${state-directory}"'';
       description = "Path to the data directory";
     };
@@ -77,8 +77,8 @@ self: {
     };
   };
 
-  config = with config.services.onisync; {
-    systemd.services.onisync = {
+  config = with config.services.tagsy; {
+    systemd.services.tagsy = {
       enable = true;
 
       wantedBy = ["multi-user.target"];
@@ -93,11 +93,11 @@ self: {
         StateDirectory = state-directory;
 
         # Local control socket (portability plan section 7). systemd creates
-        # /run/onisync owned by the service user and tears it down on stop; its
+        # /run/tagsy owned by the service user and tears it down on stop; its
         # 0700 mode is the entire security model for local control (nothing is
         # exposed on the network). The daemon binds, and clients connect to,
-        # the fixed /run/onisync/onisync.sock — no XDG_RUNTIME_DIR guessing.
-        RuntimeDirectory = "onisync";
+        # the fixed /run/tagsy/tagsy.sock — no XDG_RUNTIME_DIR guessing.
+        RuntimeDirectory = "tagsy";
         RuntimeDirectoryMode = "0700";
       };
 

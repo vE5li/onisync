@@ -1,4 +1,4 @@
-// Share-review: the interstitial shown when files are shared into onisync via
+// Share-review: the interstitial shown when files are shared into tagsy via
 // the Android share sheet. Instead of uploading immediately, this screen lets
 // the user attach tags to the incoming file(s) first, then uploads them with
 // those tags applied. It mirrors the file detail screen's top preview so the
@@ -14,7 +14,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 
 import '../bootstrap/bootstrap.dart';
-import '../rust/api.dart' as onisync;
+import '../rust/api.dart' as tagsy;
 import '../widgets/file_preview.dart';
 import '../widgets/tag_chip.dart';
 
@@ -25,7 +25,7 @@ class ShareReviewScreen extends StatefulWidget {
     required this.paths,
   });
 
-  final OniSyncSession session;
+  final TagsySession session;
 
   /// Absolute on-disk paths of the shared files to review and upload. Never
   /// empty (the share handler drops empty batches before navigating).
@@ -36,11 +36,11 @@ class ShareReviewScreen extends StatefulWidget {
 }
 
 class _ShareReviewScreenState extends State<ShareReviewScreen> {
-  onisync.OniSyncApp get _app => widget.session.app;
+  tagsy.TagsyApp get _app => widget.session.app;
 
   /// Tags the user has picked to apply to the whole batch, keyed by string id
   /// so we can render chips and de-dupe against the picker.
-  final Map<String, onisync.TagEntry> _selected = {};
+  final Map<String, tagsy.TagEntry> _selected = {};
 
   bool _uploading = false;
 
@@ -51,12 +51,12 @@ class _ShareReviewScreenState extends State<ShareReviewScreen> {
   Future<void> _addTag() async {
     // Mirror the file detail screen's picker: list every live tag and let the
     // user pick one not already selected. (Same whole-store scan TODO applies.)
-    final onisync.QueryEntries all;
+    final tagsy.QueryEntries all;
     try {
       all = await _app.runQuery(
         query: '',
-        subtagRule: onisync.SubtagRule.include,
-        deletedRule: onisync.DeletedRule.exclude,
+        subtagRule: tagsy.SubtagRule.include,
+        deletedRule: tagsy.DeletedRule.exclude,
       );
     } catch (error) {
       _snack('Failed to load tags: $error');
@@ -67,7 +67,7 @@ class _ShareReviewScreenState extends State<ShareReviewScreen> {
         .where((t) => !_selected.containsKey(t.tagId))
         .toList();
 
-    final chosen = await showModalBottomSheet<onisync.TagEntry>(
+    final chosen = await showModalBottomSheet<tagsy.TagEntry>(
       context: context,
       builder: (sheetContext) => SafeArea(
         child: ListView(
@@ -107,14 +107,14 @@ class _ShareReviewScreenState extends State<ShareReviewScreen> {
     setState(() => _selected[chosen.tagId] = chosen);
   }
 
-  /// Prompt for a tag name, create it, and return its fresh [onisync.TagEntry]
+  /// Prompt for a tag name, create it, and return its fresh [tagsy.TagEntry]
   /// (or null on cancel / failure). The engine substitutes a default palette
   /// color for the empty color, matching the home screen's create flow.
   ///
   /// `createTag` hands back the new tag's string id, which we use to fetch its
-  /// flattened [onisync.TagEntry] (name + engine-assigned color) for the chip
+  /// flattened [tagsy.TagEntry] (name + engine-assigned color) for the chip
   /// and later upload-time resolution.
-  Future<onisync.TagEntry?> _createTag() async {
+  Future<tagsy.TagEntry?> _createTag() async {
     final name = await showDialog<String>(
       context: context,
       builder: (_) => const _CreateTagDialog(),
@@ -125,7 +125,7 @@ class _ShareReviewScreenState extends State<ShareReviewScreen> {
       final tagId = await _app.createTag(name: trimmed, color: '');
       return await _app.getTagEntry(
         tagId: tagId,
-        deletedRule: onisync.DeletedRule.exclude,
+        deletedRule: tagsy.DeletedRule.exclude,
       );
     } catch (error) {
       _snack('Failed to create tag: $error');
@@ -159,7 +159,7 @@ class _ShareReviewScreenState extends State<ShareReviewScreen> {
     }
     if (!mounted) return;
     if (uploaded > 0) {
-      _snack('Uploaded $uploaded file${uploaded == 1 ? '' : 's'} to onisync');
+      _snack('Uploaded $uploaded file${uploaded == 1 ? '' : 's'} to tagsy');
     }
     Navigator.of(context).maybePop();
   }

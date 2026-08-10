@@ -54,7 +54,7 @@
 //
 // Note also that the file path can never be parsed as an option flag by the
 // editor: we always pass it through `.absolute`, so it begins with `/` even if
-// the peer-chosen filename begins with `-`. (onisync-core deliberately permits
+// the peer-chosen filename begins with `-`. (tagsy-core deliberately permits
 // leading-dash filenames, since they are legal on Linux — see
 // `validate_relative_path` — so this normalization is what actually closes the
 // argument-injection case, not a restriction upstream.)
@@ -63,7 +63,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart' show visibleForTesting;
 
-import '../rust/api.dart' as onisync;
+import '../rust/api.dart' as tagsy;
 import 'editor_launcher.dart';
 
 class LinuxEditorLauncher implements EditorLauncher {
@@ -72,11 +72,11 @@ class LinuxEditorLauncher implements EditorLauncher {
     required String path,
     required String logicalName,
     required List<String> appliedTagIds,
-    required List<onisync.EditorRuleEntry> rules,
+    required List<tagsy.EditorRuleEntry> rules,
   }) async {
     final argv = resolveArgv(appliedTagIds: appliedTagIds, rules: rules);
 
-    // Convention matches the CLI's `open_in_editor` (onisync/src/main.rs):
+    // Convention matches the CLI's `open_in_editor` (tagsy/src/main.rs):
     // path is the last argument. Users writing rules can rely on it.
     //
     // `.absolute` is belt-and-braces: the daemon already returns an absolute
@@ -128,7 +128,7 @@ class LinuxEditorLauncher implements EditorLauncher {
   @visibleForTesting
   static List<String> resolveArgv({
     required List<String> appliedTagIds,
-    required List<onisync.EditorRuleEntry> rules,
+    required List<tagsy.EditorRuleEntry> rules,
   }) {
     final applied = appliedTagIds.toSet();
     for (final rule in rules) {

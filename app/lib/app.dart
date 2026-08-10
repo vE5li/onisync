@@ -1,6 +1,6 @@
 // Shared application shell for both the Android and Linux apps.
 //
-// This is entirely platform-agnostic: it takes a [OniSyncBootstrap] (chosen in
+// This is entirely platform-agnostic: it takes a [TagsyBootstrap] (chosen in
 // main.dart via --dart-define) and drives the lifecycle that is identical on
 // every platform — connect, then hand the session to the home screen. Live
 // updates and query dispatch are owned by the screens themselves (each opens
@@ -12,14 +12,14 @@ import 'package:flutter/services.dart';
 import 'bootstrap/bootstrap.dart';
 import 'screens/home_screen.dart';
 
-class OniSyncApp extends StatefulWidget {
-  const OniSyncApp({super.key, required this.bootstrap});
+class TagsyApp extends StatefulWidget {
+  const TagsyApp({super.key, required this.bootstrap});
 
   /// The platform backend (in-process engine on Android, daemon IPC on Linux).
-  final OniSyncBootstrap bootstrap;
+  final TagsyBootstrap bootstrap;
 
   @override
-  State<OniSyncApp> createState() => _OniSyncAppState();
+  State<TagsyApp> createState() => _TagsyAppState();
 }
 
 // Shows feedback (SnackBars) from callbacks that can fire outside a build
@@ -32,8 +32,8 @@ final GlobalKey<ScaffoldMessengerState> _messengerKey =
 // screen that collects tags before uploading a shared file.
 final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
 
-class _OniSyncAppState extends State<OniSyncApp> {
-  OniSyncSession? _session;
+class _TagsyAppState extends State<TagsyApp> {
+  TagsySession? _session;
 
   @override
   void initState() {
@@ -86,7 +86,7 @@ class _OniSyncAppState extends State<OniSyncApp> {
     } catch (error) {
       // TODO: surface connection failures in the UI once the redesigned
       // status/error surface lands. For now they only appear in logs.
-      debugPrint('onisync bootstrap failed: $error');
+      debugPrint('tagsy bootstrap failed: $error');
     }
   }
 
@@ -108,7 +108,7 @@ class _OniSyncAppState extends State<OniSyncApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'OniSync',
+      title: 'Tagsy',
       scaffoldMessengerKey: _messengerKey,
       navigatorKey: _navigatorKey,
       themeMode: ThemeMode.dark,

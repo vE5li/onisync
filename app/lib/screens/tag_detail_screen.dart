@@ -14,7 +14,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../bootstrap/bootstrap.dart';
-import '../rust/api.dart' as onisync;
+import '../rust/api.dart' as tagsy;
 import '../widgets/property_tile.dart';
 import '../widgets/tag_chip.dart';
 
@@ -25,7 +25,7 @@ class TagDetailScreen extends StatefulWidget {
     required this.tagId,
   });
 
-  final OniSyncSession session;
+  final TagsySession session;
   final String tagId;
 
   @override
@@ -33,7 +33,7 @@ class TagDetailScreen extends StatefulWidget {
 }
 
 class _TagDetailScreenState extends State<TagDetailScreen> {
-  onisync.TagEntry? _tag;
+  tagsy.TagEntry? _tag;
 
   /// Direct parent tags (tags applied to this tag). String ids for the wire,
   /// resolved to entries in [_relatedTags] for rendering.
@@ -44,7 +44,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
 
   /// Name/color lookup for every tag id that appears in either section
   /// above. Bounded by parents + subtags — never a whole-store listing.
-  Map<String, onisync.TagEntry> _relatedTags = {};
+  Map<String, tagsy.TagEntry> _relatedTags = {};
 
   bool _loading = true;
   String? _error;
@@ -52,7 +52,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
   bool _watching = false;
   bool _restoring = false;
 
-  onisync.OniSyncApp get _app => widget.session.app;
+  tagsy.TagsyApp get _app => widget.session.app;
 
   @override
   void initState() {
@@ -93,15 +93,15 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
       // tombstoned tag can't participate in a live hierarchy edge.
       final tag = await _app.getTagEntry(
         tagId: widget.tagId,
-        deletedRule: onisync.DeletedRule.include,
+        deletedRule: tagsy.DeletedRule.include,
       );
       final parents = await _app.tagIdsForTag(
         tagId: widget.tagId,
-        subtagRule: onisync.SubtagRule.exclude,
+        subtagRule: tagsy.SubtagRule.exclude,
       );
       final subtags = await _app.subtagIdsForTag(
         tagId: widget.tagId,
-        subtagRule: onisync.SubtagRule.exclude,
+        subtagRule: tagsy.SubtagRule.exclude,
       );
       // Resolve every related tag by id. Bounded by parents.length +
       // subtags.length; avoids the whole-store listing that `runQuery('')`
@@ -111,7 +111,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
         relatedIds.map(
           (id) => _app.getTagEntry(
             tagId: id,
-            deletedRule: onisync.DeletedRule.exclude,
+            deletedRule: tagsy.DeletedRule.exclude,
           ),
         ),
       );
@@ -129,7 +129,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
       // `getTagEntry` rejects with `UnknownId` when the tag is gone; treat
       // that as "deleted underneath us" and pop back to the list. Other errors
       // (transport, etc.) surface normally.
-      final isMissing = error is onisync.ApiError_UnknownId;
+      final isMissing = error is tagsy.ApiError_UnknownId;
       setState(() {
         if (isMissing) {
           _tag = null;
@@ -196,18 +196,18 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
   /// Revisit — the right shape is likely a small search-in-picker that calls
   /// `runQuery` per keystroke, matching the home screen's model. Same
   /// treatment as FileDetailScreen._addTag.
-  Future<onisync.TagEntry?> _pickTag({
+  Future<tagsy.TagEntry?> _pickTag({
     required String title,
     required Set<String> excludeIds,
   }) async {
-    final onisync.QueryEntries all;
+    final tagsy.QueryEntries all;
     try {
       // Tag-picker sheets only surface live tags — you can't apply a
       // tombstoned tag to anything.
       all = await _app.runQuery(
         query: '',
-        subtagRule: onisync.SubtagRule.include,
-        deletedRule: onisync.DeletedRule.exclude,
+        subtagRule: tagsy.SubtagRule.include,
+        deletedRule: tagsy.DeletedRule.exclude,
       );
     } catch (error) {
       _snack('Failed to load tags: $error');
@@ -221,7 +221,7 @@ class _TagDetailScreenState extends State<TagDetailScreen> {
       _snack('No candidate tags.');
       return null;
     }
-    return showModalBottomSheet<onisync.TagEntry>(
+    return showModalBottomSheet<tagsy.TagEntry>(
       context: context,
       builder: (_) => SafeArea(
         child: ListView(
@@ -474,7 +474,7 @@ class _TagsSection extends StatelessWidget {
 
   final String title;
   final List<String> tagIds;
-  final Map<String, onisync.TagEntry> resolved;
+  final Map<String, tagsy.TagEntry> resolved;
   final VoidCallback onAdd;
   final ValueChanged<String> onRemove;
   final ValueChanged<String> onTapTag;

@@ -1,21 +1,21 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- onisync: peer sync (outbound / optional listener). -->
+    <!-- tagsy: peer sync (outbound / optional listener). -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- onisync: keep the tokio runtime + inotify alive under Doze. -->
+    <!-- tagsy: keep the tokio runtime + inotify alive under Doze. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <!-- Required on API 34+ (Android 14) for a data-sync foreground service. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <!-- Needed to post the ongoing notification on API 33+. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- onisync: the sync directory lives in shared storage (Documents/onisync)
+    <!-- tagsy: the sync directory lives in shared storage (Documents/tagsy)
          so synced files are browsable in the Files app / Gallery. Broad "All
          files access"; the user must grant it via the system settings screen
          (see MainActivity). Requested via MANAGE_APP_ALL_FILES_ACCESS_PERMISSION. -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <application
-        android:label="OniSync"
+        android:label="Tagsy"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <!-- launchMode="singleTask" is recommended by receive_sharing_intent:
@@ -42,11 +42,11 @@
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
-            <!-- onisync: appear in the Android share sheet as an upload target.
+            <!-- tagsy: appear in the Android share sheet as an upload target.
                  A single shared item (ACTION_SEND) or several at once
                  (ACTION_SEND_MULTIPLE); "*/*" accepts any file type. The
                  receive_sharing_intent plugin reads the EXTRA_STREAM URI(s)
-                 and hands them to Dart, which uploads via OniSyncApp.uploadFile. -->
+                 and hands them to Dart, which uploads via TagsyApp.uploadFile. -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND"/>
                 <category android:name="android.intent.category.DEFAULT"/>
@@ -58,19 +58,19 @@
                 <data android:mimeType="*/*"/>
             </intent-filter>
         </activity>
-        <!-- onisync: foreground service hosting the native runtime. Not
+        <!-- tagsy: foreground service hosting the native runtime. Not
              exported; the type must match FOREGROUND_SERVICE_DATA_SYNC. -->
         <service
-            android:name=".OniSyncService"
+            android:name=".TagsyService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
-        <!-- onisync: FileProvider used by the external-editor launcher
+        <!-- tagsy: FileProvider used by the external-editor launcher
              (EditorChannel) to hand files to third-party editors as
              `content://` URIs. Raw filesystem paths under the app's private
              storage are not readable by other apps on modern Android, so we
              expose the daemon's fetch temp dir (under `filesDir`) and the
              sync directory (under external storage) through this provider.
-             See res/xml/onisync_editor_paths.xml for the exposed roots. -->
+             See res/xml/tagsy_editor_paths.xml for the exposed roots. -->
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.editorprovider"
@@ -78,7 +78,7 @@
             android:grantUriPermissions="true">
             <meta-data
                 android:name="android.support.FILE_PROVIDER_PATHS"
-                android:resource="@xml/onisync_editor_paths" />
+                android:resource="@xml/tagsy_editor_paths" />
         </provider>
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->

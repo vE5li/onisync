@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["onisyncd", "onisync-core", "onisync", "onisync-bridge"]
+members = ["tagsyd", "tagsy-core", "tagsy", "tagsy-bridge"]
 
 [workspace.dependencies]
-onisync-core = { path = "onisync-core" }
-onisyncd = { path = "onisyncd" }
+tagsy-core = { path = "tagsy-core" }
+tagsyd = { path = "tagsyd" }
 
 android_logger = "0.15.1"
 base64 = "0.23.0"
@@ -19,7 +19,7 @@ infer = { version = "0.16", default-features = false }
 # via libloading (dynamic), so the build does not link pdfium; the daemon
 # locates `libpdfium.so` at runtime (its path is provided by the Nix wrapper /
 # ONISYNC_PDFIUM_LIB_PATH; see flake.nix). Only ever compiled into a build with
-# onisyncd's `preview-generation` feature. `image_latest` pins the same `image`
+# tagsyd's `preview-generation` feature. `image_latest` pins the same `image`
 # crate version we use elsewhere (0.25) so `PdfBitmap::as_image()` yields a
 # compatible `DynamicImage`.
 #

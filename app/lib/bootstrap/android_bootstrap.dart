@@ -2,7 +2,7 @@
 // the app.
 //
 // Unlike Linux (which attaches to a daemon), this process OWNS the engine, DB,
-// and identity. It also wires the Android share sheet so "Share to onisync"
+// and identity. It also wires the Android share sheet so "Share to tagsy"
 // uploads files, and surfaces this device's public key for pairing.
 //
 // Selected at build time via --dart-define=ONISYNC_BACKEND=android (see main).
@@ -15,42 +15,42 @@ import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 
 import '../editor/android_editor_launcher.dart';
 import '../rust/frb_generated.dart';
-import '../rust/api.dart' as onisync;
+import '../rust/api.dart' as tagsy;
 import '../screens/share_review_screen.dart';
 import 'bootstrap.dart';
 
 /// MethodChannel exposed by [MainActivity] returning the JSON config + paths
-/// the Kotlin side built. See OniSyncConfig.kt for the single source of truth.
+/// the Kotlin side built. See TagsyConfig.kt for the single source of truth.
 ///
 /// The Kotlin foreground service normally starts the runtime before this
 /// bootstrap runs; the values fetched here are the *same* values it passed to
-/// nativeStart, so OniSyncApp.start attaches to the already-running instance
+/// nativeStart, so TagsyApp.start attaches to the already-running instance
 /// (crate::service::start is idempotent). If the service is somehow slow, the
 /// Dart side starts it with identical inputs — no divergence possible.
-const _configChannel = MethodChannel('onisync_app/config');
+const _configChannel = MethodChannel('tagsy_app/config');
 
-class AndroidBootstrap extends OniSyncBootstrap {
+class AndroidBootstrap extends TagsyBootstrap {
   StreamSubscription<List<SharedMediaFile>>? _shareSub;
 
   @override
-  Future<OniSyncSession> connect() async {
-    // Loads libonisync_bridge.so and wires up the generated bindings.
+  Future<TagsySession> connect() async {
+    // Loads libtagsy_bridge.so and wires up the generated bindings.
     await RustLib.init();
 
     // Fetch the runtime startup inputs from Kotlin. The peer config lives
-    // in OniSyncConfig.kt (single source of truth); the Dart side never
+    // in TagsyConfig.kt (single source of truth); the Dart side never
     // holds a JSON literal.
     final inputs = await _configChannel.invokeMapMethod<String, String>(
       'getStartupInputs',
     );
     if (inputs == null) {
-      throw StateError('onisync_app/config channel returned no inputs');
+      throw StateError('tagsy_app/config channel returned no inputs');
     }
     final configJson = inputs['configJson']!;
     final dataDir = inputs['dataDir']!;
     final identityFile = inputs['identityFile']!;
 
-    final app = onisync.OniSyncApp.start(
+    final app = tagsy.TagsyApp.start(
       configurationJson: configJson,
       dataDir: dataDir,
       identityFile: identityFile,
@@ -63,7 +63,7 @@ class AndroidBootstrap extends OniSyncBootstrap {
       'getDownloadsDir',
     );
 
-    return OniSyncSession(
+    return TagsySession(
       app: app,
       publicKey: app.publicKey(),
       downloadsDir: downloadsDir,
@@ -71,14 +71,14 @@ class AndroidBootstrap extends OniSyncBootstrap {
     );
   }
 
-  /// Wire up the Android share sheet ("Share to onisync"). Two cases:
+  /// Wire up the Android share sheet ("Share to tagsy"). Two cases:
   ///   1. app already running  -> getMediaStream() pushes new shares,
   ///   2. app launched by share -> getInitialMedia() returns the first batch.
   /// Both funnel into [_reviewSharedFiles], which opens the share-review
   /// screen so the user can tag the file(s) before they are uploaded.
   @override
   void attachInputs(
-    OniSyncSession session, {
+    TagsySession session, {
     required void Function(String message) showMessage,
     required void Function(Route<dynamic> route) navigate,
     required VoidCallback onChanged,
@@ -98,10 +98,10 @@ class AndroidBootstrap extends OniSyncBootstrap {
 
   /// Open the share-review screen for the shared file(s). Rather than upload
   /// immediately, the user first attaches tags there; the actual
-  /// [onisync.OniSyncApp.uploadFile] call (which streams the bytes from disk,
+  /// [tagsy.TagsyApp.uploadFile] call (which streams the bytes from disk,
   /// never buffering them whole) happens when they confirm.
   void _reviewSharedFiles(
-    OniSyncSession session,
+    TagsySession session,
     List<SharedMediaFile> files,
     void Function(Route<dynamic> route) navigate,
   ) {
@@ -123,4 +123,4 @@ class AndroidBootstrap extends OniSyncBootstrap {
 }
 
 /// Factory referenced by the backend selector in main.dart.
-OniSyncBootstrap createBootstrap() => AndroidBootstrap();
+TagsyBootstrap createBootstrap() => AndroidBootstrap();

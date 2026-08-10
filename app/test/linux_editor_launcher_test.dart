@@ -8,12 +8,12 @@
 
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:onisync_app/editor/editor_launcher.dart';
-import 'package:onisync_app/editor/linux_editor_launcher.dart';
-import 'package:onisync_app/rust/api.dart' as onisync;
+import 'package:tagsy_app/editor/editor_launcher.dart';
+import 'package:tagsy_app/editor/linux_editor_launcher.dart';
+import 'package:tagsy_app/rust/api.dart' as tagsy;
 
-onisync.EditorRuleEntry _rule(String tagId, List<String> argv) =>
-    onisync.EditorRuleEntry(tagId: tagId, argv: argv);
+tagsy.EditorRuleEntry _rule(String tagId, List<String> argv) =>
+    tagsy.EditorRuleEntry(tagId: tagId, argv: argv);
 
 void main() {
   group('LinuxEditorLauncher.resolveArgv', () {

@@ -27,7 +27,7 @@ static void my_application_activate(GApplication* application) {
 
   // Use a traditional titlebar drawn by the window manager instead of a GTK
   // header bar. The header bar is much taller and wastes vertical space.
-  gtk_window_set_title(window, "onisync_app");
+  gtk_window_set_title(window, "tagsy_app");
 
   gtk_window_set_default_size(window, 1280, 720);
 

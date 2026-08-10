@@ -2,7 +2,7 @@
 
 import 'package:flutter/material.dart';
 
-import '../rust/api.dart' as onisync;
+import '../rust/api.dart' as tagsy;
 
 /// Preset colors offered when creating a tag (stored as #RRGGBB strings).
 const List<String> kTagColorPalette = [
@@ -64,7 +64,7 @@ class TagColorSwatch extends StatelessWidget {
 class TagChip extends StatelessWidget {
   const TagChip({super.key, required this.tag, this.onPressed, this.onDeleted});
 
-  final onisync.TagEntry tag;
+  final tagsy.TagEntry tag;
   final VoidCallback? onPressed;
   final VoidCallback? onDeleted;
 

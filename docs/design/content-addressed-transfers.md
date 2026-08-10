@@ -26,7 +26,7 @@ Two root problems:
 - **Point-to-point pulls cannot hop.** They target one named peer and abort if
   that peer lacks the bytes, even though another reachable peer (the phone) has
   them. There is a separate recursive fetch engine (`fetch.rs`) that *can* hop,
-  but it is wired only to `onisync edit`, not to live sync.
+  but it is wired only to `tagsy edit`, not to live sync.
 - **Two mechanisms.** Point-to-point pull and recursive fetch are separate code
   paths that both ultimately drive the *same* transfer primitive.
 
@@ -81,7 +81,7 @@ The current point-to-point pull and the recursive fetch relay both collapse into
 this: "point-to-point" is just a `ChunkRequest` to a neighbour that happens to
 hold the file; "relayed fetch" is the same request forwarded hop-by-hop.
 
-### Wire protocol (`onisync-core`)
+### Wire protocol (`tagsy-core`)
 
 Bump the peer protocol version. Remove the transfer-id-scoped messages and add
 content-addressed ones.
@@ -185,7 +185,7 @@ Because a relay holds none of the bytes, it verifies nothing: integrity is
 **Trust caveat.** A buggy or malicious upstream could return wrong bytes for a
 chunk; a relay cannot detect this (it does not hold `content_hash`'s file) and
 would fan the bad bytes out. Only the origin receiver catches it, at final
-full-file verification, and must then re-pull. OniSync assumes all peers are
+full-file verification, and must then re-pull. Tagsy assumes all peers are
 trusted (same user, mutually authenticated at handshake), so this is acceptable;
 there is deliberately no per-chunk attribution or blame.
 
@@ -271,7 +271,7 @@ single call that:
 Manifest reconcile (`reconcile_peer_manifest` -> `WantedFile`) uses the same
 receive entry point.
 
-`onisync edit`'s fetch uses the same entry point; its only difference is the
+`tagsy edit`'s fetch uses the same entry point; its only difference is the
 terminal action: return the completed temp file to the CLI instead of
 materializing into sync directories.
 
@@ -353,7 +353,7 @@ This keeps one protocol for both "is it there?" and "give it to me".
   receives via central relay while central is still catching up; assert the
   computer converges to the new content without a reconnect. Assert relays hold
   no temp file (cut-through) and bounded memory.
-- Regression: `onisync edit` on a file not present locally still fetches via the
+- Regression: `tagsy edit` on a file not present locally still fetches via the
   same path; restore availability probe (offset-0 `ChunkRequest`) resolves
   present/absent correctly.
 

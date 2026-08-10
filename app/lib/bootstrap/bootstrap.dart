@@ -1,6 +1,6 @@
 // Platform-agnostic startup contract shared by the Android and Linux apps.
 //
-// The ONLY real difference between the two apps is how a live [onisync.OniSyncApp]
+// The ONLY real difference between the two apps is how a live [tagsy.TagsyApp]
 // handle is obtained:
 //
 //   * Android starts an in-process sync engine (owns the DB + identity) and
@@ -11,17 +11,17 @@
 // Everything AFTER a handle exists (listing files/tags, the change-stream loop,
 // the widget tree) is identical and lives in the shared UI (../app.dart,
 // ../screens/). To keep that UI free of any platform imports, each platform
-// implements this [OniSyncBootstrap] and hands back a [OniSyncSession].
+// implements this [TagsyBootstrap] and hands back a [TagsySession].
 
 import 'package:flutter/widgets.dart';
 
 import '../editor/editor_launcher.dart';
-import '../rust/api.dart' as onisync;
+import '../rust/api.dart' as tagsy;
 
 /// A connected backend, ready for the shared UI to drive.
-class OniSyncSession {
+class TagsySession {
   /// The live handle every screen calls into (list/create/tag/upload/...).
-  final onisync.OniSyncApp app;
+  final tagsy.TagsyApp app;
 
   /// This device's base64 public key, or `null` when the platform has no local
   /// identity to show (Linux, where the daemon owns the identity).
@@ -40,7 +40,7 @@ class OniSyncSession {
   /// file detail screen's "Edit" button is hidden when this is null.
   final EditorLauncher? editorLauncher;
 
-  const OniSyncSession({
+  const TagsySession({
     required this.app,
     this.publicKey,
     this.downloadsDir,
@@ -48,16 +48,16 @@ class OniSyncSession {
   });
 }
 
-/// Produces a [OniSyncSession] and wires any platform-only side channels.
+/// Produces a [TagsySession] and wires any platform-only side channels.
 ///
 /// Implementations are selected at build time from [main] via a
 /// `--dart-define=ONISYNC_BACKEND=...`; the shared UI never imports them
 /// directly.
-abstract class OniSyncBootstrap {
+abstract class TagsyBootstrap {
   /// Initialize the generated Rust bindings and connect to the backend
   /// (in-process engine on Android, daemon IPC on Linux). Throws on failure;
   /// the caller renders the error.
-  Future<OniSyncSession> connect();
+  Future<TagsySession> connect();
 
   /// Hook for platform-only inputs that need a live session, e.g. the Android
   /// share sheet uploading files. Called once after [connect] succeeds.
@@ -69,7 +69,7 @@ abstract class OniSyncBootstrap {
   /// any mutation so the UI can refresh. The default is a no-op (Linux has
   /// nothing to wire).
   void attachInputs(
-    OniSyncSession session, {
+    TagsySession session, {
     required void Function(String message) showMessage,
     required void Function(Route<dynamic> route) navigate,
     required VoidCallback onChanged,

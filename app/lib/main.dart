@@ -1,8 +1,8 @@
-// Shared entrypoint for BOTH the onisync Android and Linux desktop apps.
+// Shared entrypoint for BOTH the tagsy Android and Linux desktop apps.
 //
 // The two apps differ only in how they connect to the backend (Android starts
 // an in-process engine; Linux attaches to a daemon over IPC). That difference
-// is isolated in bootstrap/*_bootstrap.dart behind the OniSyncBootstrap
+// is isolated in bootstrap/*_bootstrap.dart behind the TagsyBootstrap
 // contract, and everything else — the whole UI — is shared (app.dart,
 // screens/).
 //
@@ -26,7 +26,7 @@ const String _backend = String.fromEnvironment(
   defaultValue: 'android',
 );
 
-OniSyncBootstrap _selectBootstrap() {
+TagsyBootstrap _selectBootstrap() {
   switch (_backend) {
     case 'linux':
       return linux.createBootstrap();
@@ -44,5 +44,5 @@ void main() {
   WidgetsFlutterBinding.ensureInitialized();
   // RustLib.init() is done inside each bootstrap's connect(), because Linux
   // needs a custom library loader and Android uses the default.
-  runApp(OniSyncApp(bootstrap: _selectBootstrap()));
+  runApp(TagsyApp(bootstrap: _selectBootstrap()));
 }

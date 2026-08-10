@@ -1,15 +1,15 @@
 <p align="center">
-  <img src="./icon/github.png" alt="OniSync" width="128" />
+  <img src="./icon/github.png" alt="Tagsy" width="128" />
 </p>
 
-<h1 align="center">OniSync</h1>
+<h1 align="center">Tagsy</h1>
 
 > [!IMPORTANT]
 > **Early development — not stable, not feature-complete.** Expect breaking changes in the public APIs. Not recommended for real data yet.
 
 ## How it works
 
-OniSync organizes files by **tags** instead of folders:
+Tagsy --"Taxi"-- organizes files by **tags** instead of folders:
 
 - You can tag files.
 - You can tag tags, so tags can form hierarchies.
@@ -17,7 +17,7 @@ OniSync organizes files by **tags** instead of folders:
 
 The upshot is that search is intentionally fuzzy: matching on any tag in a chain surfaces the file, so you rarely have to remember exactly where you put something. And because every device holds the full metadata (tags, relationships, file names), search always works — even offline, and even for files whose content lives on another device.
 
-Sync is handled by `onisyncd`, running on every device. It's a true two-way sync (edits on any device propagate to the others, with conflicts resolved per-item) and it's push-based over persistent connections — changes show up on peers as they happen, with no polling.
+Sync is handled by `tagsyd`, running on every device. It's a true two-way sync (edits on any device propagate to the others, with conflicts resolved per-item) and it's push-based over persistent connections — changes show up on peers as they happen, with no polling.
 
 ## Searching
 
@@ -58,24 +58,24 @@ A few things worth knowing:
 That last point means editing your rules has no effect on files that already exist. To catch them up:
 
 ```sh
-onisync retag --dry-run   # show what would be tagged
-onisync retag             # actually apply it
-onisync retag --check     # just validate the rules
+tagsy retag --dry-run   # show what would be tagged
+tagsy retag             # actually apply it
+tagsy retag --check     # just validate the rules
 ```
 
 `retag` only ever *adds* tags, including for files a rule no longer matches: nothing distinguishes a tag a rule applied from one you applied yourself, so removing them isn't safe.
 
-A rule whose pattern doesn't compile is skipped and reported by `onisync retag --check`; it never stops the daemon from starting or disables the other rules. The daemon reads its config once at startup, so restart it after editing rules.
+A rule whose pattern doesn't compile is skipped and reported by `tagsy retag --check`; it never stops the daemon from starting or disables the other rules. The daemon reads its config once at startup, so restart it after editing rules.
 
 ## Components
 
-OniSync is a Cargo workspace plus a Flutter app:
+Tagsy is a Cargo workspace plus a Flutter app:
 
-- **`onisync-core`** — Shared types and schema primitives used by every other crate.
-- **`onisyncd`** — The sync daemon: file watching, chunked transfer, and the versioned SQLite store.
-- **`onisync`** — The command-line client that talks to `onisyncd`.
-- **`onisync-bridge`** — `flutter_rust_bridge` glue that exposes the daemon to Dart as a native library (`.so` on Android, loaded in-process on desktop).
-- **`app/`** — The Flutter UI, built on top of `onisync-bridge`.
+- **`tagsy-core`** — Shared types and schema primitives used by every other crate.
+- **`tagsyd`** — The sync daemon: file watching, chunked transfer, and the versioned SQLite store.
+- **`tagsy`** — The command-line client that talks to `tagsyd`.
+- **`tagsy-bridge`** — `flutter_rust_bridge` glue that exposes the daemon to Dart as a native library (`.so` on Android, loaded in-process on desktop).
+- **`app/`** — The Flutter UI, built on top of `tagsy-bridge`.
 
 ## Supported platforms
 

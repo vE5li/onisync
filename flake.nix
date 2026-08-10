@@ -30,8 +30,8 @@
   }:
     {
       overlays.default = final: prev: {
-        onisyncd = final.callPackage ./nix/onisyncd.nix {};
-        onisync = final.callPackage ./nix/onisync.nix {};
+        tagsyd = final.callPackage ./nix/tagsyd.nix {};
+        tagsy = final.callPackage ./nix/tagsy.nix {};
       };
 
       nixosModules.default = import ./nix/module.nix self;
@@ -106,7 +106,7 @@
         # two-process topology). Unlike Android, `flutter build linux` drives a
         # CMake + Ninja + clang toolchain and links against GTK3; none of these
         # are pulled in by the Android tooling, so they must be listed
-        # explicitly. `cargo build -p onisync-bridge` (invoked from the Linux
+        # explicitly. `cargo build -p tagsy-bridge` (invoked from the Linux
         # runner's CMake hook) reuses the Rust toolchain already on PATH.
         linuxDesktopTools = with pkgs; [
           cmake
@@ -146,11 +146,11 @@
           pkgs.lib.concatStringsSep "\n"
           (pkgs.lib.mapAttrsToList (name: value: "export ${name}=${pkgs.lib.escapeShellArg value}") androidEnv);
 
-        # Turn a bash body into a `nix run`-able app named `onisync-<name>`, with
+        # Turn a bash body into a `nix run`-able app named `tagsy-<name>`, with
         # the toolchains on PATH and the shared env exported.
         mkApp = name: body: let
           script = pkgs.writeShellApplication {
-            name = "onisync-${name}";
+            name = "tagsy-${name}";
             # Both tool sets are on PATH: the Android steps ignore the desktop
             # tools and vice versa, but the Linux desktop apps (`run-linux`)
             # need CMake/Ninja/clang/GTK from `linuxDesktopTools`.
@@ -159,7 +159,7 @@
               ${androidEnvExports}
               # Run from the repo root regardless of where `nix run` was invoked.
               # All command bodies use paths relative to the repo root (e.g.
-              # `cp onisync-bridge/... app/...`), so we must actually chdir there;
+              # `cp tagsy-bridge/... app/...`), so we must actually chdir there;
               # `cd "$PWD"` would leave us wherever the user invoked `nix run`
               # (e.g. inside app/), breaking those relative paths. Resolve the
               # root explicitly: honour an override, else ask git for the
@@ -174,18 +174,18 @@
           };
         in {
           type = "app";
-          program = "${script}/bin/onisync-${name}";
+          program = "${script}/bin/tagsy-${name}";
         };
 
         # Build the `apps` output from an attrset of `{ <name> = <bash body>; }`,
-        # deriving each app's derivation name (`onisync-<name>`) from its attr key
+        # deriving each app's derivation name (`tagsy-<name>`) from its attr key
         # so the two never drift.
         mkApps = pkgs.lib.mapAttrs mkApp;
 
         # The Flutter app tree (app/) — including the Dart sources under app/lib/
         # (minus the generated app/lib/rust/) and the hand-merged Android glue —
         # is tracked in git and is the source of truth. It is never regenerated;
-        # the one-time scaffolding is documented in onisync-bridge/android/README.md.
+        # the one-time scaffolding is documented in tagsy-bridge/android/README.md.
 
         # Generate the Dart <-> Rust bindings.
         codegenBody = ''
@@ -201,7 +201,7 @@
           for abi in $abis; do targets+=("-t" "$abi"); done
           cargo ndk "''${targets[@]}" \
             -o app/android/app/src/main/jniLibs \
-            build --release -p onisync-bridge --features generated
+            build --release -p tagsy-bridge --features generated
         '';
 
         # Standalone build step: cross-compile for a fixed ABI set. Defaults to
@@ -286,7 +286,7 @@
         selectAndroidConfigBody = ''
           mkdir -p app/android/app/src/main/assets
           cp "app/config/''${ONISYNC_CONFIG}.json" \
-             "app/android/app/src/main/assets/onisync_config.json"
+             "app/android/app/src/main/assets/tagsy_config.json"
         '';
 
         # Fast path: pick the device and launch, no native rebuild. Assumes the
@@ -320,15 +320,15 @@
         # an empty database on next launch. The package id matches
         # app/android/app/build.gradle.kts (applicationId).
         runAndroidCleanBody = ''
-          echo "Uninstalling com.example.onisync_app to wipe local data..."
+          echo "Uninstalling com.example.tagsy_app to wipe local data..."
           # adb ships with the composed Android SDK's platform-tools; reference
           # it by absolute path rather than assuming it is on PATH. Don't fail if
           # the package isn't installed yet.
-          "${androidSdkRoot}/platform-tools/adb" uninstall com.example.onisync_app || true
+          "${androidSdkRoot}/platform-tools/adb" uninstall com.example.tagsy_app || true
           # Rebuild the native .so for the device's ABI before running: a fresh
           # install (or a cleaned tree) has no bundled library, and `flutter run`
           # alone does not build it, so the app would crash with
-          # "libonisync_bridge.so not found". Building the device's own ABI also
+          # "libtagsy_bridge.so not found". Building the device's own ABI also
           # avoids the stale-.so / frb wire mismatch on x86_64 emulators.
           ${runAndroidLaunchBody}
         '';
@@ -336,13 +336,13 @@
         # Build/run the Flutter Linux desktop app. Unlike Android, the native
         # library is built and bundled by the runner's CMake hook
         # (app/linux/CMakeLists.txt) during `flutter run`, so there is no
-        # separate native-build step here. The daemon (onisyncd) is a separate,
+        # separate native-build step here. The daemon (tagsyd) is a separate,
         # long-lived process the user runs via systemd or cargo; the flake does
         # not build or manage it, and the app attaches to its control socket at
         # launch.
         #
         # We build in release mode so the produced bundle at
-        # app/build/linux/x64/release/bundle/onisync_app is a real,
+        # app/build/linux/x64/release/bundle/tagsy_app is a real,
         # standalone-launchable binary — `flutter run` itself is slow to start
         # (device daemon, hot-reload VM service, incremental compiler), but the
         # resulting binary boots instantly, so a wrapper script can exec it
@@ -357,9 +357,9 @@
         formatter = pkgs.alejandra;
 
         packages = rec {
-          onisyncd = pkgs.onisyncd;
-          onisync = pkgs.onisync;
-          default = onisync;
+          tagsyd = pkgs.tagsyd;
+          tagsy = pkgs.tagsy;
+          default = tagsy;
         };
 
         apps = mkApps {
@@ -422,7 +422,7 @@
 
               # Where the daemon (run via `cargo run` in dev) finds its preview
               # generation tools: libpdfium.so for PDF, ffmpeg/ffprobe for video.
-              # The packaged daemon (nix/onisyncd.nix) sets these itself via a
+              # The packaged daemon (nix/tagsyd.nix) sets these itself via a
               # wrapper; these cover the dev-shell workflow. Pinned nixpkgs builds.
               ONISYNC_PDFIUM_LIB_PATH = "${pkgs.pdfium-binaries}/lib";
               ONISYNC_FFMPEG_PATH = "${pkgs.ffmpeg}/bin";

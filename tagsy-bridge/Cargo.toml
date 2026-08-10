@@ -1,0 +1,55 @@
+[package]
+name = "tagsy-bridge"
+version = "0.1.0"
+edition = "2024"
+
+# The native library the Android app loads. It links the `tagsy` core (as an
+# rlib) and re-exposes the section-5/6 API to Dart. `cdylib` produces the
+# `.so` that `cargo-ndk` copies into the Flutter app's `jniLibs/<abi>/`; `rlib`
+# keeps it usable from Rust tests/harnesses on the host.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# The `flutter_rust_bridge` integration is opt-in so the crate stays buildable
+# (and `cargo check`-able offline) without pulling the generator's dependency
+# tree. Enabling it turns on the `#[flutter_rust_bridge::frb]` annotations the
+# codegen consumes; the runtime/API logic is identical either way.
+default = []
+# Turns on the `#[frb]` annotations the codegen consumes.
+flutter_rust_bridge = ["dep:flutter_rust_bridge"]
+# Set once `flutter_rust_bridge_codegen` has written `src/frb_generated.rs`;
+# pulls that generated module into the build. Kept separate from
+# `flutter_rust_bridge` so the crate compiles before the first codegen run.
+generated = ["flutter_rust_bridge"]
+
+[dependencies]
+tagsyd = { workspace = true }
+tagsy-core = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+flutter_rust_bridge = { workspace = true, optional = true }
+
+# Route the core's `log` output to logcat on Android instead of `env_logger`
+# (which targets a shell/stderr that Android does not have). Only compiled for
+# Android targets; desktop builds keep using the binary's `env_logger`.
+#
+# `jni` lets the foreground service (Kotlin) start/stop the process-global
+# runtime directly, so sync survives the UI being closed (plan section 8).
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = { workspace = true }
+jni = { workspace = true }
+
+# Desktop (non-Android): the app process loads the bridge .so but has no
+# env_logger of its own (unlike the daemon binary), so client-side `log` output
+# from the IPC backend was previously silent. Install env_logger here.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+env_logger = { workspace = true }
+
+[lints.rust]
+# `flutter_rust_bridge`'s `#[frb]` macro emits code gated on `cfg(frb_expand)`,
+# a cfg only its own `cargo expand` invocation sets. Tell rustc it is expected
+# so ordinary builds don't warn about it.
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(frb_expand)'] }

@@ -1,11 +1,11 @@
 import 'package:flutter/material.dart';
 
-import '../rust/api.dart' as onisync;
+import '../rust/api.dart' as tagsy;
 
 /// Preview for a file whose bytes are **not** present locally.
 ///
 /// Unlike [FilePreview] (which reads full-fidelity bytes off disk), this asks
-/// the daemon for a small, cacheable preview via [OniSyncApp.getPreview]
+/// the daemon for a small, cacheable preview via [TagsyApp.getPreview]
 /// — a low-resolution image or a short text snippet. The daemon generates it
 /// from a peer that holds the content (first responder wins) and caches it, so
 /// repeat opens are cheap. A file that no peer holds, or whose content is not
@@ -23,7 +23,7 @@ class RemotePreview extends StatefulWidget {
     required this.contentHash,
   });
 
-  final onisync.OniSyncApp app;
+  final tagsy.TagsyApp app;
   final String fileId;
 
   /// The file's current content hash. Not passed to the API (the daemon keys
@@ -36,7 +36,7 @@ class RemotePreview extends StatefulWidget {
 }
 
 class _RemotePreviewState extends State<RemotePreview> {
-  late Future<onisync.PreviewEntry> _future;
+  late Future<tagsy.PreviewEntry> _future;
 
   @override
   void initState() {
@@ -56,7 +56,7 @@ class _RemotePreviewState extends State<RemotePreview> {
 
   @override
   Widget build(BuildContext context) {
-    return FutureBuilder<onisync.PreviewEntry>(
+    return FutureBuilder<tagsy.PreviewEntry>(
       future: _future,
       builder: (context, snapshot) {
         if (snapshot.connectionState != ConnectionState.done) {
@@ -76,7 +76,7 @@ class _RemotePreviewState extends State<RemotePreview> {
           // A file no peer can serve is *not* an error: `getPreview` resolves
           // it to `PreviewKind.none`, handled in `_buildPreview`. The only
           // meaningful rejection here is the file id itself being gone.
-          final missing = error is onisync.ApiError_UnknownId;
+          final missing = error is tagsy.ApiError_UnknownId;
           return _PreviewTile(
             icon: missing ? Icons.help_outline : Icons.cloud_off_outlined,
             title: missing ? 'File no longer exists' : 'Failed to load preview',
@@ -90,9 +90,9 @@ class _RemotePreviewState extends State<RemotePreview> {
     );
   }
 
-  Widget _buildPreview(BuildContext context, onisync.PreviewEntry preview) {
+  Widget _buildPreview(BuildContext context, tagsy.PreviewEntry preview) {
     switch (preview.kind) {
-      case onisync.PreviewKind.image:
+      case tagsy.PreviewKind.image:
         final bytes = preview.imageBytes;
         if (bytes == null || bytes.isEmpty) {
           return const _PreviewTile(
@@ -112,7 +112,7 @@ class _RemotePreviewState extends State<RemotePreview> {
             child: Image.memory(bytes, fit: BoxFit.contain),
           ),
         );
-      case onisync.PreviewKind.text:
+      case tagsy.PreviewKind.text:
         final text = preview.text ?? '';
         return Padding(
           padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 16),
@@ -126,7 +126,7 @@ class _RemotePreviewState extends State<RemotePreview> {
             ],
           ),
         );
-      case onisync.PreviewKind.none:
+      case tagsy.PreviewKind.none:
         return const _PreviewTile(
           icon: Icons.description_outlined,
           title: 'No preview available',
