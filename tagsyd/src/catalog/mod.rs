@@ -6,3 +6,4 @@
 //! and its message types) moves here in a later phase.
 
 pub mod placement;
+pub mod previews;

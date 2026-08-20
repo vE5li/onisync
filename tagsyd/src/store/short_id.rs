@@ -3,8 +3,8 @@
 //!
 //! Generic over `(table, column)` so files and tags share one implementation.
 
-use tagsy_core::{FileId, TagId};
 use rusqlite::{Connection, OptionalExtension};
+use tagsy_core::{FileId, TagId};
 
 use super::CatalogStore;
 use super::types::DatabaseError;

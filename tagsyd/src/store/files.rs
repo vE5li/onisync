@@ -4,8 +4,8 @@
 //! Also home to `manifest_entries`, which joins those rows to their version
 //! history to build what a peer is told about on connect.
 
-use tagsy_core::{FileId, FileInfo, LogicalPath};
 use rusqlite::OptionalExtension;
+use tagsy_core::{FileId, FileInfo, LogicalPath};
 
 use super::CatalogStore;
 use super::previews::delete_previews_for;

@@ -223,8 +223,9 @@ pub enum DaemonMessage {
     ///    off-loop (`spawn_blocking`), caches it via `ApplyPreview`, and
     ///    replies;
     /// 3. else floods a `PreviewRequest` across the peer tree and caches +
-    ///    replies with the first response (or `Preview::None` if none holds
-    ///    it).
+    ///    replies with the first response. If no reachable peer holds it, the
+    ///    result is the *transient* [`PreviewError::Unavailable`] (not cached),
+    ///    not a `Preview::None`, so a later request retries.
     GetPreview {
         file_id: FileId,
         respond_to: oneshot::Sender<Result<Preview, PreviewError>>,
@@ -238,10 +239,16 @@ pub enum DaemonMessage {
     /// Split out from `GetPreview` (mirroring `Fetch`→`Materialize` and
     /// `Restore`→`ApplyRestore`) so slow generation / network work never blocks
     /// the single-threaded consumer.
+    ///
+    /// `result` carries the resolution outcome: an authoritative `Ok(preview)`
+    /// (including a cacheable `Preview::None`), which is written to
+    /// `previews_v1`; or `Err(PreviewError::Unavailable)`, the transient case,
+    /// which is **not** cached and is forwarded to the caller unchanged so a
+    /// later request retries.
     ApplyPreview {
         file_id: FileId,
         content_hash: String,
-        preview: Preview,
+        result: Result<Preview, PreviewError>,
         respond_to: oneshot::Sender<Result<Preview, PreviewError>>,
     },
     /// Operator-initiated purge of the whole preview cache (`previews_v1`).
@@ -332,15 +339,25 @@ pub enum RestoreError {
 
 /// Why a preview request failed.
 ///
-/// Note that "no peer holds the content" is *not* an error: it resolves to
-/// [`Preview::None`]. This enum covers only genuine failures (the file is
-/// unknown, or the daemon is shutting down / its internals dropped a channel).
+/// Note that a *locally-determined* "this content has no preview" (an
+/// un-previewable type, or a peer that generated and found none) is **not** an
+/// error: it resolves to an authoritative, cacheable [`Preview::None`].
+/// [`Unavailable`](Self::Unavailable) is the distinct *transient* case — we
+/// could not obtain a preview *this time* — which must not be cached so the
+/// next request retries.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum PreviewError {
     /// The file id is not in the catalog (no recorded version to key a preview
     /// by). Distinct from a known file that simply has no preview.
     #[error("file is not known to the catalog")]
     UnknownFile,
+    /// A preview could not be obtained *this time*: local generation did not
+    /// produce one (bytes absent/racing, or generation panicked) and no
+    /// reachable peer served one either. Transient and **not** cached — unlike
+    /// an authoritative `Preview::None` — so a later request re-attempts once a
+    /// holder is online or the transient condition clears.
+    #[error("preview unavailable: could not generate locally and no reachable device served one")]
+    Unavailable,
     /// The runtime is shutting down, or an internal responder was dropped.
     #[error("runtime is shutting down")]
     ShuttingDown,

@@ -24,9 +24,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tagsy_core::state::{Change, ChangeOrigin};
 use tagsy_core::{FileId, FileInfo, LogicalPath, Preview, TagId};
-use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{broadcast, oneshot};
 
@@ -131,6 +131,11 @@ impl From<PreviewError> for ApiError {
         match error {
             // The file id isn't in the catalog at all.
             PreviewError::UnknownFile => ApiError::UnknownId,
+            // Transient: local generation produced nothing and no reachable
+            // peer served one. Mirrors `FetchError::NotAvailable` — the entity
+            // exists, its preview just couldn't be obtained right now, so the
+            // UI should offer a retry rather than treat it as permanent.
+            PreviewError::Unavailable => ApiError::ContentUnavailable,
             PreviewError::ShuttingDown => ApiError::Internal(error.to_string()),
         }
     }
@@ -1011,6 +1016,12 @@ impl Api {
     /// A file with no previewable content resolves to [`Preview::None`] — that
     /// is a successful result, not an error. `ApiError::UnknownId` means the
     /// file id itself is unknown to the catalog.
+    ///
+    /// `ApiError::ContentUnavailable` is the *transient* case: the file exists
+    /// but a preview could not be obtained right now (no local bytes to
+    /// generate from and no reachable peer served one). It is deliberately not
+    /// cached, so the UI should offer a retry rather than treat it as a
+    /// permanent "no preview".
     pub async fn get_preview(&self, file_id: FileId) -> Result<Preview, ApiError> {
         // End-to-end stopwatch for the whole daemon-side request (bus enqueue →
         // handle_changes resolution → reply). Combined with the finer-grained

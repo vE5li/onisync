@@ -3,8 +3,8 @@
 //! Nothing here touches SQL; these are the vocabulary the per-table modules
 //! speak in.
 
-use tagsy_core::FileId;
 use serde::{Deserialize, Serialize};
+use tagsy_core::FileId;
 
 /// A single recorded version of a file's content.
 ///

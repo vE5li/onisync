@@ -14,9 +14,9 @@
 
 use std::collections::BTreeSet;
 
+use rusqlite::OptionalExtension;
 use tagsy_core::state::{RelationshipKind, RelationshipManifestEntry};
 use tagsy_core::{FileId, TagId};
-use rusqlite::OptionalExtension;
 
 use super::CatalogStore;
 use super::types::{DatabaseError, SubtagRule};

@@ -4,10 +4,10 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use tagsy_core::state::Frame;
-use tagsy_core::{FileId, LogicalPath, PhysicalPath, TagId};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use tagsy_core::state::Frame;
+use tagsy_core::{FileId, LogicalPath, PhysicalPath, TagId};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::bus::PeerCommand;

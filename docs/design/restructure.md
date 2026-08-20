@@ -555,7 +555,7 @@ found nothing else.
   for `contains_all_tags` were added there too (it had none before, in any of
   its three call sites). Test count: 204 → 207.
 
-### 2.3 — Extract `catalog/previews.rs` — **S**
+### 2.3 — Extract `catalog/previews.rs` — **S** — **DONE**
 
 - **Why** Removes **every** `#[cfg(feature = "preview-generation")]` from the
   rest of `lib.rs` (six items, including a duplicated
@@ -564,7 +564,7 @@ found nothing else.
 - **Verify** `cargo test --workspace`; `cargo check -p tagsyd --no-default-features`
 - **Depends on** —
 
-### 2.4 — Split `preview.rs` into `preview/` — **S**
+### 2.4 — Split `preview.rs` into `preview/` — **S** — **DONE**
 
 - **Why** Three independent backends, each `fn(&[u8]) -> Option<Preview>` with
   no shared state, plus a separately-testable classifier. `pdf` and `video` are
@@ -573,6 +573,11 @@ found nothing else.
   `pdf.rs` (239–356), `video.rs` (372–530), `text.rs` (533–550). 12 tests
   distribute across them.
 - **Verify** `cargo test --workspace`
+- **As landed** — line ranges above were stale (the earlier `FileBytes`-based
+  `generate`/`read_source_bounded`/video-path work had grown the file to 822
+  lines); mapped against the current file instead, caps/`Kind`/`classify` are
+  `pub(super)`, and `mod.rs` refers to the `image` *crate* as `::image` to avoid
+  shadowing by the new `image` submodule; 207 tests, count unchanged.
 - **Depends on** —
 
 ---

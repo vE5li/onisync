@@ -7,14 +7,14 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, ContentArrangement, Table};
+use owo_colors::OwoColorize;
+use serde::Serialize;
+use serde_json::json;
 use tagsy_core::{FileId, FileInfo, TagId};
 use tagsyd::control::IpcClientBackend;
 use tagsyd::operations::{Operation, OperationKind, OperationStatus};
 use tagsyd::store::{DeletedRule, SubtagRule, Tag};
 use tagsyd::transport::TransportBackend;
-use owo_colors::OwoColorize;
-use serde::Serialize;
-use serde_json::json;
 
 /// How command results are rendered to stdout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -238,8 +238,8 @@ pub(super) fn create_previews_v1(connection: &Connection) -> Result<(), Database
     // `invalidate_previews`) is therefore about bounding table growth and
     // clearing tombstoned files, not correctness.
     //
-    // - `kind` is the discriminant of `tagsy_core::Preview` (0 = Image, 1 = Text,
-    //   2 = None). The `None` kind is a *cached negative result* ("this content has
+    // - `kind` is the discriminant of `tagsy_core::Preview` (0 = Image, 1 = Text, 2
+    //   = None). The `None` kind is a *cached negative result* ("this content has
     //   no preview"), so an un-previewable file is not re-generated on every
     //   request.
     // - `data` holds the encoded image bytes (kind = Image) or the UTF-8 snippet

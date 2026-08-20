@@ -21,7 +21,7 @@ use std::time::Duration;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tagsy_core::state::{Change, ChangeOrigin, Frame, Sync as SyncMessage};
-use tagsy_core::{FileId, LogicalPath, Preview, TagId};
+use tagsy_core::{FileId, LogicalPath, TagId};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -31,6 +31,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bus::{ContentChange, DaemonMessage, Ingest};
 use crate::catalog::placement::{self, Placement};
+#[cfg(feature = "preview-generation")]
+use crate::catalog::previews::preview_extension_for;
+use crate::catalog::previews::{
+    PREVIEW_GENERATION_COMPILED, maybe_eager_preview, resolve_preview, try_serve_generated_preview,
+};
 use crate::configuration::{CompiledTagRules, Configuration, Peer, RuntimeConfiguration, SyncType};
 use crate::directory_manager::{SyncDirectoryCommand, SyncDirectoryManager};
 use crate::fetch::PendingFetches;
@@ -42,7 +47,7 @@ use crate::peer::plan::{
     plan_file_sync,
 };
 use crate::peer::plan_tags::{build_local_tag_manifest, build_tag_request_response, plan_tag_sync};
-use crate::preview_fetch::{PendingPreviews, PreviewReply};
+use crate::preview_fetch::PendingPreviews;
 use crate::store::CatalogStore;
 use crate::transfer::{ChunkAnswer, ChunkReply, ChunkRequest, ReceiveOutcome, VerifiedHashCache};
 
@@ -1762,7 +1767,7 @@ async fn clear_outbound_if_owned(
 /// Returns `Some(bytes)` on a hash match, `None` if the file is absent locally
 /// or its local content does not match the requested hash (in which case the
 /// request should be served from peers).
-async fn read_local_if_hash_matches(
+pub(crate) async fn read_local_if_hash_matches(
     command_sender: &UnboundedSender<SyncDirectoryCommand>,
     file_id: FileId,
     expected_hash: &str,
@@ -1793,275 +1798,6 @@ async fn read_local_if_hash_matches(
             None
         }
     }
-}
-
-/// Whether this build can generate previews at all: the `preview-generation`
-/// feature (and its `image`/`pdfium` deps) is compiled in.
-const PREVIEW_GENERATION_COMPILED: bool = cfg!(feature = "preview-generation");
-
-/// If this device is configured for **eager** previews, kick off preview
-/// generation for `file_id` now (fire-and-forget), so the preview is warm in
-/// the cache before anyone requests it.
-///
-/// Implemented by enqueuing a fire-and-forget [`DaemonMessage::GetPreview`]
-/// (the reply is discarded): it reuses the exact resolve-and-cache path, runs
-/// the CPU-heavy generation in `spawn_blocking` off the writer loop, and is a
-/// cheap no-op when the preview is already cached. Call this only after the
-/// file's bytes are known to be present locally (a completed peer transfer or a
-/// locally-observed file), so the local-first `resolve_preview` generates from
-/// disk rather than fetching from a peer.
-///
-/// A no-op unless the policy is [`PreviewGenerationPolicy::Eager`].
-fn maybe_eager_preview(
-    configuration: &Configuration,
-    change_sender: &UnboundedSender<DaemonMessage>,
-    file_id: FileId,
-) {
-    if !configuration.preview_generation_policy.is_eager() {
-        return;
-    }
-    // Throwaway responder: we don't consume the result here, we only want the
-    // side effect of generating + caching it.
-    let (respond_to, _discard) = tokio::sync::oneshot::channel();
-    if change_sender
-        .send(DaemonMessage::GetPreview {
-            file_id,
-            respond_to,
-        })
-        .is_err()
-    {
-        log::debug!(
-            "maybe_eager_preview: change channel closed; skipping eager preview for {}",
-            file_id.to_string()
-        );
-    } else {
-        log::debug!(
-            "maybe_eager_preview: enqueued eager preview generation for {}",
-            file_id.to_string()
-        );
-    }
-}
-
-/// Resolve the preview for `(file_id, content_hash)` when it is not cached.
-///
-/// Presence-first, mirroring the byte-fetch policy: if this device *can
-/// generate* (`can_generate`) and the file is present locally (its bytes are on
-/// disk and hash-match), generate the preview here (off the async runtime, via
-/// `spawn_blocking`); otherwise flood a `PreviewRequest` across the peer tree
-/// and take the first responder. A file that no reachable peer holds resolves
-/// to [`Preview::None`] — a valid, cacheable "no preview" result, not an error.
-///
-/// `can_generate` is `false` on a `Never`-policy device (or a build without the
-/// `preview-generation` feature); such a device skips local generation and only
-/// ever obtains previews from peers.
-///
-/// Runs off the DB-writer loop; the caller re-enters via
-/// [`DaemonMessage::ApplyPreview`] to cache the result.
-async fn resolve_preview(
-    command_sender: &UnboundedSender<SyncDirectoryCommand>,
-    pending_previews: &PendingPreviews,
-    file_id: FileId,
-    content_hash: &str,
-    can_generate: bool,
-    // The file's lowercase extension (from its logical name), a type-detection
-    // hint for local generation. Looked up by the caller (which holds a DB
-    // handle) and unused when we cannot generate locally.
-    extension: Option<String>,
-) -> Preview {
-    let short = content_hash.get(..8).unwrap_or(content_hash);
-
-    // 1. Can we generate locally? Only if this device's policy permits it and
-    // the generation stack is compiled in. If so, and the file is present
-    // locally, generate from our own bytes. The block is `cfg`-gated because it
-    // references `generate_preview_from_local`, which only exists with the
-    // feature; `can_generate` is always `false` without it, so this is a no-op
-    // either way.
-    #[cfg(feature = "preview-generation")]
-    if can_generate {
-        // NOTE: `read_local_if_hash_matches` issues
-        // `SyncDirectoryCommand::ReadFile`, which reads *and hashes the whole
-        // file* to verify it matches `content_hash` (O(size)).
-        let local_read_start = std::time::Instant::now();
-        let local = read_local_if_hash_matches(command_sender, file_id, content_hash).await;
-        log::debug!(
-            "resolve_preview[{short}]: local ReadFile+verify for {} took {:?} (present={})",
-            file_id.to_string(),
-            local_read_start.elapsed(),
-            local.is_some()
-        );
-
-        if let Some(file_bytes) = local {
-            match generate_preview_from_local(file_id, file_bytes, extension.clone()).await {
-                Some(preview) => return preview,
-                // Read failed (row present but bytes gone/racing): fall through
-                // to asking peers rather than failing outright.
-                None => log::debug!(
-                    "resolve_preview[{short}]: local read failed for {}; asking peers",
-                    file_id.to_string()
-                ),
-            }
-        }
-    }
-    // Without the feature, local generation is compiled out, so these are dead;
-    // silence the unused warnings.
-    #[cfg(not(feature = "preview-generation"))]
-    let _ = (can_generate, command_sender, &extension);
-
-    // 2. Not present locally: ask peers. First responder wins; exhaustion or
-    // timeout resolves to `None`.
-    let peer_start = std::time::Instant::now();
-    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    pending_previews
-        .request_preview_local(file_id, content_hash.to_owned(), reply_tx)
-        .await;
-
-    let result = match reply_rx.await {
-        Ok(PreviewReply::Data(preview)) => preview,
-        Ok(PreviewReply::Miss) | Err(_) => Preview::None,
-    };
-    log::debug!(
-        "resolve_preview[{short}]: peer fetch for {} took {:?}",
-        file_id.to_string(),
-        peer_start.elapsed()
-    );
-    result
-}
-
-/// Read `file_bytes` fully (bounded) and generate a [`Preview`] off the async
-/// runtime.
-///
-/// Returns `Some(preview)` on success (including `Some(Preview::None)` for
-/// un-previewable content — an authoritative negative result), or `None` if the
-/// bytes could not be read (row present but file gone/racing), so the caller
-/// can fall back to asking peers.
-///
-/// Only compiled with the `preview-generation` feature; all call sites are
-/// guarded by `can_generate`, which is `false` without it.
-/// Look up a file's lowercase extension (no dot, e.g. `"jpg"`) from its logical
-/// name in the main DB, for use as a preview type-detection hint.
-///
-/// Returns `None` if the file is unknown, has no extension, or the DB read
-/// fails — the generator then relies on magic-byte sniffing alone.
-#[cfg(feature = "preview-generation")]
-fn preview_extension_for(database: &CatalogStore, file_id: FileId) -> Option<String> {
-    let logical_path = database.logical_path_for_file_id(file_id).ok()?;
-    std::path::Path::new(logical_path.as_str())
-        .extension()
-        .map(|extension| extension.to_string_lossy().to_lowercase())
-}
-
-#[cfg(feature = "preview-generation")]
-async fn generate_preview_from_local(
-    file_id: FileId,
-    file_bytes: FileBytes,
-    extension: Option<String>,
-) -> Option<Preview> {
-    const MAX_PREVIEW_SOURCE_BYTES: usize = 32 * 1024 * 1024;
-
-    let read_start = std::time::Instant::now();
-    match file_bytes.read_all_bounded(MAX_PREVIEW_SOURCE_BYTES).await {
-        Ok((bytes, _complete)) => {
-            log::debug!(
-                "generate_preview_from_local: read {} source bytes for {} in {:?} (ext={:?})",
-                bytes.len(),
-                file_id.to_string(),
-                read_start.elapsed(),
-                extension.as_deref()
-            );
-            // Time the whole blocking hop separately from the read: this
-            // includes any wait for a free blocking-pool thread *plus* the
-            // decode/resize/encode itself (which `preview::generate` logs
-            // internally).
-            let blocking_start = std::time::Instant::now();
-            match tokio::task::spawn_blocking(move || {
-                crate::preview::generate(&bytes, extension.as_deref())
-            })
-            .await
-            {
-                Ok(preview) => {
-                    log::debug!(
-                        "generate_preview_from_local: spawn_blocking(generate) for {} took {:?}",
-                        file_id.to_string(),
-                        blocking_start.elapsed()
-                    );
-                    Some(preview)
-                }
-                Err(error) => {
-                    log::error!(
-                        "generate_preview_from_local: task panicked for {}: {error}",
-                        file_id.to_string()
-                    );
-                    // A panic in generation is not a read failure; treat it as a
-                    // (negative) result rather than triggering a peer fetch.
-                    Some(Preview::None)
-                }
-            }
-        }
-        Err(error) => {
-            log::debug!(
-                "generate_preview_from_local: read failed for {}: {:?}",
-                file_id.to_string(),
-                error
-            );
-            None
-        }
-    }
-}
-
-/// Tier-2 of the peer `PreviewRequest` handler: try to *generate* a preview
-/// from local bytes and send it as `PreviewData`. Returns `true` if a
-/// `PreviewData` was sent, `false` if the caller should relay instead.
-///
-/// Two implementations by feature: with `preview-generation`, it generates when
-/// `can_generate` and the content is present locally; without the feature it is
-/// a no-op that always returns `false` (so the request is relayed), consuming
-/// its arguments so the call site needs no `cfg`.
-#[cfg(feature = "preview-generation")]
-async fn try_serve_generated_preview(
-    our_sender: &UnboundedSender<Frame>,
-    command_sender: &UnboundedSender<SyncDirectoryCommand>,
-    can_generate: bool,
-    peer_name: &str,
-    file_id: FileId,
-    content_hash: &str,
-    extension: Option<String>,
-) -> bool {
-    if !can_generate {
-        return false;
-    }
-    let Some(file_bytes) = read_local_if_hash_matches(command_sender, file_id, content_hash).await
-    else {
-        return false;
-    };
-    let Some(preview) = generate_preview_from_local(file_id, file_bytes, extension).await else {
-        return false;
-    };
-    log::debug!(
-        "peer[{peer_name}]: served generated PreviewData {} [{}]",
-        file_id.to_string(),
-        content_hash.get(..8).unwrap_or(content_hash)
-    );
-    let _ = our_sender.send(Frame::Sync(SyncMessage::PreviewData {
-        file_id,
-        content_hash: content_hash.to_owned(),
-        preview,
-    }));
-    true
-}
-
-/// See the feature-enabled variant. Without `preview-generation` this device
-/// cannot generate, so it never serves a generated preview.
-#[cfg(not(feature = "preview-generation"))]
-async fn try_serve_generated_preview(
-    _our_sender: &UnboundedSender<Frame>,
-    _command_sender: &UnboundedSender<SyncDirectoryCommand>,
-    _can_generate: bool,
-    _peer_name: &str,
-    _file_id: FileId,
-    _content_hash: &str,
-    _extension: Option<String>,
-) -> bool {
-    false
 }
 
 /// Answer a content-addressed `ChunkRequest` from a **local** source, if this
@@ -3278,7 +3014,7 @@ async fn handle_changes(
                 let change_sender_preview = change_sender.clone();
                 tokio::spawn(async move {
                     let resolve_start = std::time::Instant::now();
-                    let preview = resolve_preview(
+                    let result = resolve_preview(
                         &command_sender_preview,
                         &pending_previews_preview,
                         file_id,
@@ -3288,9 +3024,11 @@ async fn handle_changes(
                     )
                     .await;
                     log::debug!(
-                        "GetPreview: {} resolve_preview took {:?} (total since request: {:?})",
+                        "GetPreview: {} resolve_preview took {:?} (ok={}, total since request: \
+                         {:?})",
                         file_id.to_string(),
                         resolve_start.elapsed(),
+                        result.is_ok(),
                         request_start.elapsed()
                     );
 
@@ -3298,7 +3036,7 @@ async fn handle_changes(
                         .send(DaemonMessage::ApplyPreview {
                             file_id,
                             content_hash,
-                            preview,
+                            result,
                             respond_to,
                         })
                         .is_err()
@@ -3317,26 +3055,41 @@ async fn handle_changes(
             DaemonMessage::ApplyPreview {
                 file_id,
                 content_hash,
-                preview,
+                result,
                 respond_to,
             } => {
                 // Cache the resolved preview on the writer loop, then reply.
-                // Best-effort caching: a DB error still returns the preview to
-                // the caller (they just don't get the cache benefit next time).
-                let cache_write_start = std::time::Instant::now();
-                if let Err(error) = database.record_preview(file_id, &content_hash, &preview) {
-                    log::error!(
-                        "ApplyPreview: record_preview failed for {}: {:?}",
+                // Only an authoritative `Ok(preview)` (including a cacheable
+                // `Preview::None`) is written; a transient `Err` (e.g.
+                // `Unavailable` — local generation produced nothing and no peer
+                // served one) is forwarded to the caller unchanged and left
+                // *out* of the cache, so the next request re-attempts.
+                //
+                // Caching is best-effort: a DB error still returns the preview
+                // to the caller (they just don't get the cache benefit next
+                // time).
+                if let Ok(preview) = &result {
+                    let cache_write_start = std::time::Instant::now();
+                    if let Err(error) = database.record_preview(file_id, &content_hash, preview) {
+                        log::error!(
+                            "ApplyPreview: record_preview failed for {}: {:?}",
+                            file_id.to_string(),
+                            error
+                        );
+                    }
+                    log::debug!(
+                        "ApplyPreview: {} cache write took {:?}; replying to caller",
                         file_id.to_string(),
-                        error
+                        cache_write_start.elapsed()
+                    );
+                } else {
+                    log::debug!(
+                        "ApplyPreview: {} resolved transiently unavailable; not caching, replying \
+                         to caller",
+                        file_id.to_string()
                     );
                 }
-                log::debug!(
-                    "ApplyPreview: {} cache write took {:?}; replying to caller",
-                    file_id.to_string(),
-                    cache_write_start.elapsed()
-                );
-                let _ = respond_to.send(Ok(preview));
+                let _ = respond_to.send(result);
                 continue;
             }
             DaemonMessage::PurgePreviews { respond_to } => {
@@ -3399,7 +3152,8 @@ async fn handle_changes(
                 // the version (byte-independent catalog; the bytes are pulled
                 // separately on the session link). Seed the path clock from the
                 // manifest entry's originating stamp (not our receive time).
-                if !database.file_exists(file_id).unwrap_or(false)
+                let is_new = !database.file_exists(file_id).unwrap_or(false);
+                if is_new
                     && let Err(error) =
                         database.add_file(file_id, &logical_path, logical_path_modified_at)
                 {
@@ -3435,6 +3189,40 @@ async fn handle_changes(
                         error
                     );
                 }
+
+                // Announce this reconcile-derived version onward so it
+                // propagates transitively across the peer tree. Without this a
+                // change learned via `Manifest` reconciliation would dead-end
+                // here: a hub (e.g. `central`) that catches an offline-created
+                // file up from one peer via reconcile would never relay it to
+                // its other continuously-connected peers, which only ever hear
+                // live `FileMetadata{Added,Changed}` — never this catalog write.
+                // We reconcile pairwise, but not every pair of peers reconciles
+                // directly, so transitive forwarding is required for
+                // convergence. Mirror the live handlers: a brand-new file is a
+                // `FileMetadataAdded` (tags empty — they reconcile separately via
+                // `TagManifest`, exactly as this reconcile's own `Create`
+                // placement left them); a new version of a known file is a
+                // `FileMetadataChanged`. The `content_hash`/`origin` carry the
+                // three-way LWW clocks unchanged so downstream reconciliation is
+                // unaffected.
+                let change = if is_new {
+                    Change::FileMetadataAdded {
+                        file_id,
+                        logical_path,
+                        logical_path_modified_at,
+                        content_hash,
+                        size,
+                        tags: Vec::new(),
+                    }
+                } else {
+                    Change::FileMetadataChanged {
+                        file_id,
+                        content_hash,
+                        size,
+                    }
+                };
+                forward_to_peers(&configuration, &runtime_configuration, &change, &origin).await;
                 continue;
             }
             DaemonMessage::Materialize {

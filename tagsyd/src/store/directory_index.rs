@@ -9,8 +9,8 @@
 
 use std::path::Path;
 
-use tagsy_core::{FileId, PhysicalPath};
 use rusqlite::Connection;
+use tagsy_core::{FileId, PhysicalPath};
 
 use super::schema;
 use super::types::DatabaseError;

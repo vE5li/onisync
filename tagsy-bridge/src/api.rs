@@ -26,14 +26,12 @@
 pub use tagsy_core::{FileInfo, Preview};
 pub use tagsyd::api::{ApiError, ApiEvent};
 pub use tagsyd::configuration::EditorRule;
-pub use tagsyd::store::{DeletedRule, SubtagRule, Tag};
 pub use tagsyd::operations::{
     Direction, Operation, OperationEvent, OperationKind, OperationStatus,
 };
 use tagsyd::paths::Paths;
-use tagsyd::transport::{
-    Backend, EventStream, OperationStream, OperationUpdate, TransportBackend,
-};
+pub use tagsyd::store::{DeletedRule, SubtagRule, Tag};
+use tagsyd::transport::{Backend, EventStream, OperationStream, OperationUpdate, TransportBackend};
 use tokio::sync::Mutex;
 
 use crate::runtime::StartError;

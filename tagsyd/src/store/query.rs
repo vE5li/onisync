@@ -6,8 +6,8 @@
 
 use std::collections::BTreeSet;
 
-use tagsy_core::{FileId, TagId};
 use regex::{Regex, RegexBuilder};
+use tagsy_core::{FileId, TagId};
 
 use super::CatalogStore;
 use super::types::{DatabaseError, DeletedRule, SubtagRule};

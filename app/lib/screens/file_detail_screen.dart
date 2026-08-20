@@ -10,6 +10,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:share_plus/share_plus.dart';
 
 import '../bootstrap/bootstrap.dart';
@@ -72,12 +73,73 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     super.initState();
     _load();
     _watch();
+    // Keyboard accelerators: `e` edit, `r` rename, Ctrl+D delete. We hook
+    // `HardwareKeyboard` directly (rather than wrapping the screen in
+    // Shortcuts/Actions) so the shortcuts fire regardless of where focus sits,
+    // matching the global Ctrl+C in app.dart and Ctrl+F in home_screen.dart.
+    HardwareKeyboard.instance.addHandler(_handleKey);
   }
 
   @override
   void dispose() {
+    HardwareKeyboard.instance.removeHandler(_handleKey);
     _watching = false;
     super.dispose();
+  }
+
+  /// Handle the screen's keyboard accelerators. Each mirrors the gating of its
+  /// AppBar/tile equivalent so a shortcut is a no-op exactly when the button
+  /// would be absent or disabled. Suppressed while an editable text widget has
+  /// focus (e.g. the rename dialog's field) so typing `e`/`r`/`d` there is not
+  /// hijacked.
+  bool _handleKey(KeyEvent event) {
+    if (event is! KeyDownEvent) return false;
+    if (!mounted) return false;
+
+    final focus = FocusManager.instance.primaryFocus?.context;
+    if (focus != null &&
+        focus.findAncestorWidgetOfExactType<EditableText>() != null) {
+      return false;
+    }
+
+    final file = _file;
+    // No file, or a tombstoned one: none of these actions apply. (Restore has
+    // no shortcut; it's the only action available on a deleted file.)
+    if (file == null || file.deleted) return false;
+
+    final key = event.logicalKey;
+
+    // Ctrl+D = delete (matches the AppBar delete button). Ctrl so it doesn't
+    // collide with a bare `d` that might be meaningful elsewhere.
+    if (key == LogicalKeyboardKey.keyD &&
+        HardwareKeyboard.instance.isControlPressed) {
+      _deleteFile();
+      return true;
+    }
+
+    // Bare accelerators only — don't fire when a modifier is held (e.g. so
+    // Ctrl+E / Ctrl+R aren't swallowed).
+    if (HardwareKeyboard.instance.isControlPressed ||
+        HardwareKeyboard.instance.isAltPressed ||
+        HardwareKeyboard.instance.isMetaPressed) {
+      return false;
+    }
+
+    // `e` = edit (matches the AppBar edit button): only when an editor is
+    // available and no edit is already in flight.
+    if (key == LogicalKeyboardKey.keyE) {
+      if (widget.session.editorLauncher == null || _editing) return false;
+      _editFile();
+      return true;
+    }
+
+    // `r` = rename / change logical path (matches the tappable Path tile).
+    if (key == LogicalKeyboardKey.keyR) {
+      _renameFile();
+      return true;
+    }
+
+    return false;
   }
 
   Future<void> _watch() async {

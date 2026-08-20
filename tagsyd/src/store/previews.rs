@@ -6,8 +6,8 @@
 //! never be served for fresh content. The explicit invalidation below is
 //! therefore about bounding table growth, not correctness.
 
-use tagsy_core::{FileId, Preview};
 use rusqlite::{Connection, OptionalExtension};
+use tagsy_core::{FileId, Preview};
 
 use super::CatalogStore;
 use super::types::DatabaseError;

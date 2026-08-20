@@ -9,7 +9,7 @@
 
 ## How it works
 
-Tagsy --"Taxi"-- organizes files by **tags** instead of folders:
+Tagsy ("Taxi") organizes files by **tags** instead of folders:
 
 - You can tag files.
 - You can tag tags, so tags can form hierarchies.

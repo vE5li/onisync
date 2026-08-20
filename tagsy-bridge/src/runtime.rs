@@ -10,8 +10,8 @@
 //!
 //! 1. [`RuntimeHandle::start`] builds a multi-thread tokio runtime **manually**
 //!    on a dedicated OS thread (never `#[tokio::main]`), performs the fallible
-//!    startup ([`tagsyd::run`]) on that runtime, and returns once the
-//!    UI-facing [`Backend`] is ready.
+//!    startup ([`tagsyd::run`]) on that runtime, and returns once the UI-facing
+//!    [`Backend`] is ready.
 //! 2. The runtime thread then drives the sync engine to completion.
 //! 3. [`RuntimeHandle::stop`] triggers the [`ShutdownSignal`] and joins the
 //!    thread, so the service `onDestroy` tears everything down cleanly.

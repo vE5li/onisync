@@ -43,8 +43,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tagsy_core::FileId;
 use serde::{Deserialize, Serialize};
+use tagsy_core::FileId;
 use tokio::sync::broadcast;
 
 /// Capacity of the operation-event broadcast channel. A slow subscriber that

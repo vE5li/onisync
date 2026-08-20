@@ -3,11 +3,11 @@
 
 use std::collections::BTreeSet;
 
+use rusqlite::OptionalExtension;
+use serde::{Deserialize, Serialize};
 use tagsy_core::TagId;
 use tagsy_core::state::TagManifestEntry;
 use tagsy_core::tag::MetadataFormat;
-use rusqlite::OptionalExtension;
-use serde::{Deserialize, Serialize};
 
 use super::CatalogStore;
 use super::query::TextPattern;

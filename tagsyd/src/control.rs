@@ -49,8 +49,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use tagsy_core::{FileId, FileInfo, Preview, TagId};
 use serde::{Deserialize, Serialize};
+use tagsy_core::{FileId, FileInfo, Preview, TagId};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_tungstenite::WebSocketStream;

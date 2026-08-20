@@ -8,8 +8,13 @@ import '../rust/api.dart' as tagsy;
 /// the daemon for a small, cacheable preview via [TagsyApp.getPreview]
 /// — a low-resolution image or a short text snippet. The daemon generates it
 /// from a peer that holds the content (first responder wins) and caches it, so
-/// repeat opens are cheap. A file that no peer holds, or whose content is not
-/// previewable, resolves to [PreviewKind.none] and renders a neutral tile.
+/// repeat opens are cheap. Content that is genuinely not previewable resolves
+/// to [PreviewKind.none] and renders a neutral tile.
+///
+/// A file whose bytes no reachable device currently holds is a *transient*
+/// failure ([ApiError_ContentUnavailable]) rather than [PreviewKind.none]: the
+/// daemon does not cache it, and this widget shows a retry affordance so the
+/// preview can be re-requested once a holder comes online.
 ///
 /// The fetch may involve a peer round-trip, so it can take a few seconds; a
 /// spinner is shown meanwhile. Keyed by [fileId] + [contentHash] so navigating
@@ -54,6 +59,15 @@ class _RemotePreviewState extends State<RemotePreview> {
     }
   }
 
+  /// Re-request the preview after a transient failure. The daemon did not cache
+  /// the `ContentUnavailable` outcome, so this re-runs the full resolve path
+  /// (which may now find a holder online) rather than returning a stale miss.
+  void _retry() {
+    setState(() {
+      _future = widget.app.getPreview(fileId: widget.fileId);
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     return FutureBuilder<tagsy.PreviewEntry>(
@@ -73,16 +87,46 @@ class _RemotePreviewState extends State<RemotePreview> {
         }
         if (snapshot.hasError) {
           final error = snapshot.error;
-          // A file no peer can serve is *not* an error: `getPreview` resolves
-          // it to `PreviewKind.none`, handled in `_buildPreview`. The only
-          // meaningful rejection here is the file id itself being gone.
-          final missing = error is tagsy.ApiError_UnknownId;
+          // Two rejections are meaningful here, and they are different in kind:
+          //
+          // - `UnknownId`: the file id itself is gone (deleted while this
+          //   screen was open). Permanent — retrying cannot help.
+          // - `ContentUnavailable`: the file exists, but no preview could be
+          //   obtained *right now* (nothing to generate from locally and no
+          //   reachable peer served one). Transient and deliberately not
+          //   cached by the daemon, so a retry once a holder is online can
+          //   succeed.
+          //
+          // A file whose content is genuinely un-previewable is *not* an error:
+          // it resolves to `PreviewKind.none`, handled in `_buildPreview`.
+          if (error is tagsy.ApiError_UnknownId) {
+            return const _PreviewTile(
+              icon: Icons.help_outline,
+              title: 'File no longer exists',
+              subtitle: 'It was deleted while this screen was open.',
+            );
+          }
+          if (error is tagsy.ApiError_ContentUnavailable) {
+            return _PreviewTile(
+              icon: Icons.cloud_off_outlined,
+              title: 'Preview unavailable',
+              subtitle: 'No device holding this file is reachable right now.',
+              trailing: IconButton(
+                icon: const Icon(Icons.refresh),
+                tooltip: 'Retry',
+                onPressed: _retry,
+              ),
+            );
+          }
           return _PreviewTile(
-            icon: missing ? Icons.help_outline : Icons.cloud_off_outlined,
-            title: missing ? 'File no longer exists' : 'Failed to load preview',
-            subtitle: missing
-                ? 'It was deleted while this screen was open.'
-                : '$error',
+            icon: Icons.cloud_off_outlined,
+            title: 'Failed to load preview',
+            subtitle: '$error',
+            trailing: IconButton(
+              icon: const Icon(Icons.refresh),
+              tooltip: 'Retry',
+              onPressed: _retry,
+            ),
           );
         }
         return _buildPreview(context, snapshot.data!);
