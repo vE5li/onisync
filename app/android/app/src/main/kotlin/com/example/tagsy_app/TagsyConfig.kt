@@ -7,7 +7,7 @@
  * The JSON is bundled into the APK as an Android asset at
  * `assets/tagsy_config.json`. The file is *not* source: it is copied in at
  * build time by the flake's `run-android` apps from `app/config/<name>.json`,
- * selected by the `ONISYNC_CONFIG` env var — that is how one repository can
+ * selected by the `TAGSY_CONFIG` env var — that is how one repository can
  * flash two devices with different peer configs. Editing peer identities
  * therefore means editing files under `app/config/`, not this class.
  *
@@ -75,7 +75,7 @@ object TagsyConfig {
      *
      * `context` is used to resolve app-private storage (`filesDir`) and to
      * open the bundled config asset. Throws if the asset is missing — that
-     * means the APK was built without a `ONISYNC_CONFIG` selection (the flake
+     * means the APK was built without a `TAGSY_CONFIG` selection (the flake
      * refuses to build in that case, so seeing this at runtime means someone
      * built the APK by hand).
      */
@@ -101,8 +101,8 @@ object TagsyConfig {
         } catch (e: FileNotFoundException) {
             throw IllegalStateException(
                 "Bundled tagsy config asset '$CONFIG_ASSET' is missing. This APK " +
-                    "was built without ONISYNC_CONFIG set; rebuild with " +
-                    "ONISYNC_CONFIG=<name> nix run .#run-android (see app/config/).",
+                    "was built without TAGSY_CONFIG set; rebuild with " +
+                    "TAGSY_CONFIG=<name> nix run .#run-android (see app/config/).",
                 e,
             )
         }

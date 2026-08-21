@@ -25,7 +25,7 @@ invocations:
 - `nix run .#launch-linux` — fast path, no codegen.
 
 See `flake.nix` for the full list and required env vars (e.g.
-`ONISYNC_CONFIG`, `ONISYNC_DEVICE`).
+`TAGSY_CONFIG`, `ONISYNC_DEVICE`).
 
 ## Restructuring in progress
 

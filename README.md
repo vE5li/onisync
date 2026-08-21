@@ -94,7 +94,7 @@ nix run .#run-linux      # codegen + launch the Linux desktop app
 nix run .#run-android    # codegen + native .so + launch on Android
 ```
 
-See `flake.nix` for the full list of apps and the required environment variables (`ONISYNC_CONFIG`, `ONISYNC_DEVICE`, ...), and `AGENTS.md` for repository conventions.
+See `flake.nix` for the full list of apps and the required environment variables (`TAGSY_CONFIG`, `ONISYNC_DEVICE`, ...), and `AGENTS.md` for repository conventions.
 
 ## License
 

@@ -327,12 +327,12 @@
           esac
         '';
 
-        # Copy the per-device runtime config selected by $ONISYNC_CONFIG into
+        # Copy the per-device runtime config selected by $TAGSY_CONFIG into
         # the Android asset the Kotlin runtime reads at start-up. This is what
         # puts one of the files under app/config/ inside the APK.
         selectAndroidConfigBody = ''
           mkdir -p app/android/app/src/main/assets
-          cp "app/config/''${ONISYNC_CONFIG}.json" \
+          cp "app/config/''${TAGSY_CONFIG}.json" \
              "app/android/app/src/main/assets/tagsy_config.json"
         '';
 
@@ -417,7 +417,7 @@
           # the connected device's ABI, then launch. The safe default; safe to
           # re-run.
           #
-          # Requires ONISYNC_CONFIG=<name> (see app/config/) so the APK bundles
+          # Requires TAGSY_CONFIG=<name> (see app/config/) so the APK bundles
           # a per-device runtime config. With more than one android device
           # connected also set ONISYNC_DEVICE=<id|name> to pick which one to
           # flash; see the run-android-phone / run-android-sylvie-phone
