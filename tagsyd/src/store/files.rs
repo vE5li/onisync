@@ -554,18 +554,18 @@ impl CatalogStore {
                   WHERE inner.file_id = f.id
               ){where_clause}"
         );
-        let (total, count): (i64, i64) =
-            self.connection
-                .query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let (total, count): (i64, i64) = self
+            .connection
+            .query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?)))?;
         Ok((total as u64, count as u64))
     }
 
     /// Sum the byte size of the *latest* version of the files named by
     /// `file_ids`, honoring `deleted_rule`, and count those that matched. This
     /// is the "stored locally" side of the storage-stats indicator: the caller
-    /// passes the set of file ids that are materialized on this device (gathered
-    /// from the per-directory indexes), and we price them against the catalog's
-    /// latest-version sizes.
+    /// passes the set of file ids that are materialized on this device
+    /// (gathered from the per-directory indexes), and we price them against
+    /// the catalog's latest-version sizes.
     ///
     /// Files in `file_ids` that no longer exist in the catalog (or that
     /// `deleted_rule` excludes) are silently skipped, so the returned count can
@@ -601,9 +601,9 @@ impl CatalogStore {
              WHERE f.id IN ({placeholders}){deleted_clause}"
         );
         let params = rusqlite::params_from_iter(file_ids.iter());
-        let (total, count): (i64, i64) =
-            self.connection
-                .query_row(&sql, params, |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let (total, count): (i64, i64) = self
+            .connection
+            .query_row(&sql, params, |row| Ok((row.get(0)?, row.get(1)?)))?;
         Ok((total as u64, count as u64))
     }
 }

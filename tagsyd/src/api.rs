@@ -1113,15 +1113,15 @@ impl Api {
             .map_err(|_| ApiError::Internal("runtime is shutting down".to_owned()))
     }
 
-    /// Report how much data this device stores locally versus how much the whole
-    /// catalog holds. See [`StorageStats`].
+    /// Report how much data this device stores locally versus how much the
+    /// whole catalog holds. See [`StorageStats`].
     ///
     /// This is async because the "stored locally" half lives in the per-sync-
-    /// directory indexes owned by the directory-manager actor: we ask it for the
-    /// set of materialized file ids (mirroring [`Api::local_path_for_file`]),
-    /// then price that set — and the whole catalog — against the catalog's
-    /// latest-version sizes over a fresh read handle. Both totals exclude
-    /// tombstoned files.
+    /// directory indexes owned by the directory-manager actor: we ask it for
+    /// the set of materialized file ids (mirroring
+    /// [`Api::local_path_for_file`]), then price that set — and the whole
+    /// catalog — against the catalog's latest-version sizes over a fresh
+    /// read handle. Both totals exclude tombstoned files.
     pub async fn storage_stats(&self) -> Result<StorageStats, ApiError> {
         let (respond_to, response) = oneshot::channel();
         self.command_sender

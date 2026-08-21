@@ -878,8 +878,9 @@ impl TagsyApp {
         self.try_backend()?.purge_previews().await
     }
 
-    /// Report how much data this device stores locally versus how much the whole
-    /// catalog holds. Surfaced in the top bar as a `<local>/<total>` indicator.
+    /// Report how much data this device stores locally versus how much the
+    /// whole catalog holds. Surfaced in the top bar as a `<local>/<total>`
+    /// indicator.
     pub async fn storage_stats(&self) -> Result<StorageStatsEntry, ApiError> {
         Ok(StorageStatsEntry::from(
             self.try_backend()?.storage_stats().await?,
