@@ -390,7 +390,13 @@ impl CatalogStore {
             DeletedRule::Include => "",
         };
         let sql = format!(
-            "SELECT f.logical_path, v.content_hash, v.version_number, v.size, f.deleted
+            "SELECT f.logical_path, v.content_hash, v.version_number, v.size, f.deleted,
+                    (SELECT observed_at FROM file_versions_v1 AS first
+                     WHERE first.file_id = f.id
+                     ORDER BY first.version_number ASC LIMIT 1) AS first_recorded_at,
+                    (SELECT observed_at FROM file_versions_v1 AS last
+                     WHERE last.file_id = f.id
+                     ORDER BY last.version_number DESC LIMIT 1) AS latest_change_at
              FROM files_v2 AS f
              JOIN file_versions_v1 AS v
                ON v.file_id = f.id
@@ -414,6 +420,8 @@ impl CatalogStore {
                     // Filled in below.
                     short_id_length: 0,
                     deleted: row.get::<_, i64>(4)? != 0,
+                    first_recorded_at: row.get(5)?,
+                    latest_change_at: row.get(6)?,
                 })
             })?
             .map(|file| file.unwrap())
@@ -447,7 +455,13 @@ impl CatalogStore {
             DeletedRule::Include => "",
         };
         let sql = format!(
-            "SELECT f.id, f.logical_path, v.content_hash, v.version_number, v.size, f.deleted
+            "SELECT f.id, f.logical_path, v.content_hash, v.version_number, v.size, f.deleted,
+                    (SELECT observed_at FROM file_versions_v1 AS first
+                     WHERE first.file_id = f.id
+                     ORDER BY first.version_number ASC LIMIT 1) AS first_recorded_at,
+                    (SELECT observed_at FROM file_versions_v1 AS last
+                     WHERE last.file_id = f.id
+                     ORDER BY last.version_number DESC LIMIT 1) AS latest_change_at
              FROM files_v2 AS f
              JOIN file_versions_v1 AS v
                ON v.file_id = f.id
@@ -470,6 +484,8 @@ impl CatalogStore {
                 // Filled in below once we have the whole set.
                 short_id_length: 0,
                 deleted: row.get::<_, i64>(5)? != 0,
+                first_recorded_at: row.get(6)?,
+                latest_change_at: row.get(7)?,
             })
         })?;
 
@@ -503,6 +519,92 @@ impl CatalogStore {
         }
 
         Ok(files)
+    }
+
+    /// Sum the byte size of the *latest* version of every file in the catalog,
+    /// honoring `deleted_rule`, and count those files. This is the
+    /// "whole catalog" side of the storage-stats indicator: what the cloud as a
+    /// whole holds, regardless of which bytes this device has materialized.
+    ///
+    /// Only the latest version of each file is priced — the stat is the current
+    /// footprint, not the sum of all historical versions.
+    ///
+    /// Returns `(total_bytes, file_count)`.
+    pub fn total_catalog_size(
+        &self,
+        deleted_rule: DeletedRule,
+    ) -> Result<(u64, u64), DatabaseError> {
+        // `f.deleted` is aliased in the join below; inline the guard rather than
+        // relying on a bare `deleted = 0` fragment (same reasoning as
+        // `get_all_files`).
+        let where_clause = match deleted_rule {
+            DeletedRule::Exclude => " WHERE f.deleted = 0",
+            DeletedRule::Include => "",
+        };
+        // `SUM` yields NULL over an empty set, which rusqlite refuses to
+        // deserialize into a plain `i64`; `COALESCE` folds it to 0.
+        let sql = format!(
+            "SELECT COALESCE(SUM(v.size), 0), COUNT(*)
+             FROM files_v2 AS f
+             JOIN file_versions_v1 AS v
+               ON v.file_id = f.id
+              AND v.version_number = (
+                  SELECT MAX(version_number)
+                  FROM file_versions_v1 AS inner
+                  WHERE inner.file_id = f.id
+              ){where_clause}"
+        );
+        let (total, count): (i64, i64) =
+            self.connection
+                .query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok((total as u64, count as u64))
+    }
+
+    /// Sum the byte size of the *latest* version of the files named by
+    /// `file_ids`, honoring `deleted_rule`, and count those that matched. This
+    /// is the "stored locally" side of the storage-stats indicator: the caller
+    /// passes the set of file ids that are materialized on this device (gathered
+    /// from the per-directory indexes), and we price them against the catalog's
+    /// latest-version sizes.
+    ///
+    /// Files in `file_ids` that no longer exist in the catalog (or that
+    /// `deleted_rule` excludes) are silently skipped, so the returned count can
+    /// be smaller than `file_ids.len()`.
+    ///
+    /// Returns `(local_bytes, file_count)`.
+    pub fn size_of_files(
+        &self,
+        file_ids: &[FileId],
+        deleted_rule: DeletedRule,
+    ) -> Result<(u64, u64), DatabaseError> {
+        if file_ids.is_empty() {
+            return Ok((0, 0));
+        }
+        let deleted_clause = match deleted_rule {
+            DeletedRule::Exclude => " AND f.deleted = 0",
+            DeletedRule::Include => "",
+        };
+        let placeholders = std::iter::repeat("?")
+            .take(file_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT COALESCE(SUM(v.size), 0), COUNT(*)
+             FROM files_v2 AS f
+             JOIN file_versions_v1 AS v
+               ON v.file_id = f.id
+              AND v.version_number = (
+                  SELECT MAX(version_number)
+                  FROM file_versions_v1 AS inner
+                  WHERE inner.file_id = f.id
+              )
+             WHERE f.id IN ({placeholders}){deleted_clause}"
+        );
+        let params = rusqlite::params_from_iter(file_ids.iter());
+        let (total, count): (i64, i64) =
+            self.connection
+                .query_row(&sql, params, |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok((total as u64, count as u64))
     }
 }
 

@@ -827,11 +827,19 @@ async fn run(
                 short_id_length: file_id.to_string().len(),
                 // A freshly-added file is live by construction.
                 deleted: false,
+                // Freshly added: its only version was recorded just now. The
+                // authoritative timestamps are stamped daemon-side; approximate
+                // with now for this optimistic local render.
+                first_recorded_at: tagsyd::clock::now_millis(),
+                latest_change_at: tagsyd::clock::now_millis(),
             };
+
             let mut name_cache = HashMap::new();
-            let tag_names = resolve_tag_names(backend, &resolved_tags, &mut name_cache).await?;
             let mut file_tags = HashMap::new();
+
+            let tag_names = resolve_tag_names(backend, &resolved_tags, &mut name_cache).await?;
             file_tags.insert(file_id, tag_names);
+
             emit_files(output_mode, std::slice::from_ref(&file), &file_tags);
         }
         Commands::CreateTag { name, color } => {

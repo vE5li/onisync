@@ -24,7 +24,7 @@
 // `frb_generated.rs`. A plain private `use` would not be visible through that
 // glob and the generated code fails to compile.
 pub use tagsy_core::{FileInfo, Preview};
-pub use tagsyd::api::{ApiError, ApiEvent};
+pub use tagsyd::api::{ApiError, ApiEvent, StorageStats};
 pub use tagsyd::configuration::EditorRule;
 pub use tagsyd::operations::{
     Direction, Operation, OperationEvent, OperationKind, OperationStatus,
@@ -61,6 +61,14 @@ pub struct FileEntry {
     /// [`DeletedRule::Include`]. The UI uses this to render a "deleted"
     /// badge distinct from live rows.
     pub deleted: bool,
+    /// Wall-clock time (unix milliseconds) the file was first recorded — the
+    /// `observed_at` of its earliest version. The UI renders this as a date +
+    /// time.
+    pub first_recorded_at: i64,
+    /// Wall-clock time (unix milliseconds) of the file's latest change — the
+    /// `observed_at` of its most recent version. The UI renders this as a date
+    /// + time.
+    pub latest_change_at: i64,
 }
 
 impl From<FileInfo> for FileEntry {
@@ -73,6 +81,32 @@ impl From<FileInfo> for FileEntry {
             size: info.size as i64,
             short_id_length: info.short_id_length as i64,
             deleted: info.deleted,
+            first_recorded_at: info.first_recorded_at,
+            latest_change_at: info.latest_change_at,
+        }
+    }
+}
+
+/// Storage totals flattened for the Dart UI (see [`FileEntry`] for why a DTO).
+///
+/// `local_*` describes what this device has materialized on disk; `total_*`
+/// describes what the whole catalog ("the cloud") knows about. Both price only
+/// the latest version of each live file, so `local_bytes <= total_bytes` and
+/// `local_files <= total_files`. The UI renders `<local>/<total>` bytes.
+pub struct StorageStatsEntry {
+    pub local_bytes: i64,
+    pub total_bytes: i64,
+    pub local_files: i64,
+    pub total_files: i64,
+}
+
+impl From<StorageStats> for StorageStatsEntry {
+    fn from(stats: StorageStats) -> Self {
+        Self {
+            local_bytes: stats.local_bytes as i64,
+            total_bytes: stats.total_bytes as i64,
+            local_files: stats.local_files as i64,
+            total_files: stats.total_files as i64,
         }
     }
 }
@@ -842,6 +876,14 @@ impl TagsyApp {
     /// file types changes). Surfaced in the UI as a toolbar action.
     pub async fn purge_previews(&self) -> Result<usize, ApiError> {
         self.try_backend()?.purge_previews().await
+    }
+
+    /// Report how much data this device stores locally versus how much the whole
+    /// catalog holds. Surfaced in the top bar as a `<local>/<total>` indicator.
+    pub async fn storage_stats(&self) -> Result<StorageStatsEntry, ApiError> {
+        Ok(StorageStatsEntry::from(
+            self.try_backend()?.storage_stats().await?,
+        ))
     }
 
     /// Move (rename) a file to a new logical path. String-id variant of the

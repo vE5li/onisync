@@ -17,6 +17,7 @@ import '../bootstrap/bootstrap.dart';
 import '../editor/editor_launcher.dart';
 import '../rust/api.dart' as tagsy;
 import '../widgets/file_preview.dart';
+import '../widgets/format.dart';
 import '../widgets/property_tile.dart';
 import '../widgets/remote_preview.dart';
 import '../widgets/tag_chip.dart';
@@ -754,13 +755,23 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
         ),
         const SizedBox(height: 24),
         PropertyTile(
+          label: 'First recorded',
+          value: _formatTimestamp(file.firstRecordedAt.toInt()),
+          dense: true,
+        ),
+        PropertyTile(
+          label: 'Latest change',
+          value: _formatTimestamp(file.latestChangeAt.toInt()),
+          dense: true,
+        ),
+        PropertyTile(
           label: 'Version',
           value: '${file.versionNumber}',
           dense: true,
         ),
         PropertyTile(
           label: 'Size',
-          value: _formatSize(file.size.toInt()),
+          value: formatSize(file.size.toInt()),
           dense: true,
         ),
         PropertyTile(
@@ -779,20 +790,16 @@ class _FileDetailScreenState extends State<FileDetailScreen> {
     );
   }
 
-  /// Format a byte count as a human-readable size (binary units: KiB, MiB, …).
-  /// Bytes are shown as a plain count; larger sizes use one decimal place.
-  static String _formatSize(int bytes) {
-    if (bytes < 1024) {
-      return '$bytes B';
-    }
-    const units = ['KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
-    var value = bytes / 1024;
-    var unit = 0;
-    while (value >= 1024 && unit < units.length - 1) {
-      value /= 1024;
-      unit++;
-    }
-    return '${value.toStringAsFixed(1)} ${units[unit]}';
+  /// Format a unix-millisecond timestamp as a local date + time, e.g.
+  /// `2026-08-21 14:03`. A non-positive value (no recorded version / unknown)
+  /// renders as an em dash.
+  static String _formatTimestamp(int millis) {
+    if (millis <= 0) return '—';
+    final at = DateTime.fromMillisecondsSinceEpoch(millis).toLocal();
+    String two(int n) => n.toString().padLeft(2, '0');
+    final date = '${at.year}-${two(at.month)}-${two(at.day)}';
+    final time = '${two(at.hour)}:${two(at.minute)}';
+    return '$date $time';
   }
 
   /// The file's inline preview.

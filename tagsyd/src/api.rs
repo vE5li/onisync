@@ -164,6 +164,23 @@ pub struct QueryResult {
     pub tags: Vec<Tag>,
 }
 
+/// The result of [`Api::storage_stats`]: how much data this device holds on
+/// disk versus how much the whole catalog ("the cloud") knows about.
+///
+/// Both totals price only the *latest* version of each file — this is the
+/// current storage footprint, not the sum of every historical version — and
+/// both exclude tombstoned files. `local_*` counts files materialized on this
+/// device (present in some sync directory's index); `total_*` counts every live
+/// file in the catalog. `local_bytes <= total_bytes` and
+/// `local_files <= total_files` always hold.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageStats {
+    pub local_bytes: u64,
+    pub total_bytes: u64,
+    pub local_files: u64,
+    pub total_files: u64,
+}
+
 /// The result of [`Api::finish_edit`]: did the edit actually change the file?
 ///
 /// `changed = false` means the post-edit bytes hashed to the file's current
@@ -1094,6 +1111,38 @@ impl Api {
         response
             .await
             .map_err(|_| ApiError::Internal("runtime is shutting down".to_owned()))
+    }
+
+    /// Report how much data this device stores locally versus how much the whole
+    /// catalog holds. See [`StorageStats`].
+    ///
+    /// This is async because the "stored locally" half lives in the per-sync-
+    /// directory indexes owned by the directory-manager actor: we ask it for the
+    /// set of materialized file ids (mirroring [`Api::local_path_for_file`]),
+    /// then price that set — and the whole catalog — against the catalog's
+    /// latest-version sizes over a fresh read handle. Both totals exclude
+    /// tombstoned files.
+    pub async fn storage_stats(&self) -> Result<StorageStats, ApiError> {
+        let (respond_to, response) = oneshot::channel();
+        self.command_sender
+            .send(SyncDirectoryCommand::LocalFileIds { respond_to })
+            .map_err(|_| ApiError::Internal("runtime is shutting down".to_owned()))?;
+        let local_ids = response
+            .await
+            .map_err(|_| ApiError::Internal("runtime is shutting down".to_owned()))?;
+
+        let local_ids: Vec<FileId> = local_ids.into_iter().collect();
+        let database = self.open_read()?;
+        let (total_bytes, total_files) = database.total_catalog_size(DeletedRule::Exclude)?;
+        let (local_bytes, local_files) =
+            database.size_of_files(&local_ids, DeletedRule::Exclude)?;
+
+        Ok(StorageStats {
+            local_bytes,
+            total_bytes,
+            local_files,
+            total_files,
+        })
     }
 
     /// Apply `tag_id` to `file_id`. Enqueues `Change::FileTagged`.

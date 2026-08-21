@@ -20,9 +20,11 @@ import 'package:flutter/services.dart';
 
 import '../bootstrap/bootstrap.dart';
 import '../rust/api.dart' as tagsy;
+import '../widgets/format.dart';
 import '../widgets/tag_chip.dart';
 import 'file_detail_screen.dart';
 import 'operations_screen.dart';
+import 'storage_stats_screen.dart';
 import 'tag_detail_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -414,6 +416,7 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('Tagsy'),
         actions: [
+          _StorageStatsIndicator(session: widget.session),
           // Toggle: search live vs. tombstoned rows. When on, the daemon
           // returns only soft-deleted files/tags for the same query text;
           // when off, only live ones.
@@ -722,6 +725,106 @@ class _FileRow extends StatelessWidget {
 /// the number of operations currently active. This includes steady-state
 /// `peer_connected_*` rows, so the badge doubles as a connected-peer count when
 /// nothing else is in flight.
+/// AppBar indicator showing `<local>/<total>` storage: how much data this
+/// device holds on disk versus how much the whole catalog knows about. Both
+/// figures price the latest version of each live file. Refreshes on connect and
+/// on every catalog change event; renders nothing until the first fetch lands.
+class _StorageStatsIndicator extends StatefulWidget {
+  const _StorageStatsIndicator({required this.session});
+
+  final TagsySession? session;
+
+  @override
+  State<_StorageStatsIndicator> createState() => _StorageStatsIndicatorState();
+}
+
+class _StorageStatsIndicatorState extends State<_StorageStatsIndicator> {
+  tagsy.StorageStatsEntry? _stats;
+  bool _watching = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.session != null) _watch();
+  }
+
+  @override
+  void didUpdateWidget(covariant _StorageStatsIndicator oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // The session arrives asynchronously after connect; start watching once it
+    // first appears.
+    if (oldWidget.session == null && widget.session != null) _watch();
+  }
+
+  @override
+  void dispose() {
+    _watching = false;
+    super.dispose();
+  }
+
+  Future<void> _refresh() async {
+    final session = widget.session;
+    if (session == null) return;
+    try {
+      final stats = await session.app.storageStats();
+      if (!mounted) return;
+      setState(() => _stats = stats);
+    } catch (_) {
+      // Transient failures keep the last shown value; the change stream will
+      // trigger another refresh soon.
+    }
+  }
+
+  Future<void> _watch() async {
+    final session = widget.session;
+    if (session == null || _watching) return;
+    _watching = true;
+    // Paint an initial value, then re-fetch on every catalog change.
+    await _refresh();
+    try {
+      final events = await session.app.subscribe();
+      while (mounted && _watching) {
+        final event = await events.next();
+        if (event == null) break;
+        if (!mounted) break;
+        await _refresh();
+      }
+    } catch (_) {
+      // Stream errors are surfaced elsewhere (bootstrap) — ignore here so a
+      // transient hiccup doesn't kill the indicator.
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final stats = _stats;
+    final session = widget.session;
+    if (stats == null || session == null) return const SizedBox.shrink();
+    final local = formatSize(stats.localBytes.toInt());
+    final total = formatSize(stats.totalBytes.toInt());
+    return InkWell(
+      onTap: () {
+        FocusManager.instance.primaryFocus?.unfocus();
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => StorageStatsScreen(session: session),
+          ),
+        );
+      },
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          child: Text(
+            '$local / $total',
+            style: Theme.of(context).textTheme.bodyMedium,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _OperationsButton extends StatefulWidget {
   const _OperationsButton({required this.session});
 

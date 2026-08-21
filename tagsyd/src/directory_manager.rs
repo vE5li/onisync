@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use notify::{RecursiveMode, Watcher};
@@ -122,6 +122,14 @@ pub enum SyncDirectoryCommand {
     ReadFile {
         file_id: FileId,
         respond_to: tokio::sync::oneshot::Sender<Option<(PhysicalPath, FileBytes, String)>>,
+    },
+    /// Collect the set of file ids that are materialized on this device: every
+    /// `file_id` that has a row in *some* sync directory's index. A file can
+    /// live in several TagBased directories, so the set is deduplicated across
+    /// them. The `Api` prices this set against the catalog's sizes to produce
+    /// the "stored locally" side of the storage-stats indicator.
+    LocalFileIds {
+        respond_to: tokio::sync::oneshot::Sender<HashSet<FileId>>,
     },
 }
 
@@ -1439,6 +1447,21 @@ impl SyncDirectoryManager {
                     break;
                 }
                 let _ = respond_to.send(response);
+            }
+            SyncDirectoryCommand::LocalFileIds { respond_to } => {
+                // Union the file ids across every sync directory's index. A DB
+                // row means "this directory holds this file's bytes on disk"
+                // (mirrors how `LocalPath` trusts the row rather than statting).
+                // A file present in multiple TagBased directories collapses to
+                // one entry via the set.
+                let mut ids: HashSet<FileId> = HashSet::new();
+                for sync_directory in &self.sync_directories {
+                    match sync_directory.database.get_all_files() {
+                        Ok(files) => ids.extend(files.into_iter().map(|file| file.file_id)),
+                        Err(_) => continue,
+                    }
+                }
+                let _ = respond_to.send(ids);
             }
             SyncDirectoryCommand::ReadFile {
                 file_id,

@@ -58,7 +58,9 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_util::sync::CancellationToken;
 
-use crate::api::{Api, ApiError, ApiEvent, EditOutcome, QueryResult, RetagSummary, TagRuleReport};
+use crate::api::{
+    Api, ApiError, ApiEvent, EditOutcome, QueryResult, RetagSummary, StorageStats, TagRuleReport,
+};
 use crate::configuration::EditorRule;
 use crate::store::{DeletedRule, SubtagRule, Tag};
 use crate::transport::{EventStream, OperationStream, OperationUpdate, TransportBackend};
@@ -195,6 +197,9 @@ pub enum ControlRequest {
     LocalPathForFile {
         file_id: FileId,
     },
+    /// Report local vs. whole-catalog storage totals. Answered with
+    /// [`ControlResponse::StorageStats`].
+    StorageStats,
     DeleteFile {
         file_id: FileId,
     },
@@ -281,6 +286,9 @@ pub enum ControlResponse {
     /// A file's absolute on-disk path, or `None` if not present locally (answer
     /// to [`ControlRequest::LocalPathForFile`]).
     LocalPath(Option<PathBuf>),
+    /// Local vs. whole-catalog storage totals (answer to
+    /// [`ControlRequest::StorageStats`]).
+    StorageStats(StorageStats),
     /// The outcome of an external edit (answer to
     /// [`ControlRequest::FinishEdit`]).
     EditOutcome(crate::api::EditOutcome),
@@ -760,6 +768,10 @@ async fn dispatch(
                 Err(error) => ControlResponse::Error(error),
             }
         }
+        ControlRequest::StorageStats => match api.storage_stats().await {
+            Ok(stats) => ControlResponse::StorageStats(stats),
+            Err(error) => ControlResponse::Error(error),
+        },
         ControlRequest::DeleteFile { file_id } => match api.delete_file(file_id) {
             Ok(()) => ControlResponse::Ok,
             Err(error) => ControlResponse::Error(error),
@@ -1409,6 +1421,13 @@ impl TransportBackend for IpcClientBackend {
             .await?
         {
             ControlResponse::LocalPath(path) => Ok(path),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    async fn storage_stats(&self) -> Result<StorageStats, ApiError> {
+        match self.call(ControlRequest::StorageStats).await? {
+            ControlResponse::StorageStats(stats) => Ok(stats),
             other => Err(unexpected(other)),
         }
     }

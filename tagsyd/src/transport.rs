@@ -42,7 +42,9 @@ use tagsy_core::state::Change;
 use tagsy_core::{FileId, FileInfo, Preview, TagId};
 use tokio::sync::broadcast;
 
-use crate::api::{Api, ApiError, ApiEvent, EditOutcome, QueryResult, RetagSummary, TagRuleReport};
+use crate::api::{
+    Api, ApiError, ApiEvent, EditOutcome, QueryResult, RetagSummary, StorageStats, TagRuleReport,
+};
 use crate::configuration::EditorRule;
 use crate::operations::{Operation, OperationEvent};
 use crate::store::{DeletedRule, SubtagRule, Tag};
@@ -258,6 +260,9 @@ pub trait TransportBackend {
         &self,
         file_id: FileId,
     ) -> impl Future<Output = Result<Option<PathBuf>, ApiError>> + Send;
+
+    /// Report local vs. whole-catalog storage totals.
+    fn storage_stats(&self) -> impl Future<Output = Result<StorageStats, ApiError>> + Send;
 
     /// Delete a file.
     fn delete_file(&self, file_id: FileId) -> impl Future<Output = Result<(), ApiError>> + Send;
@@ -597,6 +602,10 @@ impl TransportBackend for InProcessBackend {
         self.api.local_path_for_file(file_id).await
     }
 
+    async fn storage_stats(&self) -> Result<StorageStats, ApiError> {
+        self.api.storage_stats().await
+    }
+
     async fn delete_file(&self, file_id: FileId) -> Result<(), ApiError> {
         self.api.delete_file(file_id)
     }
@@ -864,6 +873,13 @@ impl TransportBackend for Backend {
         match self {
             Backend::InProcess(backend) => backend.local_path_for_file(file_id).await,
             Backend::Ipc(backend) => backend.local_path_for_file(file_id).await,
+        }
+    }
+
+    async fn storage_stats(&self) -> Result<StorageStats, ApiError> {
+        match self {
+            Backend::InProcess(backend) => backend.storage_stats().await,
+            Backend::Ipc(backend) => backend.storage_stats().await,
         }
     }
 

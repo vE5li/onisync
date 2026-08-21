@@ -630,6 +630,14 @@ pub struct FileInfo {
     /// distinguish live from tombstoned rows in a mixed result set (and letting
     /// the UI render a "deleted" badge).
     pub deleted: bool,
+    /// Wall-clock time (unix milliseconds) the file's earliest recorded version
+    /// was observed — i.e. when the file was "first recorded". Taken from the
+    /// `observed_at` of the version with the lowest `version_number`.
+    pub first_recorded_at: i64,
+    /// Wall-clock time (unix milliseconds) the file's latest version was
+    /// observed — i.e. its "latest change". Taken from the `observed_at` of the
+    /// version with the highest `version_number`.
+    pub latest_change_at: i64,
 }
 
 macro_rules! make_id_type {
